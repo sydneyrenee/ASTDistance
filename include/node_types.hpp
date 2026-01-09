@@ -253,6 +253,94 @@ inline NodeType kotlin_node_to_type(const std::string& node_type) {
 }
 
 /**
+ * C++ AST node type mappings (from tree-sitter-cpp)
+ */
+inline NodeType cpp_node_to_type(const std::string& node_type) {
+    static const std::unordered_map<std::string, NodeType> mapping = {
+        // Statements
+        {"compound_statement", NodeType::BLOCK},
+        {"if_statement", NodeType::IF},
+        {"for_statement", NodeType::FOR},
+        {"for_range_loop", NodeType::FOR},
+        {"while_statement", NodeType::WHILE},
+        {"do_statement", NodeType::WHILE},
+        {"switch_statement", NodeType::SWITCH},
+        {"return_statement", NodeType::RETURN},
+        {"continue_statement", NodeType::CONTINUE},
+        {"break_statement", NodeType::BREAK},
+        {"try_statement", NodeType::TRY},
+        {"throw_statement", NodeType::THROW},
+        {"goto_statement", NodeType::GOTO},
+
+        // Assignments
+        {"assignment_expression", NodeType::ASSIGN},
+        {"compound_assignment_expr", NodeType::ASSIGN},
+
+        // Comparisons and binary ops
+        {"binary_expression", NodeType::UNKNOWN},
+        {"conditional_expression", NodeType::TERNARY},
+        {"unary_expression", NodeType::UNKNOWN},
+
+        // Literals
+        {"identifier", NodeType::VARIABLE},
+        {"field_identifier", NodeType::VARIABLE},
+        {"namespace_identifier", NodeType::VARIABLE},
+        {"type_identifier", NodeType::TYPE_REF},
+        {"number_literal", NodeType::NUMBER},
+        {"string_literal", NodeType::STRING},
+        {"raw_string_literal", NodeType::STRING},
+        {"char_literal", NodeType::CHAR},
+        {"true", NodeType::BOOLEAN},
+        {"false", NodeType::BOOLEAN},
+        {"nullptr", NodeType::NULL_LIT},
+
+        // Function/Method calls
+        {"call_expression", NodeType::CALL},
+        {"field_expression", NodeType::FIELD_ACCESS},
+        {"subscript_expression", NodeType::INDEX},
+
+        // Declarations
+        {"function_definition", NodeType::FUNCTION},
+        {"function_declarator", NodeType::FUNCTION},
+        {"class_specifier", NodeType::CLASS},
+        {"struct_specifier", NodeType::STRUCT},
+        {"enum_specifier", NodeType::ENUM},
+        {"declaration", NodeType::VAR_DECL},
+        {"init_declarator", NodeType::VAR_DECL},
+        {"parameter_declaration", NodeType::PARAM},
+        {"template_parameter_list", NodeType::TYPE_PARAM},
+
+        // Templates (generics)
+        {"template_declaration", NodeType::GENERIC_TYPE},
+        {"template_type", NodeType::GENERIC_TYPE},
+
+        // Lambda
+        {"lambda_expression", NodeType::LAMBDA},
+
+        // Types
+        {"primitive_type", NodeType::TYPE_REF},
+        {"qualified_identifier", NodeType::TYPE_REF},
+        {"pointer_declarator", NodeType::TYPE_REF},
+        {"reference_declarator", NodeType::TYPE_REF},
+        {"array_declarator", NodeType::ARRAY_TYPE},
+
+        // Namespaces and includes
+        {"preproc_include", NodeType::IMPORT},
+        {"using_declaration", NodeType::IMPORT},
+        {"namespace_definition", NodeType::PACKAGE},
+
+        // Other
+        {"comment", NodeType::COMMENT},
+        {"attribute", NodeType::ANNOTATION},
+        {"storage_class_specifier", NodeType::MODIFIER},
+        {"type_qualifier", NodeType::MODIFIER},
+    };
+
+    auto it = mapping.find(node_type);
+    return it != mapping.end() ? it->second : NodeType::UNKNOWN;
+}
+
+/**
  * Get human-readable name for a node type
  */
 inline const char* node_type_name(NodeType type) {
