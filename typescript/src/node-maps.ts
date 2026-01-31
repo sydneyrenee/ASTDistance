@@ -268,19 +268,33 @@ export const KOTLIN_NODE_MAP: NodeMap = {
   // Import/Export
   import_header: NodeType.IMPORT_STATEMENT,
   import_list: NodeType.IMPORT_STATEMENT,
-  package_header: NodeType.MODULE,
+  package_header: NodeType.PACKAGE,
 
   // Annotations
-  annotation: NodeType.UNKNOWN,
-  annotation_entry: NodeType.UNKNOWN,
+  annotation: NodeType.ANNOTATION,
+  annotation_entry: NodeType.ANNOTATION,
 
   // Modifiers
-  modifier: NodeType.UNKNOWN,
+  modifier: NodeType.MODIFIER,
+  modifiers: NodeType.MODIFIER,
+  visibility_modifier: NodeType.MODIFIER,
+  inheritance_modifier: NodeType.MODIFIER,
+  function_modifier: NodeType.MODIFIER,
+  platform_modifier: NodeType.MODIFIER,
 
   // Comments
   multiline_comment: NodeType.COMMENT,
   line_comment: NodeType.COMMENT,
   doc_comment: NodeType.COMMENT,
+
+  // Additional constructs
+  class_body: NodeType.BLOCK,
+  function_body: NodeType.BLOCK,
+  property_delegate: NodeType.OTHER,
+  type_arguments: NodeType.TYPE_DECLARATION,
+  value_arguments: NodeType.OTHER,
+  this_expression: NodeType.IDENTIFIER,
+  super_expression: NodeType.IDENTIFIER,
 
   // Lambdas
   lambda_literal: NodeType.FUNCTION_DECLARATION,
@@ -355,7 +369,8 @@ export const CPP_NODE_MAP: NodeMap = {
   array_declarator: NodeType.TYPE_DECLARATION,
 
   // Namespaces
-  namespace_definition: NodeType.MODULE,
+  namespace_definition: NodeType.PACKAGE,
+  declaration_list: NodeType.PACKAGE, // Map to PACKAGE to flatten structural nesting
   preproc_include: NodeType.IMPORT_STATEMENT,
   using_declaration: NodeType.IMPORT_STATEMENT,
   using_directive: NodeType.IMPORT_STATEMENT,
@@ -363,9 +378,25 @@ export const CPP_NODE_MAP: NodeMap = {
   // Templates
   template_declaration: NodeType.TYPE_DECLARATION,
   template_type: NodeType.TYPE_DECLARATION,
+  template_argument_list: NodeType.TYPE_DECLARATION,
 
   // Lambdas
   lambda_expression: NodeType.FUNCTION_DECLARATION,
+
+  // Modifiers and attributes
+  storage_class_specifier: NodeType.MODIFIER,
+  type_qualifier: NodeType.MODIFIER,
+  virtual_specifier: NodeType.MODIFIER,
+  access_specifier: NodeType.MODIFIER,
+  attribute: NodeType.ANNOTATION,
+
+  // Other constructs
+  linkage_specification: NodeType.PACKAGE, // extern "C"
+  base_clause: NodeType.TYPE_IDENTIFIER, // Inheritance list
+  parameter_list: NodeType.OTHER,
+  argument_list: NodeType.OTHER,
+  field_declaration: NodeType.VARIABLE_DECLARATION,
+  alias_declaration: NodeType.TYPE_IDENTIFIER,
 
   // Comments
   comment: NodeType.COMMENT,

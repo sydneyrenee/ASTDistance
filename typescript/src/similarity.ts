@@ -94,15 +94,23 @@ export function computeSimilarity(
   result1: ParseResult,
   result2: ParseResult,
 ): SimilarityMetrics {
+  // Clone trees to avoid modifying originals
+  const tree1 = cloneTree(result1.tree);
+  const tree2 = cloneTree(result2.tree);
+
+  // Normalize ASTs: Flatten PACKAGE nodes to reduce structural noise
+  tree1.flattenNodeType(NodeType.PACKAGE);
+  tree2.flattenNodeType(NodeType.PACKAGE);
+
   const histogram1 = result1.nodeTypes;
   const histogram2 = result2.nodeTypes;
 
   const cosineHistogram = cosineSimilarity(histogram1, histogram2);
 
-  const structure = structureSimilarity(result1.tree, result2.tree);
+  const structure = structureSimilarity(tree1, tree2);
 
-  const nodeTypes1 = extractNodeTypes(result1.tree);
-  const nodeTypes2 = extractNodeTypes(result2.tree);
+  const nodeTypes1 = extractNodeTypes(tree1);
+  const nodeTypes2 = extractNodeTypes(tree2);
   const jaccard = jaccardSimilarity(nodeTypes1, nodeTypes2);
 
   // Combined score weighted: histogram (40%), structure (30%), jaccard (30%)
@@ -114,6 +122,17 @@ export function computeSimilarity(
     jaccard,
     combined,
   };
+}
+
+/**
+ * Deep clone a tree node
+ */
+function cloneTree(node: TreeNode): TreeNode {
+  const clone = new TreeNode(node.nodeType, node.label);
+  clone.startPosition = { ...node.startPosition };
+  clone.endPosition = { ...node.endPosition };
+  clone.children = node.children.map(child => cloneTree(child));
+  return clone;
 }
 
 /**

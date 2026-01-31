@@ -60,6 +60,10 @@ export enum NodeType {
   EXPORT_STATEMENT = "export_statement",
   COMMENT = "comment",
   PROPERTY = "property",
+  PACKAGE = "package",
+  ANNOTATION = "annotation",
+  MODIFIER = "modifier",
+  OTHER = "other",
 
   // Additional node types for cross-language support
   SWITCH = "switch",
@@ -105,6 +109,30 @@ export class TreeNode {
   depth(): number {
     if (this.isLeaf()) return 0;
     return 1 + Math.max(...this.children.map((child) => child.depth()));
+  }
+
+  /**
+   * Flatten nodes of specific type (replacing them with their children)
+   * Used to reduce structural noise in AST comparisons
+   */
+  flattenNodeType(typeToFlatten: NodeType): void {
+    if (this.children.length === 0) return;
+
+    const newChildren: TreeNode[] = [];
+
+    for (const child of this.children) {
+      // Recurse first (bottom-up flattening)
+      child.flattenNodeType(typeToFlatten);
+
+      if (child.nodeType === typeToFlatten) {
+        // Dissolve this node, append its children to current parent
+        newChildren.push(...child.children);
+      } else {
+        newChildren.push(child);
+      }
+    }
+
+    this.children = newChildren;
   }
 }
 

@@ -35,7 +35,7 @@ export interface DepGraph {
 }
 
 /**
- * Parse all files in a directory with given language
+ * Parse all files in a directory or a single file with given language
  */
 export function parseDirectory(
   dirPath: string,
@@ -43,6 +43,30 @@ export function parseDirectory(
   extensions: string[] = [".ts", ".tsx", ".rs", ".kt", ".cpp"],
 ): Map<string, FileEntry> {
   const files = new Map<string, FileEntry>();
+
+  // Handle single file input
+  if (fs.statSync(dirPath).isFile()) {
+    const ext = path.extname(dirPath);
+    if (extensions.includes(ext)) {
+      const filename = path.basename(dirPath);
+      const parseResult = parseFile(dirPath, language);
+      const fileContent = fs.readFileSync(dirPath, "utf-8");
+      const lineCount = fileContent.split("\n").length;
+
+      files.set(filename, {
+        filename,
+        filepath: dirPath,
+        relativePath: filename,
+        language,
+        parseResult,
+        imports: parseResult?.importPaths || [],
+        exports: parseResult?.exportPaths || [],
+        lineCount,
+        isStub: lineCount < 10,
+      });
+    }
+    return files;
+  }
 
   function walk(currentPath: string, relativePath: string) {
     const entries = fs.readdirSync(currentPath, { withFileTypes: true });
