@@ -223,13 +223,17 @@ function extractImportsExports(
 
 /**
  * Extract port-lint header from file
+ *
+ * Matches:
+ *   // port-lint: source <path>
+ *   // port-lint: tests <path>
  */
 function extractPortLintHeader(
   source: string,
   filename: string,
 ): PortLintHeader | null {
   const lines = source.split("\n").slice(0, 50).join("\n");
-  const match = lines.match(/\/\/\s*port-lint:\s*source\s+([^\s\n]+)/);
+  const match = lines.match(/\/\/\s*port-lint:\s*(?:source|tests)\s+([^\s\n]+)/);
 
   if (match) {
     return {
