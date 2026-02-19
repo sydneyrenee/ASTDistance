@@ -23,6 +23,9 @@ const STUB_MARKERS = [
   "fixme",
   "not yet implemented",
   "not implemented",
+  // Common stub constructs without spaces (Rust `unimplemented!`, Kotlin/Python `NotImplementedError`)
+  "unimplemented",
+  "notimplemented",
 ];
 const ARITHMETIC_OPS = new Set(["+", "-", "*", "/", "%", "**"]);
 const COMPARISON_OPS = new Set(["==", "!=", "<", ">", "<=", ">=", "===", "!=="]);
@@ -249,7 +252,89 @@ function extractIdentifierStats(source: string, tree: Parser.Tree): IdentifierSt
 
 function textHasStubMarkers(text: string): boolean {
   const lower = text.toLowerCase();
-  return STUB_MARKERS.some((marker) => lower.includes(marker));
+
+  function isWordChar(ch: string): boolean {
+    return (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "_";
+  }
+
+  function hasWord(word: string): boolean {
+    let start = 0;
+    while (true) {
+      const idx = lower.indexOf(word, start);
+      if (idx < 0) return false;
+      const leftOk = idx === 0 || !isWordChar(lower[idx - 1]!);
+      const end = idx + word.length;
+      const rightOk = end >= lower.length || !isWordChar(lower[end]!);
+      if (leftOk && rightOk) return true;
+      start = idx + 1;
+    }
+  }
+
+  // Use word-boundary style matching for short markers so we don't trip on
+  // explanatory text like "TODOs/stubs are a failure mode" inside the tool itself.
+  return (
+    hasWord("todo") ||
+    hasWord("stub") ||
+    hasWord("placeholder") ||
+    hasWord("fixme") ||
+    lower.includes("not yet implemented") ||
+    lower.includes("not implemented") ||
+    hasWord("unimplemented") ||
+    hasWord("notimplemented")
+  );
+}
+
+function commentHasStubMarkers(text: string): boolean {
+  // For comment nodes, be stricter: only treat as a stub marker when the
+  // comment itself starts with TODO/FIXME/STUB/etc. This avoids false positives
+  // from explanatory comments inside the tool.
+  const lower = text.toLowerCase();
+
+  let i = 0;
+  if (lower.startsWith("//")) {
+    i = 2;
+    while (i < lower.length && lower[i] === "/") i++;
+  } else if (lower.startsWith("#")) {
+    i = 1;
+    while (i < lower.length && lower[i] === "#") i++;
+  } else if (lower.startsWith("/*")) {
+    i = 2;
+    if (i < lower.length && lower[i] === "*") i++; // /** ...
+  }
+
+  while (i < lower.length && /\s/.test(lower[i]!)) i++;
+  while (i < lower.length && lower[i] === "*") {
+    i++;
+    while (i < lower.length && /\s/.test(lower[i]!)) i++;
+  }
+
+  function isWordChar(ch: string): boolean {
+    return (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") || ch === "_";
+  }
+
+  function startsWithWord(word: string): boolean {
+    if (!lower.startsWith(word, i)) return false;
+    const end = i + word.length;
+    if (end >= lower.length) return true;
+    return !isWordChar(lower[end]!);
+  }
+
+  if (
+    startsWithWord("todo") ||
+    startsWithWord("fixme") ||
+    startsWithWord("stub") ||
+    startsWithWord("placeholder") ||
+    startsWithWord("unimplemented") ||
+    startsWithWord("notimplemented")
+  ) {
+    return true;
+  }
+
+  if (lower.startsWith("not implemented", i) || lower.startsWith("not yet implemented", i)) {
+    return true;
+  }
+
+  return false;
 }
 
 function detectStubBodies(source: string, tree: Parser.Tree, language: Language): boolean {
@@ -279,11 +364,6 @@ function detectStubBodies(source: string, tree: Parser.Tree, language: Language)
     "block_comment",
     "comment",
     "multiline_comment",
-    "string",
-    "string_literal",
-    "string_content",
-    "raw_string_literal",
-    "template_string",
   ]);
 
   const functionTypes = functionTypesByLang[language] || new Set<string>();
@@ -292,9 +372,23 @@ function detectStubBodies(source: string, tree: Parser.Tree, language: Language)
     const stack: Parser.SyntaxNode[] = [root];
     while (stack.length > 0) {
       const node = stack.pop()!;
+      // Strong stub constructs that don't rely on comments/strings.
+      if (language === Language.RUST && node.type === "macro_invocation") {
+        const text = source
+          .slice(node.startIndex, Math.min(node.endIndex, node.startIndex + 96))
+          .toLowerCase();
+        if (
+          text.includes("todo!") ||
+          text.includes("unimplemented!") ||
+          text.includes("unreachable!") ||
+          textHasStubMarkers(text)
+        ) {
+          return true;
+        }
+      }
       if (markerTypes.has(node.type)) {
         const text = source.slice(node.startIndex, node.endIndex);
-        if (textHasStubMarkers(text)) {
+        if (commentHasStubMarkers(text)) {
           return true;
         }
       }

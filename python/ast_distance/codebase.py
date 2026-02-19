@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -507,6 +508,38 @@ class CodebaseComparator:
         src_lang = _parse_language(self.source.language)
         tgt_lang = _parse_language(self.target.language)
 
+        def _function_name_coverage_ratio(src_paths: list[str], tgt_paths: list[str]) -> float:
+            try:
+                src_bytes = parser._read_combined_files(src_paths)
+                tgt_bytes = parser._read_combined_files(tgt_paths)
+            except OSError:
+                return 1.0
+
+            src_funcs = parser.extract_functions_bytes(src_bytes, src_lang)
+            tgt_funcs = parser.extract_functions_bytes(tgt_bytes, tgt_lang)
+
+            src_names = [
+                SourceFile.normalize_name(name)
+                for name, _tree in src_funcs
+                if name and name != "<anonymous>"
+            ]
+            if not src_names:
+                return 1.0
+
+            tgt_counts = Counter(
+                SourceFile.normalize_name(name)
+                for name, _tree in tgt_funcs
+                if name and name != "<anonymous>"
+            )
+
+            matched = 0
+            for n in src_names:
+                if tgt_counts.get(n, 0) > 0:
+                    matched += 1
+                    tgt_counts[n] -= 1
+
+            return matched / len(src_names)
+
         for m in self.matches:
             try:
                 src_file = self.source.files[m.source_path]
@@ -531,9 +564,11 @@ class CodebaseComparator:
                     m.similarity = 0.0
                     m.is_stub = True
                 else:
-                    m.similarity = ASTSimilarity.combined_similarity_with_content(
+                    file_sim = ASTSimilarity.combined_similarity_with_content(
                         src_tree, tgt_tree, src_ids, tgt_ids
                     )
+                    fn_cov = _function_name_coverage_ratio(src_file.paths, tgt_file.paths)
+                    m.similarity = file_sim * fn_cov
 
                 # Documentation stats
                 src_docs = parser.extract_comments_from_file(src_file.paths, src_lang)

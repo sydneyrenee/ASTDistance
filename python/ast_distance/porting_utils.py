@@ -43,8 +43,8 @@ class FileStats:
 
 _TODO_RE = re.compile(r"//\s*TODO(\([^)]*\))?:\s*(.+)")
 _LINE_REF_RE = re.compile(r"Line\s+(\d+)(?:-(\d+))?", re.IGNORECASE)
-_TRANS_RE = re.compile(r"Transliterated from:\s*(.+\.kt)", re.IGNORECASE)
-_PORTLINT_RE = re.compile(r"port-lint:\s*source\s+(.+\.rs)", re.IGNORECASE)
+_TRANS_RE = re.compile(r"Transliterated from:\s*(.+)", re.IGNORECASE)
+_PORTLINT_RE = re.compile(r"port-lint:\s*(?:source|tests)\s+(.+)", re.IGNORECASE)
 
 
 class PortingAnalyzer:
@@ -142,7 +142,10 @@ class PortingAnalyzer:
         clean = re.sub(r"namespace[^\{]*\{?", "", clean)
         clean = re.sub(r"#pragma[^\n]*", "", clean)
         clean = "".join(clean.split())
-        stats.is_stub = len(clean) < 50
+        # Length-based stub detection is only reliable for C/C++ skeleton files.
+        # For other languages we rely on AST-based stub detection (TODO()/pass/unimplemented!/etc).
+        is_cpp_like = ext in (".cpp", ".cc", ".cxx", ".hpp", ".h", ".hxx", ".hh")
+        stats.is_stub = is_cpp_like and len(clean) < 50
 
         stats.transliterated_from = PortingAnalyzer.extract_transliterated_from(filepath)
         stats.todos = PortingAnalyzer.scan_todos(filepath)

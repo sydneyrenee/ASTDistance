@@ -27,12 +27,27 @@ class Language(Enum):
     CPP = "cpp"
     PYTHON = "python"
 
+def _make_language(capsule: object, name: str) -> tree_sitter.Language:
+    """Construct a Language from a tree-sitter-* package capsule.
+
+    The modern `tree-sitter` Python bindings accept a capsule directly
+    (required by our `tree-sitter-<lang>` dependencies).
+    """
+    try:
+        return tree_sitter.Language(capsule)  # type: ignore[arg-type]
+    except TypeError as e:
+        raise RuntimeError(
+            "ast-distance requires the modern 'tree-sitter' Python bindings (tree-sitter>=0.23) "
+            "which accept language capsules. Please upgrade your environment to match "
+            "python/pyproject.toml dependencies."
+        ) from e
+
 
 _LANGUAGES: dict[Language, tree_sitter.Language] = {
-    Language.RUST: tree_sitter.Language(tree_sitter_rust.language()),
-    Language.KOTLIN: tree_sitter.Language(tree_sitter_kotlin.language()),
-    Language.CPP: tree_sitter.Language(tree_sitter_cpp.language()),
-    Language.PYTHON: tree_sitter.Language(tree_sitter_py.language()),
+    Language.RUST: _make_language(tree_sitter_rust.language(), "rust"),
+    Language.KOTLIN: _make_language(tree_sitter_kotlin.language(), "kotlin"),
+    Language.CPP: _make_language(tree_sitter_cpp.language(), "cpp"),
+    Language.PYTHON: _make_language(tree_sitter_py.language(), "python"),
 }
 
 _NODE_MAP_FN = {
@@ -281,14 +296,90 @@ class ASTParser:
     @staticmethod
     def text_has_stub_markers(text: str) -> bool:
         lower = text.lower()
+
+        def _is_word(ch: str) -> bool:
+            return ch.isalnum() or ch == "_"
+
+        def _has_word(word: str) -> bool:
+            start = 0
+            while True:
+                idx = lower.find(word, start)
+                if idx < 0:
+                    return False
+                left_ok = idx == 0 or not _is_word(lower[idx - 1])
+                end = idx + len(word)
+                right_ok = end >= len(lower) or not _is_word(lower[end])
+                if left_ok and right_ok:
+                    return True
+                start = idx + 1
+
+        # Use word-boundary style matching for short markers so we don't trip on
+        # explanatory text like "TODOs/stubs are a failure mode" inside the tool itself.
         return (
-            "todo" in lower or
-            "stub" in lower or
-            "placeholder" in lower or
-            "fixme" in lower or
+            _has_word("todo") or
+            _has_word("stub") or
+            _has_word("placeholder") or
+            _has_word("fixme") or
             "not yet implemented" in lower or
-            "not implemented" in lower
+            "not implemented" in lower or
+            # Common stub constructs without spaces (Rust `unimplemented!`, Kotlin/Python `NotImplementedError`)
+            _has_word("unimplemented") or
+            _has_word("notimplemented")
         )
+
+    @staticmethod
+    def comment_has_stub_markers(text: str) -> bool:
+        # For comment nodes, be stricter: only treat as a stub marker when the
+        # comment itself starts with TODO/FIXME/STUB/etc. This avoids false
+        # positives from explanatory comments inside the tool.
+        lower = text.lower()
+
+        i = 0
+        if lower.startswith("//"):
+            i = 2
+            while i < len(lower) and lower[i] == "/":
+                i += 1
+        elif lower.startswith("#"):
+            i = 1
+            while i < len(lower) and lower[i] == "#":
+                i += 1
+        elif lower.startswith("/*"):
+            i = 2
+            if i < len(lower) and lower[i] == "*":
+                i += 1
+
+        while i < len(lower) and lower[i].isspace():
+            i += 1
+        while i < len(lower) and lower[i] == "*":
+            i += 1
+            while i < len(lower) and lower[i].isspace():
+                i += 1
+
+        def _is_word(ch: str) -> bool:
+            return ch.isalnum() or ch == "_"
+
+        def _starts_with_word(word: str) -> bool:
+            if not lower.startswith(word, i):
+                return False
+            end = i + len(word)
+            if end >= len(lower):
+                return True
+            return not _is_word(lower[end])
+
+        if (
+            _starts_with_word("todo")
+            or _starts_with_word("fixme")
+            or _starts_with_word("stub")
+            or _starts_with_word("placeholder")
+            or _starts_with_word("unimplemented")
+            or _starts_with_word("notimplemented")
+        ):
+            return True
+
+        if lower.startswith("not implemented", i) or lower.startswith("not yet implemented", i):
+            return True
+
+        return False
 
     def has_stub_bodies(self, source: str, lang: Language) -> bool:
         parser = self._get_parser(lang)
@@ -312,19 +403,35 @@ class ASTParser:
             "block_comment",
             "comment",
             "multiline_comment",
-            "string_literal",
-            "string_content",
-            "raw_string_literal",
-            "string",
         }
 
         def body_has_markers(root: tree_sitter.Node) -> bool:
             stack = [root]
             while stack:
                 node = stack.pop()
+                # Strong stub constructs that don't rely on comments/strings.
+                if lang == Language.PYTHON:
+                    if node.type in {"pass_statement", "ellipsis"}:
+                        return True
+                    if node.type == "raise_statement":
+                        text = (node.text or b"")
+                        if b"NotImplementedError" in text or b"notimplementederror" in text.lower():
+                            return True
+                elif lang == Language.RUST:
+                    if node.type == "macro_invocation":
+                        text = (node.text or b"")[:96].decode(errors="replace").lower()
+                        if ("todo!" in text or "unimplemented!" in text or "unreachable!" in text or
+                                self.text_has_stub_markers(text)):
+                            return True
+                elif lang == Language.KOTLIN:
+                    if node.type in {"simple_identifier", "type_identifier", "identifier"}:
+                        text = (node.text or b"").decode(errors="replace")
+                        if text in {"TODO", "NotImplementedError"}:
+                            return True
+
                 if node.type in marker_types:
                     text = (node.text or b"").decode(errors="replace")
-                    if self.text_has_stub_markers(text):
+                    if self.comment_has_stub_markers(text):
                         return True
                 stack.extend(node.children)
             return False

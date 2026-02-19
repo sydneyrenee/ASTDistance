@@ -10,14 +10,34 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <cstdio>
+#include <memory>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <ctime>
+#include <cmath>
+#include <unordered_map>
+#include <unordered_set>
 #include <unistd.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <tree_sitter/api.h>
 
 using namespace ast_distance;
+
+struct GuardrailsContext {
+    bool active = false;
+    std::string task_file;
+    int agent = 0;
+    bool override_mode = false;
+};
+
+static GuardrailsContext g_guardrails;
+
+// Forward declarations for guardrails helpers defined later in this file.
+static void print_agent_activity_section(const TaskManager& tm, const std::string& task_file, int current_agent);
 
 Language parse_language(const std::string& lang_str) {
     if (lang_str == "rust") return Language::RUST;
@@ -40,6 +60,8 @@ const char* language_name(Language lang) {
 void print_usage(const char* program) {
     std::cerr << "AST Distance - Cross-language AST comparison and porting analysis\n\n";
     std::cerr << "Usage:\n";
+    std::cerr << "  " << program << " [--agent <number>] [--task-file <tasks.json>] [--override] <command>\n";
+    std::cerr << "      Guardrails: when a task system is initialized, commands require --agent.\n\n";
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
@@ -105,8 +127,9 @@ void print_usage(const char* program) {
     std::cerr << "      Generate task file from missing/incomplete ports\n\n";
     std::cerr << "  " << program << " --tasks <task_file>\n";
     std::cerr << "      Show task status summary\n\n";
-    std::cerr << "  " << program << " --assign <task_file> <agent_id>\n";
-    std::cerr << "      Assign highest-priority pending task to an agent\n";
+    std::cerr << "  " << program << " --assign <task_file> [agent_number]\n";
+    std::cerr << "      Assign highest-priority pending task to an agent session\n";
+    std::cerr << "      If agent_number is omitted, a new one is allocated and printed\n";
     std::cerr << "      Outputs complete porting instructions and AGENTS.md guidelines\n\n";
     std::cerr << "  " << program << " --complete <task_file> <source_qualified>\n";
     std::cerr << "      Mark a task as completed\n\n";
@@ -118,9 +141,10 @@ void print_usage(const char* program) {
     std::cerr << "  This allows --deep analysis to match files by explicit declaration rather\n";
     std::cerr << "  than heuristic name matching, improving accuracy and enabling documentation\n";
     std::cerr << "  gap detection.\n\n";
-    std::cerr << "  Format (Kotlin porting from Rust):\n";
-    std::cerr << "    // port-lint: source <relative-path-to-rust-file>\n\n";
-    std::cerr << "  Example:\n";
+    std::cerr << "  Format:\n";
+    std::cerr << "    // port-lint: source <relative-path-to-source-file>\n";
+    std::cerr << "    ## port-lint: source <relative-path-to-source-file>   (Python)\n\n";
+    std::cerr << "  Example (Kotlin):\n";
     std::cerr << "    // port-lint: source core/src/config.rs\n";
     std::cerr << "    package com.example.config\n\n";
     std::cerr << "  The header must appear in the first 50 lines of the file.\n";
@@ -999,42 +1023,64 @@ void generate_reports(const Codebase& source, const Codebase& target,
                 report << ")\n";
             }
         }
-        report << "\n";
-        
-        report << "## High Priority Missing Files\n\n";
-        report << "Files with highest dependency counts:\n\n";
-        int shown_missing = 0;
-        for (const auto* sf : missing) {
-            if (shown_missing++ < 20) {
-                report << shown_missing << ". **" << sf->qualified_name << "** (" 
-                       << sf->dependent_count << " deps)\n";
-            }
-        }
-        report << "\n";
-        
-        report << "## Documentation Gaps\n\n";
-        report << "**Documentation coverage:** " << total_tgt_doc_lines << " / " 
-               << total_src_doc_lines << " lines (";
-        if (total_src_doc_lines > 0) {
-            report << std::fixed << std::setprecision(0)
-                   << (100.0f * total_tgt_doc_lines / total_src_doc_lines) << "%)\n\n";
-        } else {
-            report << "N/A)\n\n";
-        }
-        
-        report << "Files with significant documentation gaps (>80%):\n\n";
-        int shown_docs = 0;
-        for (const auto& [gap, m] : doc_gaps) {
-            if (gap > 0.8f && shown_docs++ < 10) {
-                report << "- `" << m->source_qualified << "` - " 
-                       << std::fixed << std::setprecision(0) << (gap * 100) << "% gap ("
-                       << m->source_doc_lines << " → " << m->target_doc_lines << " lines)\n";
-            }
-        }
-        report << "\n";
-        
-        std::cout << "✅ Generated: port_status_report.md\n";
-    }
+	        report << "\n";
+	        
+	        report << "## High Priority Missing Files\n\n";
+	        if (missing.empty()) {
+	            report << "No missing files detected.\n\n";
+	        } else {
+	            report << "| Rank | Source file | Deps | Path |\n";
+	            report << "|------|------------|------|------|\n";
+	            int shown_missing = 0;
+	            for (const auto* sf : missing) {
+	                if (shown_missing++ >= 20) break;
+	                report << "| " << shown_missing << " | `" << sf->qualified_name << "` | "
+	                       << sf->dependent_count << " | `" << sf->relative_path << "` |\n";
+	            }
+	            if (missing.size() > 20) {
+	                report << "\n... and " << (missing.size() - 20) << " more missing files.\n";
+	            }
+	            report << "\n";
+	        }
+	        
+	        report << "## Documentation Gaps\n\n";
+	        float doc_coverage_pct = 0.0f;
+	        bool docs_missing = false;
+	        if (total_src_doc_lines > 0) {
+	            doc_coverage_pct = 100.0f * total_tgt_doc_lines / total_src_doc_lines;
+	            docs_missing = doc_coverage_pct < 85.0f;
+	        }
+	        if (docs_missing) {
+	            report << "There is missing documentation that is hurting overall scoring.\n\n";
+	        }
+	        report << "**Documentation coverage:** " << total_tgt_doc_lines << " / " 
+	               << total_src_doc_lines << " lines (";
+	        if (total_src_doc_lines > 0) {
+	            report << std::fixed << std::setprecision(0)
+	                   << (100.0f * total_tgt_doc_lines / total_src_doc_lines) << "%)\n\n";
+	        } else {
+	            report << "N/A)\n\n";
+	        }
+	        
+	        report << "Top documentation gaps (>20%):\n\n";
+	        if (doc_gaps.empty()) {
+	            report << "No significant documentation gaps found.\n\n";
+	        } else {
+	            int shown_docs = 0;
+	            for (const auto& [gap, m] : doc_gaps) {
+	                if (shown_docs++ >= 15) break;
+	                report << "- `" << m->source_qualified << "` - " 
+	                       << std::fixed << std::setprecision(0) << (gap * 100) << "% gap ("
+	                       << m->source_doc_lines << " → " << m->target_doc_lines << " lines)\n";
+	            }
+	            if (doc_gaps.size() > 15) {
+	                report << "\n... and " << (doc_gaps.size() - 15) << " more files with doc gaps.\n";
+	            }
+	            report << "\n";
+	        }
+	        
+	        std::cout << "✅ Generated: port_status_report.md\n";
+	    }
     
     // 2. Generate high_priority_ports.md
     {
@@ -1073,12 +1119,30 @@ void generate_reports(const Codebase& source, const Codebase& target,
                 report << "\n";
             }
         }
-        if (!has_critical) {
-            report << "No critical issues with dependencies.\n\n";
-        }
-        
-        std::cout << "✅ Generated: high_priority_ports.md\n";
-    }
+	        if (!has_critical) {
+	            report << "No critical issues with dependencies.\n\n";
+	        }
+
+	        report << "## Missing Files (Top by Dependents)\n\n";
+	        if (missing.empty()) {
+	            report << "No missing files detected.\n\n";
+	        } else {
+	            report << "| Rank | Source file | Deps | Path |\n";
+	            report << "|------|------------|------|------|\n";
+	            int shown_missing = 0;
+	            for (const auto* sf : missing) {
+	                if (shown_missing++ >= 20) break;
+	                report << "| " << shown_missing << " | `" << sf->qualified_name << "` | "
+	                       << sf->dependent_count << " | `" << sf->relative_path << "` |\n";
+	            }
+	            if (missing.size() > 20) {
+	                report << "\n... and " << (missing.size() - 20) << " more missing files.\n";
+	            }
+	            report << "\n";
+	        }
+	        
+	        std::cout << "✅ Generated: high_priority_ports.md\n";
+	    }
     
     // 3. Generate NEXT_ACTIONS.md
     {
@@ -1114,17 +1178,21 @@ void generate_reports(const Codebase& source, const Codebase& target,
             }
         }
         
-        report << "## Priority 2: Port Missing High-Value Files\n\n";
-        report << "Critical missing files (>10 dependencies):\n\n";
-        int p2_count = 0;
-        for (const auto* sf : missing) {
-            if (sf->dependent_count >= 10 && p2_count++ < 10) {
-                report << p2_count << ". **" << sf->qualified_name << "** (" 
-                       << sf->dependent_count << " deps)\n";
-                report << "   - Path: `" << sf->relative_path << "`\n";
-                report << "   - Essential for " << sf->dependent_count << " other files\n\n";
-            }
-        }
+	        report << "## Priority 2: Port Missing High-Value Files\n\n";
+	        report << "Critical missing files (>10 dependencies):\n\n";
+	        int p2_count = 0;
+	        for (const auto* sf : missing) {
+	            if (sf->dependent_count >= 10 && p2_count < 10) {
+	                p2_count++;
+	                report << p2_count << ". **" << sf->qualified_name << "** (" 
+	                       << sf->dependent_count << " deps)\n";
+	                report << "   - Path: `" << sf->relative_path << "`\n";
+	                report << "   - Essential for " << sf->dependent_count << " other files\n\n";
+	            }
+	        }
+	        if (p2_count == 0) {
+	            report << "No missing high-value files detected.\n\n";
+	        }
         
         report << "## Success Criteria\n\n";
         report << "For each file to be considered \"complete\":\n";
@@ -1180,6 +1248,245 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
     std::cout << "Computing AST similarities...\n";
     comp.compute_similarities();
 
+    auto ranked = comp.ranked_for_porting();
+
+    // Agent-scoped dashboard (guardrails): in task mode, lock the view to the assigned file
+    // and its direct imports to prevent "dashboard skipping" and out-of-scope prioritization.
+    bool guard_active = (g_guardrails.active && g_guardrails.agent > 0);
+    if (guard_active && !g_guardrails.override_mode) {
+        TaskManager tm(g_guardrails.task_file);
+        if (tm.load()) {
+            print_agent_activity_section(tm, g_guardrails.task_file, g_guardrails.agent);
+
+            std::string agent_id = std::to_string(g_guardrails.agent);
+            const PortTask* focus = nullptr;
+            for (const auto& t : tm.tasks) {
+                if (t.status == TaskStatus::ASSIGNED && t.assigned_to == agent_id) {
+                    focus = &t;
+                    break;
+                }
+            }
+
+            std::cout << "\n=== Agent Scope Dashboard ===\n\n";
+            std::cout << "Task file: " << g_guardrails.task_file << "\n";
+            std::cout << "You are agent #" << g_guardrails.agent << "\n\n";
+
+            if (!focus) {
+                std::cout << "No task assigned to agent #" << g_guardrails.agent << ".\n";
+                std::cout << "Run: ast_distance --assign " << g_guardrails.task_file
+                          << " " << g_guardrails.agent << "\n\n";
+                std::cout << "Note: full project dashboard is locked in agent scope.\n";
+                std::cout << "Use --override if you need full-project output.\n";
+                return;
+            }
+
+            // Build relative_path -> logical key maps for locating the focus file.
+            std::map<std::string, std::string> src_rel_to_key;
+            for (const auto& [k, sf] : source.files) {
+                src_rel_to_key[sf.relative_path] = k;
+            }
+            std::map<std::string, std::string> tgt_rel_to_key;
+            for (const auto& [k, sf] : target.files) {
+                tgt_rel_to_key[sf.relative_path] = k;
+            }
+
+            std::string focus_src_key;
+            auto it_src = src_rel_to_key.find(focus->source_path);
+            if (it_src != src_rel_to_key.end()) focus_src_key = it_src->second;
+
+            std::string focus_tgt_key;
+            auto it_tgt = tgt_rel_to_key.find(focus->target_path);
+            if (it_tgt != tgt_rel_to_key.end()) focus_tgt_key = it_tgt->second;
+
+            std::filesystem::path focus_source_path =
+                std::filesystem::path(tm.source_root) / focus->source_path;
+            std::filesystem::path focus_target_path =
+                std::filesystem::path(tm.target_root) / focus->target_path;
+
+            std::cout << "Assigned task: " << focus->source_qualified << "\n";
+            std::cout << "Source: " << focus_source_path.string();
+            if (!std::filesystem::exists(focus_source_path)) std::cout << " (missing?)";
+            std::cout << "\n";
+            std::cout << "Target: " << focus_target_path.string();
+            if (std::filesystem::exists(focus_target_path)) std::cout << " (exists)";
+            else std::cout << " (missing)";
+            std::cout << "\n\n";
+
+            // Scope: focus file + its direct imports, plus the target file + its imports (if it exists).
+            std::set<std::string> scope_source_keys;
+            std::set<std::string> scope_target_keys;
+            if (!focus_src_key.empty()) {
+                scope_source_keys.insert(focus_src_key);
+                const auto& sf = source.files.at(focus_src_key);
+                scope_source_keys.insert(sf.depends_on.begin(), sf.depends_on.end());
+            }
+            if (!focus_tgt_key.empty()) {
+                scope_target_keys.insert(focus_tgt_key);
+                const auto& tf = target.files.at(focus_tgt_key);
+                scope_target_keys.insert(tf.depends_on.begin(), tf.depends_on.end());
+            }
+
+            std::cout << "Scope: " << scope_source_keys.size()
+                      << " source files (focus + imports), " << scope_target_keys.size()
+                      << " target files (focus + imports)\n";
+
+            // Determine which scoped imports are already assigned to other agents.
+            std::map<std::string, int> assigned_to_agent;
+            for (const auto& t : tm.tasks) {
+                if (t.status != TaskStatus::ASSIGNED) continue;
+                int a = 0;
+                try {
+                    a = std::stoi(t.assigned_to);
+                } catch (...) {
+                    continue;
+                }
+                assigned_to_agent[t.source_qualified] = a;
+            }
+
+            std::map<std::string, int> blocked_by;
+            for (const auto& key : scope_source_keys) {
+                if (key == focus_src_key) continue;
+                const auto& sf = source.files.at(key);
+                auto ita = assigned_to_agent.find(sf.qualified_name);
+                if (ita != assigned_to_agent.end() && ita->second != g_guardrails.agent) {
+                    blocked_by[key] = ita->second;
+                }
+            }
+
+            if (!blocked_by.empty()) {
+                std::cout << "\nBlocked imports (assigned to other agents):\n";
+                for (const auto& [key, a] : blocked_by) {
+                    const auto& sf = source.files.at(key);
+                    std::cout << "  - " << sf.qualified_name << " (agent #" << a << ")\n";
+                }
+            }
+
+            // Match lookup by source logical key.
+            std::map<std::string, const CodebaseComparator::Match*> match_by_source;
+            for (const auto& m : comp.matches) {
+                match_by_source[m.source_path] = &m;
+            }
+            std::set<std::string> unmatched_source(
+                comp.unmatched_source.begin(), comp.unmatched_source.end());
+
+            auto format_fn_parity = [](const CodebaseComparator::Match* m) -> std::string {
+                if (!m || m->source_function_count <= 0) return "-";
+                return std::to_string(m->matched_function_count) + "/" +
+                       std::to_string(m->source_function_count);
+            };
+
+            auto print_scope_row = [&](const std::string& key, bool is_focus) {
+                const auto& sf = source.files.at(key);
+                const CodebaseComparator::Match* m = nullptr;
+                auto it = match_by_source.find(key);
+                if (it != match_by_source.end()) m = it->second;
+
+                bool missing = unmatched_source.count(key) > 0;
+                std::string status;
+                if (is_focus) status = "FOCUS";
+                if (missing) status = status.empty() ? "MISSING_FILE" : status + ",MISSING_FILE";
+                if (m && m->is_stub) status = status.empty() ? "STUB(FAIL)" : status + ",STUB(FAIL)";
+                if (m && m->todo_count > 0) status = status.empty() ? "TODO(FAIL)" : status + ",TODO(FAIL)";
+                if (m && m->source_function_count > 0 &&
+                    m->matched_function_count < m->source_function_count) {
+                    status = status.empty() ? "MISSING_FUNCTIONS" : status + ",MISSING_FUNCTIONS";
+                }
+                auto itb = blocked_by.find(key);
+                if (itb != blocked_by.end()) {
+                    std::string b = "BLOCKED(agent #" + std::to_string(itb->second) + ")";
+                    status = status.empty() ? b : status + "," + b;
+                }
+
+                int dependents = sf.dependent_count;
+                std::string sim_str = "-";
+                int todos = 0;
+                int lint = 0;
+                if (m && !missing) {
+                    std::ostringstream sim;
+                    sim << std::fixed << std::setprecision(2) << m->similarity;
+                    sim_str = sim.str();
+                    todos = m->todo_count;
+                    lint = m->lint_count;
+                }
+
+                std::cout << std::setw(30) << std::left << sf.qualified_name.substr(0, 28)
+                          << std::setw(11) << dependents
+                          << std::setw(11) << sim_str
+                          << std::setw(16) << format_fn_parity(m)
+                          << std::setw(8) << todos
+                          << std::setw(6) << lint
+                          << status
+                          << "\n";
+            };
+
+            std::cout << "\n=== Scope Work Items ===\n\n";
+            std::cout << std::setw(30) << std::left << "File"
+                      << std::setw(11) << "Dependents"
+                      << std::setw(11) << "Similarity"
+                      << std::setw(16) << "Function parity"
+                      << std::setw(8) << "TODOs"
+                      << std::setw(6) << "Lint"
+                      << "Status\n";
+            std::cout << std::string(90, '-') << "\n";
+
+            if (!focus_src_key.empty()) {
+                print_scope_row(focus_src_key, true);
+            } else {
+                std::cout << std::setw(30) << std::left << focus->source_qualified.substr(0, 28)
+                          << std::setw(11) << focus->dependent_count
+                          << std::setw(11) << "-"
+                          << std::setw(16) << "-"
+                          << std::setw(8) << 0
+                          << std::setw(6) << 0
+                          << "FOCUS,UNKNOWN_SOURCE_PATH\n";
+            }
+
+            std::vector<std::string> others;
+            for (const auto& k : scope_source_keys) {
+                if (k == focus_src_key) continue;
+                others.push_back(k);
+            }
+            std::sort(others.begin(), others.end(),
+                      [&](const std::string& a, const std::string& b) {
+                          return source.files.at(a).dependent_count >
+                                 source.files.at(b).dependent_count;
+                      });
+            for (const auto& k : others) {
+                print_scope_row(k, false);
+            }
+
+            // Deterministic next action hint for the focus file.
+            std::cout << "\n=== Next Action (Focus) ===\n\n";
+            const CodebaseComparator::Match* focus_match = nullptr;
+            if (!focus_src_key.empty()) {
+                auto it = match_by_source.find(focus_src_key);
+                if (it != match_by_source.end()) focus_match = it->second;
+            }
+
+            if (!focus_match || unmatched_source.count(focus_src_key) > 0) {
+                std::cout << "Target file is missing. Create it and port the full implementation.\n";
+            } else if (focus_match->is_stub) {
+                std::cout << "Replace the stub with a real implementation (stubs are a failure mode).\n";
+            } else if (focus_match->todo_count > 0) {
+                std::cout << "Remove TODOs and finish the implementation (TODOs are a failure mode).\n";
+            } else if (focus_match->source_function_count > 0 &&
+                       focus_match->matched_function_count < focus_match->source_function_count) {
+                std::cout << "Port missing functions to reach per-file parity.\n";
+            } else if (focus_match->similarity < 0.85f) {
+                std::cout << "Improve similarity to >= 0.85 (whole-file + identifier-content + parity).\n";
+            } else {
+                std::cout << "Looks complete. If you have validated behavior and tests, mark it complete.\n";
+            }
+            std::cout << "\nMark complete with:\n";
+            std::cout << "  ast_distance --agent " << g_guardrails.agent << " --complete "
+                      << g_guardrails.task_file << " " << focus->source_qualified << "\n";
+
+            std::cout << "\nNote: full project dashboard is locked in agent scope.\n";
+            std::cout << "Use --override to view the full project view.\n";
+            return;
+        }
+    }
+
     comp.print_report();
 
     // Porting quality summary
@@ -1199,103 +1506,173 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 
     std::cout << "Matched by header:    " << header_matched << " / " << comp.matches.size() << "\n";
     std::cout << "Matched by name:      " << (comp.matches.size() - header_matched) << " / " << comp.matches.size() << "\n";
-    std::cout << "Total TODOs in target: " << total_todos << "\n";
-    std::cout << "Total lint errors:    " << total_lint << "\n";
-    std::cout << "Stub files:           " << stub_count << "\n";
+	    std::cout << "Total TODOs in target: " << total_todos << "\n";
+	    std::cout << "Total lint errors:    " << total_lint << "\n";
+	    std::cout << "Stub files:           " << stub_count << "\n";
 
-    // Show files with issues
-    std::cout << "\n=== Files with Issues ===\n\n";
-    std::cout << std::setw(30) << std::left << "File"
-              << std::setw(8) << "Sim"
-              << std::setw(8) << "Ratio"
-              << std::setw(6) << "TODOs"
-              << std::setw(6) << "Lint"
-              << "Status\n";
-    std::cout << std::string(70, '-') << "\n";
+		    int incomplete = 0;
+		    int func_gap_files = 0;
+		    for (const auto& m : ranked) {
+	        if (m.similarity < 0.6) incomplete++;
+	        if (m.source_function_count > 0 &&
+	            m.matched_function_count < m.source_function_count) {
+	            func_gap_files++;
+	        }
+	    }
 
-    auto ranked = comp.ranked_for_porting();
-    int shown = 0;
-    for (const auto& m : ranked) {
-        if (m.todo_count == 0 && m.lint_count == 0 && !m.is_stub && m.similarity >= 0.6) {
-            continue;  // Skip files without issues
+	    int total_src_doc_lines = 0;
+	    int total_tgt_doc_lines = 0;
+	    for (const auto& m : comp.matches) {
+	        total_src_doc_lines += m.source_doc_lines;
+	        total_tgt_doc_lines += m.target_doc_lines;
+	    }
+	    const float kDocCoverageWarnPct = 85.0f;
+	    float doc_coverage_pct = 0.0f;
+	    if (total_src_doc_lines > 0) {
+	        doc_coverage_pct = 100.0f * static_cast<float>(total_tgt_doc_lines) /
+	                           static_cast<float>(total_src_doc_lines);
+	    }
+	    bool docs_missing = (total_src_doc_lines > 0 && doc_coverage_pct < kDocCoverageWarnPct);
+
+	    std::cout << "\n=== Big Picture ===\n\n";
+	    std::cout << "- Missing files: " << comp.unmatched_source.size() << "\n";
+	    std::cout << "- Incomplete ports (similarity < 60%): " << incomplete << "\n";
+	    std::cout << "- Stub files: " << stub_count << "\n";
+	    std::cout << "- Files missing functions: " << func_gap_files << "\n";
+	    if (total_src_doc_lines > 0) {
+	        int pct = static_cast<int>(doc_coverage_pct + 0.5f);
+	        std::cout << "- Documentation coverage: " << total_tgt_doc_lines << " / "
+	                  << total_src_doc_lines << " lines (" << pct << "%)\n";
+		    } else {
+		        std::cout << "- Documentation coverage: N/A (source has no docs)\n";
+		    }
+		    std::cout << "\nPrimary focus: ";
+		    if (!comp.unmatched_source.empty()) {
+		        std::cout << "create missing files (highest deps first)\n";
+		    } else if (stub_count > 0) {
+		        std::cout << "replace stub files with real implementations\n";
+		    } else if (func_gap_files > 0) {
+		        std::cout << "port missing functions to reach per-file parity\n";
+		    } else if (incomplete > 0) {
+		        std::cout << "improve incomplete ports (similarity < 60%)\n";
+		    } else if (docs_missing) {
+		        std::cout << "port missing documentation\n";
+		    } else {
+		        std::cout << "no major gaps detected\n";
+		    }
+
+			    // Show files with issues
+			    std::cout << "\n=== Files with Issues ===\n\n";
+		    std::cout << std::setw(30) << std::left << "File"
+		              << std::setw(11) << "Similarity"
+		              << std::setw(11) << "LineRatio"
+		              << std::setw(14) << "FunctionParity"
+		              << std::setw(6) << "TODOs"
+		              << std::setw(6) << "Lint"
+		              << "Status\n";
+		    std::cout << std::string(90, '-') << "\n";
+
+	    int shown = 0;
+	    for (const auto& m : ranked) {
+	        bool func_gap = (m.source_function_count > 0 &&
+	                         m.matched_function_count < m.source_function_count);
+	        if (m.todo_count == 0 && m.lint_count == 0 && !m.is_stub && !func_gap && m.similarity >= 0.6) {
+	            continue;  // Skip files without issues
+	        }
+	        if (shown++ >= 20) {
+	            std::cout << "... and " << (ranked.size() - 20) << " more files\n";
+	            break;
         }
-        if (shown++ >= 20) {
-            std::cout << "... and " << (ranked.size() - 20) << " more files\n";
-            break;
-        }
 
-        std::string status;
-        if (m.is_stub) status = "STUB";
-        else if (m.similarity < 0.4) status = "LOW_SIM";
-        else if (m.lint_count > 0) status = "LINT";
-        else if (m.todo_count > 0) status = "TODO";
+	        std::string status;
+	        if (m.is_stub) status = "STUB";
+	        else if (m.similarity < 0.4) status = "LOW_SIM";
+	        else if (func_gap) status = "MISSING_FUNCS";
+	        else if (m.lint_count > 0) status = "LINT";
+	        else if (m.todo_count > 0) status = "TODO";
 
-        float ratio = 0.0f;
-        if (m.source_lines > 0) {
-            ratio = static_cast<float>(m.target_lines) / static_cast<float>(m.source_lines);
-        }
+	        float ratio = 0.0f;
+	        if (m.source_lines > 0) {
+	            ratio = static_cast<float>(m.target_lines) / static_cast<float>(m.source_lines);
+	        }
 
-        std::cout << std::setw(30) << std::left << m.target_qualified.substr(0, 28)
-                  << std::setw(8) << std::fixed << std::setprecision(2) << m.similarity
-                  << std::setw(8) << std::fixed << std::setprecision(2) << ratio
-                  << std::setw(6) << m.todo_count
-                  << std::setw(6) << m.lint_count
-                  << status << "\n";
-    }
+	        std::string funcs = "-";
+	        if (m.source_function_count > 0) {
+	            funcs = std::to_string(m.matched_function_count) + "/" +
+	                    std::to_string(m.source_function_count);
+	        }
 
-    // Porting recommendations
-    std::cout << "\n=== Porting Recommendations ===\n\n";
+		        std::cout << std::setw(30) << std::left << m.target_qualified.substr(0, 28)
+		                  << std::setw(11) << std::fixed << std::setprecision(2) << m.similarity
+		                  << std::setw(11) << std::fixed << std::setprecision(2) << ratio
+		                  << std::setw(14) << funcs
+		                  << std::setw(6) << m.todo_count
+		                  << std::setw(6) << m.lint_count
+		                  << status << "\n";
+	    }
 
-    int incomplete = 0;
-    for (const auto& m : ranked) {
-        if (m.similarity < 0.6) incomplete++;
-    }
+	    // Porting recommendations
+	    std::cout << "\n=== Porting Recommendations ===\n\n";
 
-    std::cout << "Incomplete ports (similarity < 60%): " << incomplete << "\n";
-    std::cout << "Missing files: " << comp.unmatched_source.size() << "\n\n";
+	    std::cout << "Incomplete ports (similarity < 60%): " << incomplete << "\n";
+	    std::cout << "Missing files: " << comp.unmatched_source.size() << "\n\n";
 
-    if (incomplete > 0) {
-        std::cout << "Top priority to complete:\n";
-        int shown_priority = 0;
-        for (const auto& m : ranked) {
-            if (m.similarity < 0.6 && shown_priority++ < 10) {
-                std::cout << "  " << std::setw(30) << std::left << m.source_qualified
-                          << " sim=" << std::fixed << std::setprecision(2) << m.similarity
-                          << " deps=" << m.source_dependents;
-                if (m.is_stub) std::cout << " [STUB]";
-                if (m.todo_count > 0) std::cout << " [" << m.todo_count << " TODOs]";
-                std::cout << "\n";
-            }
-        }
-    }
+	    if (incomplete > 0) {
+	        std::cout << "Top priority to complete:\n";
+	        int shown_priority = 0;
+	        for (const auto& m : ranked) {
+	            if (m.similarity < 0.6 && shown_priority++ < 10) {
+	                std::string funcs = "-";
+	                if (m.source_function_count > 0) {
+	                    funcs = std::to_string(m.matched_function_count) + "/" +
+	                            std::to_string(m.source_function_count);
+	                }
+		                std::cout << "  " << std::setw(30) << std::left << m.source_qualified
+		                          << " similarity=" << std::fixed << std::setprecision(2) << m.similarity
+		                          << " function_parity=" << funcs
+		                          << " dependents=" << m.source_dependents;
+	                if (m.is_stub) std::cout << " [STUB]";
+	                if (m.todo_count > 0) std::cout << " [" << m.todo_count << " TODOs]";
+	                std::cout << "\n";
+	            }
+	        }
+	    }
 
-    // Prepare missing files vector for report generation
-    std::vector<const SourceFile*> missing;
-    if (!comp.unmatched_source.empty()) {
-        std::cout << "\nTop priority to create:\n";
-        // Sort unmatched by dependents
-        for (const auto& path : comp.unmatched_source) {
-            missing.push_back(&source.files.at(path));
-        }
-        std::sort(missing.begin(), missing.end(),
-            [](const SourceFile* a, const SourceFile* b) {
-                return a->dependent_count > b->dependent_count;
-            });
+	    // Prepare missing files vector for report generation
+	    std::vector<const SourceFile*> missing;
+	    if (!comp.unmatched_source.empty()) {
+	        std::cout << "\n=== Missing Files (Top by Dependents) ===\n\n";
+	        // Sort unmatched by dependents
+	        for (const auto& path : comp.unmatched_source) {
+	            missing.push_back(&source.files.at(path));
+	        }
+	        std::sort(missing.begin(), missing.end(),
+	            [](const SourceFile* a, const SourceFile* b) {
+	                return a->dependent_count > b->dependent_count;
+	            });
 
-        int shown_missing = 0;
-        for (const auto* sf : missing) {
-            if (shown_missing++ < 10) {
-                std::cout << "  " << std::setw(30) << std::left << sf->qualified_name
-                          << " deps=" << sf->dependent_count << "\n";
-            }
-        }
-    }
+		        std::cout << std::setw(30) << std::left << "Source File"
+		                  << std::setw(11) << "Dependents"
+		                  << "Path\n";
+		        std::cout << std::string(81, '-') << "\n";
 
-    // Documentation gaps section
-    std::cout << "\n=== Documentation Gaps ===\n\n";
+	        int shown_missing = 0;
+	        for (const auto* sf : missing) {
+	            if (shown_missing++ >= 20) {
+	                std::cout << "... and " << (missing.size() - 20) << " more missing files\n";
+	                break;
+	            }
+		            std::cout << std::setw(30) << std::left << sf->qualified_name.substr(0, 28)
+		                      << std::setw(11) << sf->dependent_count
+		                      << sf->relative_path << "\n";
+		        }
+		    }
 
-    // Collect files with doc gaps, sorted by gap severity
-    std::vector<std::pair<float, const CodebaseComparator::Match*>> doc_gaps;
+	    // Documentation gaps section
+	    std::cout << "\n=== Documentation Gaps ===\n\n";
+
+	    // Collect files with doc gaps, sorted by gap severity
+	    std::vector<std::pair<float, const CodebaseComparator::Match*>> doc_gaps;
     for (const auto& m : comp.matches) {
         float gap = m.doc_gap_ratio();
         if (gap > 0.2f && m.source_doc_lines > 5) {  // >20% gap and source has meaningful docs
@@ -1303,24 +1680,28 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
         }
     }
 
-    std::sort(doc_gaps.begin(), doc_gaps.end(),
-        [](const auto& a, const auto& b) {
-            // Sort by gap ratio * source doc lines (prioritize big gaps in well-documented files)
-            return (a.first * a.second->source_doc_lines) > (b.first * b.second->source_doc_lines);
-        });
+	    std::sort(doc_gaps.begin(), doc_gaps.end(),
+	        [](const auto& a, const auto& b) {
+	            // Sort by gap ratio * source doc lines (prioritize big gaps in well-documented files)
+	            return (a.first * a.second->source_doc_lines) > (b.first * b.second->source_doc_lines);
+	        });
 
-    // Calculate total doc lines (moved out of block for report generation)
-    int total_src_doc_lines = 0;
-    int total_tgt_doc_lines = 0;
-    for (const auto& m : comp.matches) {
-        total_src_doc_lines += m.source_doc_lines;
-        total_tgt_doc_lines += m.target_doc_lines;
-    }
+	    if (docs_missing) {
+	        std::cout << "There is missing documentation that is hurting overall scoring.\n";
+	    }
+	    if (total_src_doc_lines > 0) {
+	        int pct = static_cast<int>(doc_coverage_pct + 0.5f);
+	        std::cout << "Documentation coverage: " << total_tgt_doc_lines << " / "
+	                  << total_src_doc_lines << " lines (" << pct << "%)\n";
+	    } else {
+	        std::cout << "Documentation coverage: N/A (source has no docs)\n";
+	    }
+	    std::cout << "Files with >20% doc gap: " << doc_gaps.size() << "\n\n";
 
-    if (doc_gaps.empty()) {
-        std::cout << "No significant documentation gaps found.\n";
-    } else {
-        std::cout << std::setw(30) << std::left << "File"
+	    if (doc_gaps.empty()) {
+	        std::cout << "No significant documentation gaps found.\n";
+	    } else {
+	        std::cout << std::setw(30) << std::left << "File"
                   << std::setw(12) << "Src Docs"
                   << std::setw(12) << "Tgt Docs"
                   << std::setw(10) << "Gap %"
@@ -1339,17 +1720,11 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
             std::cout << std::setw(30) << std::left << m->source_qualified.substr(0, 28)
                       << std::setw(12) << m->source_doc_lines
                       << std::setw(12) << m->target_doc_lines
-                      << std::setw(10) << gap_str
-                      << std::setw(10) << std::fixed << std::setprecision(2) << m->doc_similarity
-                      << "\n";
-        }
-
-        std::cout << "\nDocumentation coverage: " << total_tgt_doc_lines << " / " << total_src_doc_lines
-                  << " lines (" << std::fixed << std::setprecision(0)
-                  << (total_src_doc_lines > 0 ? (100.0f * total_tgt_doc_lines / total_src_doc_lines) : 0)
-                  << "%)\n";
-        std::cout << "Files with >20% doc gap: " << doc_gaps.size() << "\n";
-    }
+	                      << std::setw(10) << gap_str
+	                      << std::setw(10) << std::fixed << std::setprecision(2) << m->doc_similarity
+	                      << "\n";
+	        }
+	    }
 
     // Generate markdown reports
     generate_reports(source, target, comp, ranked, missing, doc_gaps, 
@@ -1497,6 +1872,254 @@ void cmd_stats(const std::string& directory) {
     std::cout << "  Lint errors: " << total_lint << "\n";
 }
 
+// ============ Agent Guardrails (Swarm Mode) ============
+
+struct AgentState {
+    long long last_used_epoch = 0;      // seconds since epoch
+    long long last_score_epoch = 0;     // seconds since epoch
+    float last_score = -1.0f;           // -1 = unknown
+};
+
+static long long now_epoch_seconds() {
+    using namespace std::chrono;
+    return duration_cast<seconds>(system_clock::now().time_since_epoch()).count();
+}
+
+static float activity_score_from_idle_minutes(long long idle_minutes) {
+    if (idle_minutes <= 15) return 100.0f;
+    if (idle_minutes >= 60) return 0.0f;
+    // Linear decay from 100% at 15m idle to 0% at 60m idle.
+    float t = static_cast<float>(idle_minutes - 15) / 45.0f;
+    return 100.0f * (1.0f - t);
+}
+
+static std::string format_idle_minutes(long long idle_minutes) {
+    if (idle_minutes < 0) idle_minutes = 0;
+    long long h = idle_minutes / 60;
+    long long m = idle_minutes % 60;
+    if (h == 0) return std::to_string(m) + "m";
+    std::ostringstream ss;
+    ss << h << "h" << std::setw(2) << std::setfill('0') << m << "m";
+    return ss.str();
+}
+
+static std::filesystem::path guardrails_agents_dir(const std::string& task_file) {
+    std::filesystem::path base = std::filesystem::path(task_file).parent_path();
+    if (base.empty()) base = std::filesystem::current_path();
+    return base / ".cache" / "ast_distance" / "agents";
+}
+
+static std::filesystem::path agent_lock_path(const std::string& task_file, int agent) {
+    auto dir = guardrails_agents_dir(task_file);
+    return dir / ("agent_" + std::to_string(agent) + ".lock");
+}
+
+static std::filesystem::path agent_notice_path(const std::string& task_file, int agent) {
+    auto dir = guardrails_agents_dir(task_file);
+    return dir / ("agent_" + std::to_string(agent) + ".notice");
+}
+
+static std::filesystem::path agent_state_path(const std::string& task_file, int agent) {
+    auto dir = guardrails_agents_dir(task_file);
+    return dir / ("agent_" + std::to_string(agent) + ".state");
+}
+
+static AgentState load_agent_state(const std::filesystem::path& path) {
+    AgentState st;
+    std::ifstream f(path);
+    if (!f.is_open()) return st;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string k = line.substr(0, eq);
+        std::string v = line.substr(eq + 1);
+        try {
+            if (k == "last_used_epoch") st.last_used_epoch = std::stoll(v);
+            else if (k == "last_score_epoch") st.last_score_epoch = std::stoll(v);
+            else if (k == "last_score") st.last_score = std::stof(v);
+        } catch (...) {
+            // Ignore malformed fields.
+        }
+    }
+    return st;
+}
+
+static void save_agent_state(const std::filesystem::path& path, const AgentState& st) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream f(path);
+    if (!f.is_open()) return;
+    f << "last_used_epoch=" << st.last_used_epoch << "\n";
+    f << "last_score_epoch=" << st.last_score_epoch << "\n";
+    f << "last_score=" << st.last_score << "\n";
+}
+
+static void touch_agent_last_used(const std::string& task_file, int agent) {
+    auto p = agent_state_path(task_file, agent);
+    AgentState st = load_agent_state(p);
+    st.last_used_epoch = now_epoch_seconds();
+    save_agent_state(p, st);
+}
+
+static int read_pid_from_lockfile(const std::filesystem::path& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return -1;
+    int pid = -1;
+    f >> pid;
+    return pid;
+}
+
+class AgentLock {
+public:
+    AgentLock(const std::string& task_file, int agent, bool override_wait)
+        : fd_(-1), locked_(false), holder_pid_(-1) {
+        lock_path_ = agent_lock_path(task_file, agent);
+        std::filesystem::create_directories(lock_path_.parent_path());
+        fd_ = open(lock_path_.string().c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd_ < 0) return;
+        int flags = LOCK_EX;
+        if (!override_wait) flags |= LOCK_NB;
+        if (flock(fd_, flags) == 0) {
+            locked_ = true;
+            std::string pid_str = std::to_string(getpid()) + "\n";
+            ftruncate(fd_, 0);
+            lseek(fd_, 0, SEEK_SET);
+            ::write(fd_, pid_str.c_str(), pid_str.size());
+        } else {
+            holder_pid_ = read_pid_from_lockfile(lock_path_);
+        }
+    }
+
+    ~AgentLock() {
+        if (fd_ >= 0) {
+            if (locked_) flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+    }
+
+    bool locked() const { return locked_; }
+    int holder_pid() const { return holder_pid_; }
+    const std::filesystem::path& path() const { return lock_path_; }
+
+private:
+    int fd_;
+    bool locked_;
+    int holder_pid_;
+    std::filesystem::path lock_path_;
+};
+
+static void write_agent_notice(const std::string& task_file, int agent, const std::string& msg) {
+    auto p = agent_notice_path(task_file, agent);
+    std::filesystem::create_directories(p.parent_path());
+    std::ofstream f(p, std::ios::app);
+    if (!f.is_open()) return;
+    f << msg << "\n";
+}
+
+static void print_and_clear_agent_notice(const std::string& task_file, int agent) {
+    auto p = agent_notice_path(task_file, agent);
+    std::ifstream f(p);
+    if (!f.is_open()) return;
+    std::stringstream buf;
+    buf << f.rdbuf();
+    std::string s = buf.str();
+    if (!s.empty()) {
+        std::cerr << "\n=== NOTICE (Agent #" << agent << ") ===\n\n";
+        std::cerr << s << "\n";
+    }
+    std::error_code ec;
+    std::filesystem::remove(p, ec);
+}
+
+static void print_agent_activity_section(const TaskManager& tm, const std::string& task_file, int current_agent) {
+    std::cout << "\n=== Agent Activity ===\n\n";
+    std::cout << "You are agent #" << current_agent << "\n\n";
+
+    struct Row {
+        int agent = 0;
+        std::string task;
+        std::string since;
+        long long idle_min = 0;
+        float score = 0.0f;
+        float trend = 0.0f;
+        bool has_trend = false;
+    };
+    std::vector<Row> rows;
+
+    long long now = now_epoch_seconds();
+    for (const auto& t : tm.tasks) {
+        if (t.status != TaskStatus::ASSIGNED) continue;
+        int agent = 0;
+        try {
+            agent = std::stoi(t.assigned_to);
+        } catch (...) {
+            continue; // Guardrails require numeric agent IDs.
+        }
+        AgentState st = load_agent_state(agent_state_path(task_file, agent));
+        long long idle_s = (st.last_used_epoch > 0) ? (now - st.last_used_epoch) : (60LL * 60LL);
+        long long idle_min = std::max(0LL, (idle_s + 30) / 60);
+        float score = activity_score_from_idle_minutes(idle_min);
+
+        float trend = 0.0f;
+        bool has_trend = false;
+        if (st.last_score >= 0.0f) {
+            trend = score - st.last_score;
+            has_trend = true;
+        }
+
+        // Update last reported score for trending.
+        st.last_score = score;
+        st.last_score_epoch = now;
+        save_agent_state(agent_state_path(task_file, agent), st);
+
+        Row r;
+        r.agent = agent;
+        r.task = t.source_qualified;
+        r.since = t.assigned_at;
+        r.idle_min = idle_min;
+        r.score = score;
+        r.trend = trend;
+        r.has_trend = has_trend;
+        rows.push_back(r);
+    }
+
+    if (rows.empty()) {
+        std::cout << "No agents currently assigned.\n";
+        return;
+    }
+
+    std::sort(rows.begin(), rows.end(),
+              [](const Row& a, const Row& b) { return a.agent < b.agent; });
+
+    std::cout << std::setw(8) << std::left << "Agent"
+              << std::setw(34) << "Working On"
+              << std::setw(10) << "Idle"
+              << std::setw(10) << "Active"
+              << "Trend\n";
+    std::cout << std::string(76, '-') << "\n";
+    for (const auto& r : rows) {
+        std::ostringstream trend;
+        if (r.has_trend) {
+            int d = static_cast<int>(std::round(r.trend));
+            if (d > 0) trend << "+" << d;
+            else trend << d;
+        } else {
+            trend << "-";
+        }
+
+	        std::ostringstream score;
+	        score << static_cast<int>(std::round(r.score)) << "%";
+
+	        std::string agent_label = "#" + std::to_string(r.agent);
+	        std::cout << std::setw(8) << std::left << agent_label
+	                  << std::setw(34) << std::left << r.task.substr(0, 32)
+	                  << std::setw(10) << format_idle_minutes(r.idle_min)
+	                  << std::setw(10) << score.str()
+	                  << trend.str()
+	                  << "\n";
+	    }
+}
+
 // ============ Swarm Task Management Commands ============
 
 void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
@@ -1512,9 +2135,12 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
 
     Codebase target(tgt_dir, tgt_lang);
     target.scan();
+    target.extract_porting_data();  // TODOs, lint, line counts (task inclusion needs this)
 
     CodebaseComparator comp(source, target);
     comp.find_matches();
+    std::cout << "Computing AST similarities...\n";
+    comp.compute_similarities();
 
     // Build task list from missing files
     TaskManager tm(task_file);
@@ -1524,26 +2150,33 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
     tm.target_lang = tgt_lang;
     tm.agents_md_path = agents_md;
 
-    // Add missing files as tasks (sorted by dependents)
-    std::vector<const SourceFile*> pending_files;
+    // Add missing files and unacceptable ports as tasks (sorted by dependents).
+    // NOTE: TODOs/stubs are an automatic failure mode for "complete" status,
+    // so they must stay in the queue even if similarity looks high.
+    std::set<std::string> pending_keys;
 
-    // 1. Missing files
     for (const auto& path : comp.unmatched_source) {
-        pending_files.push_back(&source.files.at(path));
+        pending_keys.insert(path);
     }
 
-    // 2. Incomplete files (similarity < 0.85)
-    // We treat them as "missing" for task purposes to force re-evaluation/completion
     for (const auto& m : comp.matches) {
-        if (m.similarity < 0.85) { // Strict threshold for swarm quality
-            pending_files.push_back(&source.files.at(m.source_path));
+        bool func_gap = (m.source_function_count > 0 &&
+                         m.matched_function_count < m.source_function_count);
+        if (m.similarity < 0.85f || m.todo_count > 0 || m.lint_count > 0 || m.is_stub || func_gap) {
+            pending_keys.insert(m.source_path);
         }
     }
 
+    std::vector<const SourceFile*> pending_files;
+    pending_files.reserve(pending_keys.size());
+    for (const auto& key : pending_keys) {
+        pending_files.push_back(&source.files.at(key));
+    }
+
     std::sort(pending_files.begin(), pending_files.end(),
-        [](const SourceFile* a, const SourceFile* b) {
-            return a->dependent_count > b->dependent_count;
-        });
+              [](const SourceFile* a, const SourceFile* b) {
+                  return a->dependent_count > b->dependent_count;
+              });
 
     for (const auto* sf : pending_files) {
         PortTask task;
@@ -1587,7 +2220,7 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
     }
 }
 
-void cmd_tasks(const std::string& task_file) {
+void cmd_tasks(const std::string& task_file, int agent) {
     TaskManager tm(task_file);
     if (!tm.load()) {
         std::cerr << "Error: Could not load task file: " << task_file << "\n";
@@ -1596,6 +2229,8 @@ void cmd_tasks(const std::string& task_file) {
 
     int pending, assigned, completed, blocked;
     tm.get_stats(pending, assigned, completed, blocked);
+
+    print_agent_activity_section(tm, task_file, agent);
 
     std::cout << "=== Task Status ===\n\n";
     std::cout << "Task file: " << task_file << "\n";
@@ -1642,21 +2277,76 @@ void cmd_tasks(const std::string& task_file) {
     }
 }
 
-void cmd_assign(const std::string& task_file, const std::string& agent_id) {
+void cmd_assign(const std::string& task_file, int requested_agent, bool override_mode) {
     TaskManager tm(task_file);
     if (!tm.load()) {
         std::cerr << "Error: Could not load task file: " << task_file << "\n";
         return;
     }
 
+    int agent = requested_agent;
+    if (agent <= 0) {
+        // Allocate a new agent number (monotonic) to avoid collisions/reuse confusion.
+        int max_agent = 0;
+        for (const auto& t : tm.tasks) {
+            if (t.status != TaskStatus::ASSIGNED) continue;
+            try {
+                max_agent = std::max(max_agent, std::stoi(t.assigned_to));
+            } catch (...) {
+                // Ignore non-numeric IDs.
+            }
+        }
+        auto dir = guardrails_agents_dir(task_file);
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec) break;
+            auto name = entry.path().filename().string();
+            if (!name.starts_with("agent_")) continue;
+            auto pos = name.find_first_of('.');
+            auto num_str = name.substr(std::string("agent_").size(),
+                                       pos == std::string::npos ? std::string::npos : pos - std::string("agent_").size());
+            try {
+                max_agent = std::max(max_agent, std::stoi(num_str));
+            } catch (...) {
+            }
+        }
+        agent = max_agent + 1;
+    }
+
+    if (agent <= 0) {
+        std::cerr << "Error: Could not allocate agent number\n";
+        return;
+    }
+
+    AgentLock agent_lock(task_file, agent, override_mode);
+    if (!agent_lock.locked()) {
+        int holder = agent_lock.holder_pid();
+        std::ostringstream msg;
+        msg << "Agent #" << agent << " appears to be in use";
+        if (holder > 0) msg << " by pid " << holder;
+        msg << ".\n"
+            << "Re-run with --override to wait, or pick a different agent number.\n";
+        std::cerr << "Error: " << msg.str();
+        write_agent_notice(task_file, agent,
+                           "Conflict: another PID attempted to use this agent number.\n" + msg.str());
+        return;
+    }
+
+    print_and_clear_agent_notice(task_file, agent);
+    touch_agent_last_used(task_file, agent);
+
+    std::string agent_id = std::to_string(agent);
+
     // Check if agent already has an assigned task
     for (const auto& t : tm.tasks) {
         if (t.status == TaskStatus::ASSIGNED && t.assigned_to == agent_id) {
-            std::cerr << "Agent " << agent_id << " already has an assigned task: "
+            std::cerr << "Agent #" << agent << " already has an assigned task: "
                       << t.source_qualified << "\n";
-            std::cerr << "Complete it with: ast_distance --complete " << task_file
+            std::cerr << "Complete it with: ast_distance --agent " << agent
+                      << " --complete " << task_file
                       << " " << t.source_qualified << "\n";
-            std::cerr << "Or release it with: ast_distance --release " << task_file
+            std::cerr << "Or release it with: ast_distance --agent " << agent
+                      << " --release " << task_file
                       << " " << t.source_qualified << "\n";
             return;
         }
@@ -1675,15 +2365,106 @@ void cmd_assign(const std::string& task_file, const std::string& agent_id) {
 
     tm.save();
 
+    print_agent_activity_section(tm, task_file, agent);
+
     // Print full assignment details
-    tm.print_assignment(*task);
+    tm.print_assignment(*task, agent);
 }
 
-void cmd_complete(const std::string& task_file, const std::string& source_qualified) {
+void cmd_complete(const std::string& task_file, const std::string& source_qualified,
+                  int agent, bool override_mode) {
     TaskManager tm(task_file);
     if (!tm.load()) {
         std::cerr << "Error: Could not load task file: " << task_file << "\n";
         return;
+    }
+
+    const PortTask* task_ptr = nullptr;
+    for (const auto& t : tm.tasks) {
+        if (t.source_qualified == source_qualified) {
+            task_ptr = &t;
+            break;
+        }
+    }
+    if (!task_ptr) {
+        std::cerr << "Task not found: " << source_qualified << "\n";
+        return;
+    }
+
+    if (agent > 0 && task_ptr->status == TaskStatus::ASSIGNED &&
+        task_ptr->assigned_to != std::to_string(agent) && !override_mode) {
+        std::cerr << "Error: Agent #" << agent << " cannot complete a task assigned to agent "
+                  << task_ptr->assigned_to << "\n";
+        std::cerr << "Use --override only if you are explicitly taking over the task.\n";
+        return;
+    }
+
+    std::filesystem::path source_path = std::filesystem::path(tm.source_root) / task_ptr->source_path;
+    std::filesystem::path target_path = std::filesystem::path(tm.target_root) / task_ptr->target_path;
+
+    if (!std::filesystem::exists(target_path) && !override_mode) {
+        std::cerr << "Error: Cannot complete task - target file does not exist: " << target_path.string() << "\n";
+        std::cerr << "Create the file and add a port-lint header first.\n";
+        return;
+    }
+
+    if (std::filesystem::exists(target_path)) {
+        FileStats stats = PortingAnalyzer::analyze_file(target_path.string());
+        if (!stats.todos.empty() && !override_mode) {
+            std::cerr << "Error: Cannot complete task - target file contains TODO markers\n";
+            std::cerr << "TODOs are an automatic failure mode for porting completeness.\n";
+            std::cerr << "Complete the TODOs or remove the file.\n";
+            return;
+        }
+        if (stats.is_stub && !override_mode) {
+            std::cerr << "Error: Cannot complete task - target file is detected as a stub\n";
+            std::cerr << "Complete the real implementation before marking complete.\n";
+            return;
+        }
+
+        // Require no stub bodies and high similarity.
+        Language src_lang = parse_language(tm.source_lang);
+        Language tgt_lang = parse_language(tm.target_lang);
+
+        ASTParser parser;
+        bool has_stubs = parser.has_stub_bodies_in_files({target_path.string()}, tgt_lang);
+        if (has_stubs && !override_mode) {
+            std::cerr << "Error: Cannot complete task - target file contains stub/TODO markers in function bodies\n";
+            std::cerr << "The code is fake. Complete the real implementation before marking complete.\n";
+            return;
+        }
+
+        auto src_tree = parser.parse_file(source_path.string(), src_lang);
+        auto tgt_tree = parser.parse_file(target_path.string(), tgt_lang);
+        if (!src_tree || !tgt_tree) {
+            std::cerr << "Error: Cannot parse files for comparison\n";
+            std::cerr << "Fix syntax errors or use --override.\n";
+            return;
+        }
+
+        // Normalize ASTs: Flatten namespaces/packages to reduce structural noise
+        // Node type 82 is PACKAGE (includes C++ namespaces)
+        src_tree->flatten_node_type(82);
+        tgt_tree->flatten_node_type(82);
+
+        auto src_ids = parser.extract_identifiers_from_file(source_path.string(), src_lang);
+        auto tgt_ids = parser.extract_identifiers_from_file(target_path.string(), tgt_lang);
+        float file_sim = ASTSimilarity::combined_similarity_with_content(
+            src_tree.get(), tgt_tree.get(), src_ids, tgt_ids);
+
+        auto src_functions = parser.extract_function_infos_from_file(
+            source_path.string(), src_lang);
+        auto tgt_functions = parser.extract_function_infos_from_file(
+            target_path.string(), tgt_lang);
+        float fn_cov = CodebaseComparator::function_name_coverage(src_functions, tgt_functions).ratio;
+
+        float similarity = file_sim * fn_cov;
+        if (similarity < 0.85f && !override_mode) {
+            std::cerr << "Error: Cannot complete task with low similarity: " << similarity << "\n";
+            std::cerr << "Target exists but identifier content does not match source.\n";
+            std::cerr << "Complete the port (aim for >= 0.85) or use --override.\n";
+            return;
+        }
     }
 
     if (!tm.complete_task(source_qualified)) {
@@ -1840,7 +2621,8 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
     }
 }
 
-void cmd_release(const std::string& task_file, const std::string& source_qualified) {
+void cmd_release(const std::string& task_file, const std::string& source_qualified,
+                 int agent, bool override_mode) {
     TaskManager tm(task_file);
     if (!tm.load()) {
         std::cerr << "Error: Could not load task file: " << task_file << "\n";
@@ -1855,6 +2637,13 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
         std::cerr << "Task not found or not assigned: " << source_qualified << "\n";
         return;
     }
+
+    if (agent > 0 && it->assigned_to != std::to_string(agent) && !override_mode) {
+        std::cerr << "Error: Agent #" << agent << " cannot release a task assigned to agent "
+                  << it->assigned_to << "\n";
+        std::cerr << "Use --override only if you are explicitly taking over the task.\n";
+        return;
+    }
     
     // Check if target file exists - if so, require completion or deletion
     std::filesystem::path target_path = std::filesystem::path(tm.target_root) / it->target_path;
@@ -1864,45 +2653,67 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
         // Try to compute similarity - if we can't even parse, that's a HARD FAIL
         std::cerr << "Error: Cannot release task - target file already exists: " << target_path.string() << "\n";
         std::cerr << "Checking similarity...\n";
-        
-        // Parse and compare
-        Language src_lang = Language::RUST;  // default
-        if (tm.source_lang == "rust") src_lang = Language::RUST;
-        else if (tm.source_lang == "kotlin") src_lang = Language::KOTLIN;
-        else if (tm.source_lang == "cpp") src_lang = Language::CPP;
-        else if (tm.source_lang == "python") src_lang = Language::PYTHON;
-        
-        Language tgt_lang = Language::KOTLIN;  // default
-        if (tm.target_lang == "rust") tgt_lang = Language::RUST;
-        else if (tm.target_lang == "kotlin") tgt_lang = Language::KOTLIN;
-        else if (tm.target_lang == "cpp") tgt_lang = Language::CPP;
-        else if (tm.target_lang == "python") tgt_lang = Language::PYTHON;
-        
-        ASTParser parser;
-        auto src_tree = parser.parse_file(source_path.string(), src_lang);
-        auto tgt_tree = parser.parse_file(target_path.string(), tgt_lang);
-        
-        if (!src_tree || !tgt_tree) {
-            std::cerr << "Error: Cannot parse files for comparison\n";
-            std::cerr << "This usually means the target file has syntax errors.\n";
-            std::cerr << "Fix the errors or delete the file to release.\n";
+
+        FileStats stats = PortingAnalyzer::analyze_file(target_path.string());
+        if (!stats.todos.empty() && !override_mode) {
+            std::cerr << "Error: Cannot release task - target file contains TODO markers\n";
+            std::cerr << "TODOs are an automatic failure mode for porting completeness.\n";
+            std::cerr << "Complete the TODOs or delete the file to release.\n";
+            return;
+        }
+        if (stats.is_stub && !override_mode) {
+            std::cerr << "Error: Cannot release task - target file is detected as a stub\n";
+            std::cerr << "Complete the real implementation or delete the file to release.\n";
             return;
         }
         
-        bool has_stubs = parser.has_stub_bodies_in_files({target_path.string()}, tgt_lang);
+        // Parse and compare
+        Language src_lang = parse_language(tm.source_lang);
+        Language tgt_lang = parse_language(tm.target_lang);
+        
+        ASTParser parser;
+        bool has_stubs = false;
+        float similarity = 0.0f;
+
+        // Require no stub bodies (e.g., Kotlin TODO(), Rust unimplemented!(), Python pass/...)
+        has_stubs = parser.has_stub_bodies_in_files({target_path.string()}, tgt_lang);
         if (has_stubs) {
             std::cerr << "Error: Cannot release task - target file contains stub/TODO markers in function bodies\n";
             std::cerr << "The code is fake. Complete the real implementation or delete the file.\n";
             return;
         }
 
+        auto src_tree = parser.parse_file(source_path.string(), src_lang);
+        auto tgt_tree = parser.parse_file(target_path.string(), tgt_lang);
+
+        if (!src_tree || !tgt_tree) {
+            std::cerr << "Error: Cannot parse files for comparison\n";
+            std::cerr << "This usually means the target file has syntax errors.\n";
+            std::cerr << "Fix the errors or delete the file to release.\n";
+            return;
+        }
+
+        // Normalize ASTs: Flatten namespaces/packages to reduce structural noise
+        // Node type 82 is PACKAGE (includes C++ namespaces)
+        src_tree->flatten_node_type(82);
+        tgt_tree->flatten_node_type(82);
+
         auto src_ids = parser.extract_identifiers_from_file(source_path.string(), src_lang);
         auto tgt_ids = parser.extract_identifiers_from_file(target_path.string(), tgt_lang);
-        float similarity = ASTSimilarity::combined_similarity_with_content(
+        float file_sim = ASTSimilarity::combined_similarity_with_content(
             src_tree.get(), tgt_tree.get(), src_ids, tgt_ids);
 
+        // Parity penalty: missing functions should reduce score.
+        auto src_functions = parser.extract_function_infos_from_file(
+            source_path.string(), src_lang);
+        auto tgt_functions = parser.extract_function_infos_from_file(
+            target_path.string(), tgt_lang);
+        float fn_cov = CodebaseComparator::function_name_coverage(src_functions, tgt_functions).ratio;
+
+        similarity = file_sim * fn_cov;
+
         // Require >= 0.50 content-aware similarity to release.
-        // Content-aware scoring is stricter than structure-only scoring.
+        // (threshold lowered because content-aware scoring is much stricter)
         if (similarity < 0.50f) {
             std::cerr << "Error: Cannot release task with low similarity: " << similarity << "\n";
             std::cerr << "Target file exists but identifier content doesn't match source\n";
@@ -1920,25 +2731,122 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
     }
 }
 
+static bool guardrails_detect_shell_pipeline_peer_process() {
+    // If ast_distance is part of a shell pipeline (cmd | other),
+    // there will be a sibling process in our process group that's neither
+    // our ancestor nor our child.
+    //
+    // We intentionally allow non-terminal stdout when the caller captures output
+    // directly (e.g. a wrapper process reading from a pipe), because that is not
+    // the same failure mode as shell filtering commands like `sed`/`grep`.
+    const int self = static_cast<int>(getpid());
+    const int pgid = static_cast<int>(getpgrp());
+
+    FILE* fp = popen("ps -A -o pid= -o ppid= -o pgid= -o comm=", "r");
+    if (!fp) {
+        // Conservative fallback: if we cannot inspect the process table,
+        // assume the pipe is a shell pipeline and refuse to run.
+        return true;
+    }
+
+    struct Row {
+        int pid = 0;
+        int ppid = 0;
+        int pgid = 0;
+    };
+
+    std::vector<Row> rows;
+    rows.reserve(256);
+    std::unordered_map<int, int> ppid_by_pid;
+
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), fp)) {
+        std::string line(buf);
+        std::stringstream ss(line);
+        Row r;
+        if (!(ss >> r.pid >> r.ppid >> r.pgid)) {
+            continue;
+        }
+        rows.push_back(r);
+        ppid_by_pid[r.pid] = r.ppid;
+    }
+    pclose(fp);
+
+    // Build ancestor chain for this process.
+    std::unordered_set<int> ancestors;
+    int cur = self;
+    for (int i = 0; i < 64; ++i) {
+        auto it = ppid_by_pid.find(cur);
+        if (it == ppid_by_pid.end()) break;
+        int parent = it->second;
+        if (parent <= 0) break;
+        if (!ancestors.insert(parent).second) break;
+        cur = parent;
+    }
+
+    // Detect a peer process in the same process group.
+    for (const auto& r : rows) {
+        if (r.pgid != pgid) continue;
+        if (r.pid == self) continue;
+        if (ancestors.count(r.pid)) continue;
+        if (r.ppid == self) continue;  // our own child
+        return true;
+    }
+
+    return false;
+}
+
 int main(int argc, char* argv[]) {
-    // Refuse to run when stdout or stderr is piped to another program.
-    // Piping has caused model-driven wrappers to truncate output silently.
+    // Refuse to run when stdout or stderr is piped to another program via a shell pipeline.
+    // This blocks `ast_distance ... | sed/grep/...` which has caused model-driven wrappers
+    // to silently filter or truncate dashboards.
     {
+        bool out_fifo = false;
+        bool err_fifo = false;
         struct stat st;
         if (fstat(STDOUT_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            out_fifo = true;
+        }
+        if (fstat(STDERR_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            err_fifo = true;
+        }
+
+        if ((out_fifo || err_fifo) && guardrails_detect_shell_pipeline_peer_process()) {
             const char msg[] = "Error: stdout is piped to another program.\n"
                                "ast_distance does not support piping (|).\n"
                                "Run it directly in a terminal.\n";
             write(STDERR_FILENO, msg, sizeof(msg) - 1);
             return 2;
         }
-        if (fstat(STDERR_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
-            std::cout << "Error: stderr is piped to another program.\n";
-            std::cout << "ast_distance does not support piping (|).\n";
-            std::cout << "Run it directly in a terminal.\n";
-            return 2;
+    }
+
+    int agent = 0;
+    bool override_mode = false;
+    std::string task_file_flag;
+
+    std::vector<std::string> rest;
+    rest.reserve(static_cast<size_t>(argc));
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--agent" && i + 1 < argc) {
+            agent = std::stoi(argv[++i]);
+        } else if (arg == "--task-file" && i + 1 < argc) {
+            task_file_flag = argv[++i];
+        } else if (arg == "--override") {
+            override_mode = true;
+        } else {
+            rest.push_back(arg);
         }
     }
+
+    std::vector<char*> argv_rebased;
+    argv_rebased.reserve(rest.size() + 1);
+    argv_rebased.push_back(argv[0]);
+    for (auto& s : rest) {
+        argv_rebased.push_back(const_cast<char*>(s.c_str()));
+    }
+    argc = static_cast<int>(argv_rebased.size());
+    argv = argv_rebased.data();
 
     if (argc < 2) {
         print_usage(argv[0]);
@@ -1946,6 +2854,58 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
+
+    // Guardrails: if a task system exists, require --agent and lock the session number.
+    GuardrailsContext guard;
+    guard.agent = agent;
+    guard.override_mode = override_mode;
+
+    if (!task_file_flag.empty()) {
+        guard.task_file = task_file_flag;
+    } else if ((mode == "--tasks" || mode == "--assign" || mode == "--complete" ||
+                mode == "--release") &&
+               argc >= 3) {
+        guard.task_file = argv[2];
+    } else if (mode == "--init-tasks" && argc >= 7) {
+        guard.task_file = argv[6];
+    } else if (std::filesystem::exists("tasks.json")) {
+        guard.task_file = "tasks.json";
+    }
+
+    if (!guard.task_file.empty()) {
+        TaskManager tm(guard.task_file);
+        guard.active = tm.load();
+    }
+
+    if (guard.active && mode != "--assign" && agent <= 0) {
+        std::cerr << "Error: task system detected (" << guard.task_file << ").\n";
+        std::cerr << "All commands require an agent session number.\n";
+        std::cerr << "Get one with: ast_distance --assign " << guard.task_file << "\n";
+        std::cerr << "Then re-run with: ast_distance --agent <number> ...\n";
+        return 2;
+    }
+
+    std::unique_ptr<AgentLock> agent_lock;
+    if (guard.active && mode != "--assign" && agent > 0) {
+        agent_lock = std::make_unique<AgentLock>(guard.task_file, agent, override_mode);
+        if (!agent_lock->locked()) {
+            int holder = agent_lock->holder_pid();
+            std::ostringstream msg;
+            msg << "Agent #" << agent << " appears to be in use";
+            if (holder > 0) msg << " by pid " << holder;
+            msg << ".\n"
+                << "Re-run with --override to wait, or pick a different agent number.\n";
+            std::cerr << "Error: " << msg.str();
+            write_agent_notice(guard.task_file, agent,
+                               "Conflict: another PID attempted to use this agent number.\n" +
+                                   msg.str());
+            return 3;
+        }
+        print_and_clear_agent_notice(guard.task_file, agent);
+        touch_agent_last_used(guard.task_file, agent);
+    }
+
+    g_guardrails = guard;
 
     try {
         if (mode == "--scan" && argc >= 4) {
@@ -2062,16 +3022,22 @@ int main(int argc, char* argv[]) {
             cmd_init_tasks(argv[2], argv[3], argv[4], argv[5], argv[6], agents_md);
 
         } else if (mode == "--tasks" && argc >= 3) {
-            cmd_tasks(argv[2]);
+            cmd_tasks(argv[2], agent);
 
-        } else if (mode == "--assign" && argc >= 4) {
-            cmd_assign(argv[2], argv[3]);
+        } else if (mode == "--assign" && argc >= 3) {
+            int requested_agent = 0;
+            if (argc >= 4) {
+                requested_agent = std::stoi(argv[3]);
+            } else if (agent > 0) {
+                requested_agent = agent;
+            }
+            cmd_assign(argv[2], requested_agent, override_mode);
 
         } else if (mode == "--complete" && argc >= 4) {
-            cmd_complete(argv[2], argv[3]);
+            cmd_complete(argv[2], argv[3], agent, override_mode);
 
         } else if (mode == "--release" && argc >= 4) {
-            cmd_release(argv[2], argv[3]);
+            cmd_release(argv[2], argv[3], agent, override_mode);
 
         } else if (mode == "--dump" && argc >= 4) {
             ASTParser parser;
@@ -2108,40 +3074,67 @@ int main(int argc, char* argv[]) {
             std::ifstream stream1(file1);
             std::stringstream buffer1;
             buffer1 << stream1.rdbuf();
-            auto funcs1 = parser.extract_functions(buffer1.str(), lang1);
+            auto funcs1 = parser.extract_function_infos(buffer1.str(), lang1);
 
             std::cout << "Found " << funcs1.size() << " " << language_name(lang1) << " functions\n";
-            for (const auto& [name, tree] : funcs1) {
-                std::cout << "  - " << name << " (" << tree->size() << " nodes)\n";
+            for (const auto& info : funcs1) {
+                std::cout << "  - " << info.name << " (" << info.body_tree->size() << " nodes)";
+                if (info.has_stub_markers) {
+                    std::cout << " [TODO]";
+                }
+                std::cout << "\n";
             }
 
             std::cout << "\nExtracting functions from " << file2 << " (" << language_name(lang2) << ")...\n";
             std::ifstream stream2(file2);
             std::stringstream buffer2;
             buffer2 << stream2.rdbuf();
-            auto funcs2 = parser.extract_functions(buffer2.str(), lang2);
+            auto funcs2 = parser.extract_function_infos(buffer2.str(), lang2);
 
             std::cout << "Found " << funcs2.size() << " " << language_name(lang2) << " functions\n";
-            for (const auto& [name, tree] : funcs2) {
-                std::cout << "  - " << name << " (" << tree->size() << " nodes)\n";
+            for (const auto& info : funcs2) {
+                std::cout << "  - " << info.name << " (" << info.body_tree->size() << " nodes)";
+                if (info.has_stub_markers) {
+                    std::cout << " [TODO]";
+                }
+                std::cout << "\n";
             }
 
-            // Compare functions with similar names
+            // Compare function bodies (all pairs, then aggregate with matching)
             std::cout << "\n=== Function Similarity Matrix ===\n\n";
             std::cout << std::setw(20) << "";
-            for (const auto& [name2, _] : funcs2) {
-                std::cout << std::setw(12) << name2.substr(0, 10);
+            for (const auto& func2 : funcs2) {
+                std::cout << std::setw(12) << func2.name.substr(0, 10);
             }
             std::cout << "\n";
 
-            for (const auto& [name1, tree1] : funcs1) {
-                std::cout << std::setw(20) << name1.substr(0, 18);
-                for (const auto& [name2, tree2] : funcs2) {
-                    float sim = ASTSimilarity::combined_similarity(
-                        tree1.get(), tree2.get());
+            for (const auto& func1 : funcs1) {
+                std::cout << std::setw(20) << func1.name.substr(0, 18);
+                for (const auto& func2 : funcs2) {
+                    float sim = 0.0f;
+                    if (!func1.has_stub_markers && !func2.has_stub_markers) {
+                        sim = ASTSimilarity::combined_similarity_with_content(
+                            func1.body_tree.get(), func2.body_tree.get(),
+                            func1.identifiers, func2.identifiers);
+                    }
                     std::cout << std::setw(12) << std::fixed << std::setprecision(3) << sim;
                 }
                 std::cout << "\n";
+            }
+
+            auto function_summary = CodebaseComparator::compare_function_sets(funcs1, funcs2);
+            if (function_summary.score >= 0.0f) {
+                std::cout << "\nCompared " << function_summary.source_total << " source functions vs "
+                          << function_summary.target_total << " target functions\n";
+                std::cout << "Matched pairs: " << function_summary.matched_pairs
+                          << " | Unmatched source: " << function_summary.unmatched_source
+                          << " | Unmatched target: " << function_summary.unmatched_target << "\n";
+                std::cout << "Function-wise overall score: "
+                          << std::fixed << std::setprecision(3)
+                          << function_summary.score << "\n";
+                if (function_summary.has_source_stub || function_summary.has_target_stub) {
+                    std::cout << "TODO/stub markers found in function bodies. Stubmed pairs contribute 0.\n";
+                }
             }
 
         } else if (mode[0] != '-' && argc >= 5) {
@@ -2194,17 +3187,44 @@ int main(int argc, char* argv[]) {
             std::cout << "Canonical jaccard:    " << std::fixed << std::setprecision(4)
                       << ids1.canonical_jaccard_similarity(ids2) << "\n";
 
+            bool function_scored = false;
+            CodebaseComparator::FunctionComparisonResult function_result;
+            try {
+                auto src_funcs = parser.extract_function_infos_from_file(file1, lang1);
+                auto tgt_funcs = parser.extract_function_infos_from_file(file2, lang2);
+                function_result = CodebaseComparator::compare_function_sets(src_funcs, tgt_funcs);
+                function_scored = (function_result.score >= 0.0f);
+            } catch (...) {
+                function_scored = false;
+            }
+
             bool file1_stubs = parser.has_stub_bodies_in_files({file1}, lang1);
             bool file2_stubs = parser.has_stub_bodies_in_files({file2}, lang2);
+
+            if (function_scored) {
+                content_score = function_result.score;
+                file1_stubs = function_result.has_source_stub;
+                file2_stubs = function_result.has_target_stub;
+            }
+
+            if (function_scored) {
+                std::cout << "Scored by function bodies: "
+                          << function_result.source_total << " vs "
+                          << function_result.target_total << " functions, matched "
+                          << function_result.matched_pairs << "\n";
+                if (function_result.has_source_stub || function_result.has_target_stub) {
+                    std::cout << "Function-level TODO/stub markers found; affected matches scored as 0.\n";
+                }
+            }
+
             if (file1_stubs || file2_stubs) {
                 content_score = 0.0f;
                 std::cout << "\n*** STUB DETECTED ***\n";
-                if (file1_stubs) {
+                if (file1_stubs)
                     std::cout << "  " << file1 << " has TODO/stub/placeholder in function bodies\n";
-                }
-                if (file2_stubs) {
+                if (file2_stubs)
                     std::cout << "  " << file2 << " has TODO/stub/placeholder in function bodies\n";
-                }
+                
                 std::cout << "  Content-Aware Score forced to 0.0000\n";
             } else {
                 std::cout << "\nContent-Aware Score:  " << std::fixed << std::setprecision(4)

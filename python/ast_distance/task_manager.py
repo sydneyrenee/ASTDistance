@@ -191,16 +191,19 @@ class TaskManager:
         except OSError:
             return ""
 
-    def format_assignment(self, task: PortTask) -> str:
+    def format_assignment(self, task: PortTask, agent_number: int) -> str:
+        prefix = "##" if self.target_lang == "python" else "//"
         lines = [
             "=== TASK ASSIGNMENT ===\n",
+            f"You are agent #{agent_number}",
+            f"Reminder: all ast_distance commands require: --agent {agent_number}\n",
             "Source File:",
             f"  Path:      {self.source_root}/{task.source_path}",
             f"  Qualified: {task.source_qualified}",
             f"  Dependents: {task.dependent_count} files depend on this\n",
             "Target File:",
             f"  Path:      {self.target_root}/{task.target_path}",
-            f"  Add header: // port-lint: source {task.source_path}\n",
+            f"  Add header: {prefix} port-lint: source {task.source_path}\n",
             f"Priority: {task.dependent_count} (higher = more critical)\n",
         ]
         agents_content = self.read_agents_md()
@@ -216,9 +219,9 @@ class TaskManager:
             "3. Add the port-lint header as the first line",
             "4. Transliterate the source code to idiomatic target language",
             "5. Match documentation comments from the source",
-            f"6. Run: ast_distance <source> {self.source_lang} <target> {self.target_lang}",
+            f"6. Run: ast_distance --agent {agent_number} <source> {self.source_lang} <target> {self.target_lang}",
             "   to verify similarity (aim for >0.85)",
-            f"7. When complete, run: ast_distance --complete {task.source_qualified}",
+            f"7. When complete, run: ast_distance --agent {agent_number} --complete {self.task_file_path} {task.source_qualified}",
         ])
         return "\n".join(lines) + "\n"
 

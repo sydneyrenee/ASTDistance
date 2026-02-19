@@ -2,6 +2,7 @@
 
 import { Command } from "commander";
 import * as fs from "fs";
+import { spawnSync } from "child_process";
 import chalk from "chalk";
 import { parseFile } from "./ast-parser.js";
 import {
@@ -22,6 +23,106 @@ import {
 import { Language } from "./types.js";
 
 const program = new Command();
+
+function refusePipedStdio(): void {
+  // Refuse to run when stdout or stderr is piped via a shell pipeline.
+  // This blocks `ast_distance ... | sed/grep/...` which has caused model-driven
+  // wrappers to silently filter or truncate dashboards.
+  //
+  // We intentionally allow non-terminal stdout when the caller captures output
+  // directly (e.g. a wrapper process reading from a pipe), because that is not
+  // the same failure mode as shell filtering commands like `sed`/`grep`.
+  function detectPipelinePeerProcess(): boolean {
+    const selfPid = process.pid;
+    const ps = spawnSync(
+      "ps",
+      ["-A", "-o", "pid=", "-o", "ppid=", "-o", "pgid="],
+      { encoding: "utf8" },
+    );
+    if (ps.status !== 0 || typeof ps.stdout !== "string") {
+      return true;
+    }
+
+    type Row = { pid: number; ppid: number; pgid: number };
+    const rows: Row[] = [];
+    const ppidByPid = new Map<number, number>();
+
+    let pgid: number | null = null;
+    for (const line of ps.stdout.split("\n")) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 3) continue;
+      const pid = Number(parts[0]);
+      const ppid = Number(parts[1]);
+      const pg = Number(parts[2]);
+      if (!Number.isFinite(pid) || !Number.isFinite(ppid) || !Number.isFinite(pg)) {
+        continue;
+      }
+      rows.push({ pid, ppid, pgid: pg });
+      ppidByPid.set(pid, ppid);
+      if (pid === selfPid) {
+        pgid = pg;
+      }
+    }
+    if (pgid === null) {
+      return true;
+    }
+
+    const ancestors = new Set<number>();
+    let cur = selfPid;
+    for (let i = 0; i < 64; i++) {
+      const parent = ppidByPid.get(cur) ?? 0;
+      if (parent <= 0) break;
+      if (ancestors.has(parent)) break;
+      ancestors.add(parent);
+      cur = parent;
+    }
+
+    for (const r of rows) {
+      if (r.pgid !== pgid) continue;
+      if (r.pid === selfPid) continue;
+      if (ancestors.has(r.pid)) continue;
+      if (r.ppid === selfPid) continue; // our own child
+      return true;
+    }
+
+    return false;
+  }
+
+  try {
+    const out = fs.fstatSync(process.stdout.fd);
+    if (out.isFIFO()) {
+      if (!detectPipelinePeerProcess()) {
+        return;
+      }
+      process.stderr.write(
+        "Error: stdout is piped to another program.\n" +
+          "ast_distance does not support piping (|).\n" +
+          "Run it directly in a terminal.\n",
+      );
+      process.exit(2);
+    }
+  } catch {
+    // ignore
+  }
+  try {
+    const err = fs.fstatSync(process.stderr.fd);
+    if (err.isFIFO()) {
+      if (!detectPipelinePeerProcess()) {
+        return;
+      }
+      process.stdout.write(
+        "Error: stderr is piped to another program.\n" +
+          "ast_distance does not support piping (|).\n" +
+          "Run it directly in a terminal.\n",
+      );
+      process.exit(2);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+refusePipedStdio();
 
 function parseLanguage(lang: string): Language {
   const normalized = lang.toLowerCase();

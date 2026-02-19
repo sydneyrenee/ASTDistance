@@ -213,6 +213,18 @@ struct CommentStats {
 };
 
 /**
+ * Function metadata extracted from source code.
+ * The AST is kept as the function body (not the whole declaration)
+ * so that stub checks and identifier matching are aligned with behavior.
+ */
+struct FunctionInfo {
+    std::string name;
+    TreePtr body_tree;
+    IdentifierStats identifiers;
+    bool has_stub_markers = false;
+};
+
+/**
  * AST Parser using tree-sitter.
  * Parses source files into normalized Tree structures.
  */
@@ -407,7 +419,23 @@ public:
      */
     std::vector<std::pair<std::string, TreePtr>> extract_functions(
             const std::string& source, Language lang) {
+        auto function_infos = extract_function_infos(source, lang);
+
         std::vector<std::pair<std::string, TreePtr>> functions;
+        functions.reserve(function_infos.size());
+        for (auto& info : function_infos) {
+            functions.emplace_back(info.name, info.body_tree);
+        }
+
+        return functions;
+    }
+
+    /**
+     * Extract function metadata and body ASTs from source.
+     */
+    std::vector<FunctionInfo> extract_function_infos(
+            const std::string& source, Language lang) {
+        std::vector<FunctionInfo> functions;
 
         // Set language
         const TSLanguage* ts_lang;
@@ -430,10 +458,42 @@ public:
         }
 
         TSNode root = ts_tree_root_node(ts_tree);
-        extract_functions_recursive(root, source, lang, functions);
+        extract_function_infos_recursive(root, source, lang, functions);
 
         ts_tree_delete(ts_tree);
         return functions;
+    }
+
+    /**
+     * Extract function metadata for one source file.
+     */
+    std::vector<FunctionInfo> extract_function_infos_from_file(
+            const std::string& filepath, Language lang) {
+        std::ifstream file(filepath);
+        if (!file.is_open()) return {};
+
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return extract_function_infos(buffer.str(), lang);
+    }
+
+    /**
+     * Extract function metadata for multiple source files.
+     */
+    std::vector<FunctionInfo> extract_function_infos_from_files(
+            const std::vector<std::string>& filepaths, Language lang) {
+        std::stringstream unified_buffer;
+
+        for (const auto& filepath : filepaths) {
+            std::ifstream file(filepath);
+            if (file.is_open()) {
+                unified_buffer << file.rdbuf() << "\n\n";
+            }
+        }
+
+        if (unified_buffer.tellp() == std::streampos(0)) return {};
+
+        return extract_function_infos(unified_buffer.str(), lang);
     }
 
     /**
@@ -445,13 +505,93 @@ public:
         for (char c : text) {
             lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         }
-        // These patterns inside function bodies mean the code is fake
-        return lower.find("todo") != std::string::npos ||
-               lower.find("stub") != std::string::npos ||
-               lower.find("placeholder") != std::string::npos ||
-               lower.find("fixme") != std::string::npos ||
+        // These patterns inside function bodies mean the code is fake.
+        //
+        // Use word-boundary style matching for short markers so we don't trip on
+        // explanatory text like "TODOs/stubs are a failure mode" inside the tool itself.
+        auto is_word = [](char ch) -> bool {
+            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+        };
+        auto has_word = [&](const std::string& w) -> bool {
+            size_t pos = lower.find(w);
+            while (pos != std::string::npos) {
+                bool left_ok = (pos == 0) || !is_word(lower[pos - 1]);
+                size_t end = pos + w.size();
+                bool right_ok = (end >= lower.size()) || !is_word(lower[end]);
+                if (left_ok && right_ok) return true;
+                pos = lower.find(w, pos + 1);
+            }
+            return false;
+        };
+
+        return has_word("todo") ||
+               has_word("stub") ||
+               has_word("placeholder") ||
+               has_word("fixme") ||
                lower.find("not yet implemented") != std::string::npos ||
-               lower.find("not implemented") != std::string::npos;
+               lower.find("not implemented") != std::string::npos ||
+               // Common stub constructs without spaces (Rust `unimplemented!`, Kotlin/Python `NotImplementedError`)
+               has_word("unimplemented") ||
+               has_word("notimplemented");
+    }
+
+    static bool comment_has_stub_markers(const std::string& text) {
+        // For comment nodes, be stricter: only treat as a stub marker when the
+        // comment itself starts with TODO/FIXME/STUB/etc. This avoids false
+        // positives from explanatory comments inside the tool.
+        std::string lower;
+        lower.reserve(text.size());
+        for (char c : text) {
+            lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+
+        size_t i = 0;
+        if (lower.rfind("//", 0) == 0) {
+            i = 2;
+            while (i < lower.size() && lower[i] == '/') i++;  // ///, //!, etc.
+        } else if (lower.rfind("#", 0) == 0) {
+            i = 1;
+            while (i < lower.size() && lower[i] == '#') i++;  // ## ...
+        } else if (lower.rfind("/*", 0) == 0) {
+            i = 2;
+            if (i < lower.size() && lower[i] == '*') i++;  // /** ...
+        }
+
+        auto is_space = [](char ch) -> bool {
+            return std::isspace(static_cast<unsigned char>(ch));
+        };
+        while (i < lower.size() && is_space(lower[i])) i++;
+        while (i < lower.size() && lower[i] == '*') {  // leading "*" in block comment lines
+            i++;
+            while (i < lower.size() && is_space(lower[i])) i++;
+        }
+
+        auto is_word = [](char ch) -> bool {
+            return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+        };
+        auto starts_with_word = [&](const std::string& w) -> bool {
+            if (lower.size() < i + w.size()) return false;
+            if (lower.compare(i, w.size(), w) != 0) return false;
+            size_t end = i + w.size();
+            if (end >= lower.size()) return true;
+            return !is_word(lower[end]);
+        };
+
+        // Most common: TODO:, TODO(...), FIXME:, etc.
+        if (starts_with_word("todo") ||
+            starts_with_word("fixme") ||
+            starts_with_word("stub") ||
+            starts_with_word("placeholder") ||
+            starts_with_word("unimplemented") ||
+            starts_with_word("notimplemented")) {
+            return true;
+        }
+
+        // Phrases.
+        if (lower.size() >= i + 16 && lower.compare(i, 16, "not implemented") == 0) return true;
+        if (lower.size() >= i + 20 && lower.compare(i, 20, "not yet implemented") == 0) return true;
+
+        return false;
     }
 
     /**
@@ -475,11 +615,35 @@ public:
         if (!ts_tree) return false;
 
         TSNode root = ts_tree_root_node(ts_tree);
-        bool found = false;
-        detect_stubs_recursive(root, source, found, false);
+        std::vector<TSNode> stack;
+        stack.push_back(root);
+
+        while (!stack.empty()) {
+            TSNode node = stack.back();
+            stack.pop_back();
+
+            std::string type_s(ts_node_type(node));
+            if (is_function_node(type_s, lang)) {
+                TSNode body_node = extract_function_body_node(node, lang);
+                if (!ts_node_is_null(body_node) && !ts_node_eq(body_node, node)) {
+                    if (has_stub_markers_in_node(body_node, source, lang)) {
+                        ts_tree_delete(ts_tree);
+                        return true;
+                    }
+                }
+            }
+
+            uint32_t child_count = ts_node_child_count(node);
+            for (uint32_t i = 0; i < child_count; ++i) {
+                TSNode child = ts_node_child(node, i);
+                if (!ts_node_is_null(child)) {
+                    stack.push_back(child);
+                }
+            }
+        }
 
         ts_tree_delete(ts_tree);
-        return found;
+        return false;
     }
 
     /**
@@ -496,7 +660,7 @@ public:
         return false;
     }
 
-private:
+    private:
     TSParser* parser_;
 
     int count_lines(const std::string& text) {
@@ -684,17 +848,21 @@ private:
 
         bool now_in_body = in_body || entering_body;
 
-        // If we're inside a function body, check comments and string literals
+        // If we're inside a function body, check comments for stub markers.
+        //
+        // IMPORTANT: We intentionally do NOT scan arbitrary string literals for
+        // "todo"/"stub"/"not implemented" markers. The tool itself (and many real
+        // codebases) legitimately prints these words in diagnostics, which would
+        // create noisy false positives and make cross-language self-porting
+        // comparisons unusable.
         if (now_in_body) {
             if (type == "line_comment" || type == "block_comment" ||
-                type == "comment" || type == "multiline_comment" ||
-                type == "string_literal" || type == "string_content" ||
-                type == "raw_string_literal" || type == "string") {
+                type == "comment" || type == "multiline_comment") {
                 uint32_t start = ts_node_start_byte(node);
                 uint32_t end = ts_node_end_byte(node);
                 if (end > start && end <= source.length()) {
                     std::string text = source.substr(start, end - start);
-                    if (text_has_stub_markers(text)) {
+                    if (comment_has_stub_markers(text)) {
                         found = true;
                         return;
                     }
@@ -790,59 +958,192 @@ private:
         return tree_node;
     }
 
-    void extract_functions_recursive(
-            TSNode node,
-            const std::string& source,
-            Language lang,
-            std::vector<std::pair<std::string, TreePtr>>& functions) {
+    bool is_function_node(const std::string& type_s, Language lang) const {
+        return (lang == Language::RUST && type_s == "function_item") ||
+            (lang == Language::KOTLIN && type_s == "function_declaration") ||
+            (lang == Language::CPP &&
+             (type_s == "function_definition" || type_s == "function_declarator")) ||
+            (lang == Language::PYTHON && type_s == "function_definition");
+    }
 
-        const char* type_str = ts_node_type(node);
-        bool is_function = false;
-        std::string func_name;
+    std::string extract_function_name(TSNode node, Language lang, const std::string& source) const {
+        uint32_t child_count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < child_count; ++i) {
+            TSNode child = ts_node_child(node, i);
+            const char* child_type = ts_node_type(child);
 
-        // Check if this is a function declaration
-        std::string type_s(type_str);
-        if (lang == Language::RUST) {
-            is_function = (type_s == "function_item");
-        } else if (lang == Language::KOTLIN) {
-            is_function = (type_s == "function_declaration");
-        } else if (lang == Language::CPP) {
-            is_function = (type_s == "function_definition" || type_s == "function_declarator");
-        } else if (lang == Language::PYTHON) {
-            is_function = (type_s == "function_definition");
+            std::string ct(child_type);
+            if ((lang == Language::RUST && ct == "identifier") ||
+                (lang == Language::KOTLIN && ct == "simple_identifier") ||
+                (lang == Language::CPP &&
+                    (ct == "identifier" || ct == "field_identifier")) ||
+                (lang == Language::PYTHON && ct == "identifier")) {
+                uint32_t start = ts_node_start_byte(child);
+                uint32_t end = ts_node_end_byte(child);
+                if (end > start && end <= source.length()) {
+                    return source.substr(start, end - start);
+                }
+            }
         }
 
-        if (is_function) {
-            // Extract function name
-            uint32_t child_count = ts_node_child_count(node);
-            for (uint32_t i = 0; i < child_count; ++i) {
-                TSNode child = ts_node_child(node, i);
-                const char* child_type = ts_node_type(child);
+        return "<anonymous>";
+    }
 
-                std::string ct(child_type);
-                if ((lang == Language::RUST && ct == "identifier") ||
-                    (lang == Language::KOTLIN && ct == "simple_identifier") ||
-                    (lang == Language::CPP && (ct == "identifier" || ct == "field_identifier")) ||
-                    (lang == Language::PYTHON && ct == "identifier")) {
-                    uint32_t start = ts_node_start_byte(child);
-                    uint32_t end = ts_node_end_byte(child);
+    TSNode extract_function_body_node(TSNode function_node, Language lang) const {
+        (void)lang;
+
+        TSNode body = ts_node_child_by_field_name(function_node, "body", 4);
+        if (!ts_node_is_null(body)) {
+            return body;
+        }
+
+        const std::vector<std::string> body_types = {
+            "function_body",
+            "expression_body",
+            "body",
+            "block",
+            "compound_statement"
+        };
+
+        const uint32_t child_count = ts_node_child_count(function_node);
+        for (uint32_t i = 0; i < child_count; ++i) {
+            TSNode child = ts_node_child(function_node, i);
+            std::string child_type(ts_node_type(child));
+            for (const auto& bt : body_types) {
+                if (child_type == bt) {
+                    return child;
+                }
+            }
+        }
+
+        return function_node;
+    }
+
+    bool has_stub_markers_in_node(TSNode node, const std::string& source, Language lang) const {
+        if (ts_node_is_null(node) || source.empty()) return false;
+
+        const std::vector<std::string> marker_nodes = {
+            "line_comment",
+            "block_comment",
+            "comment",
+            "multiline_comment"
+        };
+
+        std::vector<TSNode> stack;
+        stack.push_back(node);
+
+        while (!stack.empty()) {
+            TSNode current = stack.back();
+            stack.pop_back();
+
+            std::string current_type(ts_node_type(current));
+
+            // Strong stub constructs that don't rely on string/comment markers.
+            // Keep these conservative to avoid false positives.
+            if (lang == Language::PYTHON) {
+                if (current_type == "pass_statement" || current_type == "ellipsis") {
+                    return true;
+                }
+                if (current_type == "raise_statement") {
+                    uint32_t start = ts_node_start_byte(current);
+                    uint32_t end = ts_node_end_byte(current);
                     if (end > start && end <= source.length()) {
-                        func_name = source.substr(start, end - start);
-                        break;
+                        std::string text = source.substr(start, end - start);
+                        if (text.find("NotImplementedError") != std::string::npos ||
+                            text.find("notimplementederror") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+            } else if (lang == Language::RUST) {
+                if (current_type == "macro_invocation") {
+                    uint32_t start = ts_node_start_byte(current);
+                    uint32_t end = ts_node_end_byte(current);
+                    if (end > start && end <= source.length()) {
+                        // Macro names are at the beginning; avoid copying huge token trees.
+                        size_t len = std::min<size_t>(end - start, 96);
+                        std::string text = source.substr(start, len);
+                        if (text_has_stub_markers(text) ||
+                            text.find("todo!") != std::string::npos ||
+                            text.find("unimplemented!") != std::string::npos ||
+                            text.find("unreachable!") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+            } else if (lang == Language::KOTLIN) {
+                if (current_type == "simple_identifier" ||
+                    current_type == "type_identifier" ||
+                    current_type == "identifier") {
+                    uint32_t start = ts_node_start_byte(current);
+                    uint32_t end = ts_node_end_byte(current);
+                    if (end > start && end <= source.length()) {
+                        std::string text = source.substr(start, end - start);
+                        if (text == "TODO" || text == "NotImplementedError") {
+                            return true;
+                        }
                     }
                 }
             }
 
-            // Convert the function AST
-            TreePtr func_tree = convert_node(node, source, lang);
-            functions.emplace_back(func_name, func_tree);
+            bool is_marker_type = false;
+            for (const auto& marker_type : marker_nodes) {
+                if (current_type == marker_type) {
+                    is_marker_type = true;
+                    break;
+                }
+            }
+
+            if (is_marker_type) {
+                uint32_t start = ts_node_start_byte(current);
+                uint32_t end = ts_node_end_byte(current);
+                if (end > start && end <= source.length()) {
+                    std::string text = source.substr(start, end - start);
+                    if (comment_has_stub_markers(text)) return true;
+                }
+            }
+
+            const uint32_t child_count = ts_node_child_count(current);
+            for (uint32_t i = 0; i < child_count; ++i) {
+                TSNode child = ts_node_child(current, i);
+                if (!ts_node_is_null(child)) {
+                    stack.push_back(child);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    void extract_function_infos_recursive(
+            TSNode node,
+            const std::string& source,
+            Language lang,
+            std::vector<FunctionInfo>& functions) {
+
+        const char* type_str = ts_node_type(node);
+        std::string type_s(type_str);
+        if (is_function_node(type_s, lang)) {
+            TSNode body_node = extract_function_body_node(node, lang);
+            std::string func_name = extract_function_name(node, lang, source);
+
+            IdentifierStats ids;
+            extract_identifiers_recursive(body_node, source, ids);
+
+            FunctionInfo info;
+            info.name = func_name;
+            info.body_tree = convert_node(body_node, source, lang);
+            info.identifiers = ids;
+            info.has_stub_markers = has_stub_markers_in_node(body_node, source, lang);
+
+            functions.push_back(info);
         }
 
         // Recurse into children
         uint32_t child_count = ts_node_child_count(node);
         for (uint32_t i = 0; i < child_count; ++i) {
             TSNode child = ts_node_child(node, i);
-            extract_functions_recursive(child, source, lang, functions);
+            extract_function_infos_recursive(child, source, lang, functions);
         }
     }
 };
