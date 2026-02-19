@@ -1,5 +1,7 @@
 import Parser from "tree-sitter";
-import TypeScript from "tree-sitter-typescript";
+import TreeSitterTypeScript from "tree-sitter-typescript";
+import Rust from "tree-sitter-rust";
+import Cpp from "tree-sitter-cpp";
 import * as fs from "fs";
 import * as path from "path";
 import {
@@ -9,18 +11,56 @@ import {
   ParseResult,
   CommentStats,
   PortLintHeader,
+  IdentifierStats,
 } from "./types.js";
+import { getNodeMap } from "./node-maps.js";
+
+const STOP_WORDS = new Set(["the", "and", "for", "this", "that", "with"]);
+const STUB_MARKERS = [
+  "todo",
+  "stub",
+  "placeholder",
+  "fixme",
+  "not yet implemented",
+  "not implemented",
+];
+const ARITHMETIC_OPS = new Set(["+", "-", "*", "/", "%", "**"]);
+const COMPARISON_OPS = new Set(["==", "!=", "<", ">", "<=", ">=", "===", "!=="]);
+const LOGICAL_OPS = new Set(["&&", "||", "!"]);
+const BITWISE_OPS = new Set(["&", "|", "^", "~", "<<", ">>"]);
+const ASSIGNMENT_OPS = new Set([
+  "=",
+  "+=",
+  "-=",
+  "*=",
+  "/=",
+  "%=",
+  "&=",
+  "|=",
+  "^=",
+  "<<=",
+  ">>=",
+]);
+
+function getTypeScriptLanguage(): any {
+  const candidate = (TreeSitterTypeScript as any).typescript ??
+    (TreeSitterTypeScript as any).default ??
+    (TreeSitterTypeScript as any);
+  return candidate;
+}
 
 /**
  * Get tree-sitter parser for language
  */
-function getTreeSitterLanguage(lang: Language): Parser.Language {
+function getTreeSitterLanguage(lang: Language): any {
   switch (lang) {
     case Language.TYPESCRIPT:
-      return TypeScript;
+      return getTypeScriptLanguage();
     case Language.RUST:
-      // Will need tree-sitter-rust when added
-      throw new Error("Rust parser not yet implemented");
+      return Rust as unknown as any;
+    case Language.CPP:
+    case Language.C:
+      return Cpp as unknown as any;
     default:
       throw new Error(`Unsupported language: ${lang}`);
   }
@@ -29,68 +69,31 @@ function getTreeSitterLanguage(lang: Language): Parser.Language {
 /**
  * Normalize tree-sitter node type to our NodeType enum
  */
-function normalizeNodeType(type: string): NodeType {
-  const mapping: Record<string, NodeType> = {
-    // TypeScript types
-    source_file: NodeType.SOURCE_FILE,
-    program: NodeType.SOURCE_FILE,
-    function_declaration: NodeType.FUNCTION_DECLARATION,
-    function_definition: NodeType.FUNCTION_DEFINITION,
-    class_declaration: NodeType.CLASS_DECLARATION,
-    interface_declaration: NodeType.INTERFACE_DECLARATION,
-    type_alias_declaration: NodeType.TYPE_DECLARATION,
-    enum_declaration: NodeType.ENUM_DECLARATION,
-    variable_declaration: NodeType.VARIABLE_DECLARATION,
-    block: NodeType.BLOCK,
-    if_statement: NodeType.IF_STATEMENT,
-    for_statement: NodeType.FOR_STATEMENT,
-    while_statement: NodeType.WHILE_STATEMENT,
-    return_statement: NodeType.RETURN_STATEMENT,
-    expression_statement: NodeType.EXPRESSION_STATEMENT,
-    assignment_expression: NodeType.ASSIGNMENT,
-    call_expression: NodeType.CALL_EXPRESSION,
-    member_expression: NodeType.MEMBER_EXPRESSION,
-    binary_expression: NodeType.BINARY_EXPRESSION,
-    unary_expression: NodeType.UNARY_EXPRESSION,
-    string: NodeType.LITERAL,
-    number: NodeType.LITERAL,
-    true: NodeType.LITERAL,
-    false: NodeType.LITERAL,
-    identifier: NodeType.IDENTIFIER,
-    formal_parameters: NodeType.PARAMETER_LIST,
-    parameter: NodeType.PARAMETER,
-    type_annotation: NodeType.TYPE_ANNOTATION,
-    type_identifier: NodeType.TYPE_IDENTIFIER,
-    import_statement: NodeType.IMPORT_STATEMENT,
-    export_statement: NodeType.EXPORT_STATEMENT,
-    comment: NodeType.COMMENT,
-    property_identifier: NodeType.PROPERTY,
-
-    // Rust specific types (for future)
-    rust_function_item: NodeType.FUNCTION_DECLARATION,
-    rust_impl_item: NodeType.CLASS_DECLARATION,
-    rust_struct_item: NodeType.CLASS_DECLARATION,
-    rust_trait_item: NodeType.INTERFACE_DECLARATION,
-    rust_enum_item: NodeType.ENUM_DECLARATION,
-    rust_let_declaration: NodeType.VARIABLE_DECLARATION,
-  };
-
+function normalizeNodeType(type: string, language: Language): NodeType {
+  const mapping = getNodeMap(language);
   return mapping[type] || NodeType.UNKNOWN;
+}
+
+function classifyOperator(type: string): NodeType | null {
+  if (ARITHMETIC_OPS.has(type)) return NodeType.ARITHMETIC_OP;
+  if (COMPARISON_OPS.has(type)) return NodeType.COMPARISON_OP;
+  if (LOGICAL_OPS.has(type)) return NodeType.LOGICAL_OP;
+  if (BITWISE_OPS.has(type)) return NodeType.BITWISE_OP;
+  if (ASSIGNMENT_OPS.has(type)) return NodeType.ASSIGNMENT_OP;
+  return null;
 }
 
 /**
  * Convert tree-sitter tree to our TreeNode structure
  */
-function convertTree(node: Parser.SyntaxNode): TreeNode {
-  const nodeType = normalizeNodeType(node.type);
-  const label = node.type;
+function convertTree(
+  node: Parser.SyntaxNode,
+  source: string,
+  language: Language,
+): TreeNode {
+  const nodeType = normalizeNodeType(node.type, language);
+  const treeNode = new TreeNode(nodeType, node.type);
 
-  const children: TreeNode[] = [];
-  for (const child of node.children) {
-    children.push(convertTree(child));
-  }
-
-  const treeNode = new TreeNode(nodeType, label, children);
   treeNode.startPosition = {
     row: node.startPosition.row,
     column: node.startPosition.column,
@@ -99,6 +102,23 @@ function convertTree(node: Parser.SyntaxNode): TreeNode {
     row: node.endPosition.row,
     column: node.endPosition.column,
   };
+
+  if (node.children.length === 0) {
+    treeNode.label = source.slice(node.startIndex, node.endIndex);
+    return treeNode;
+  }
+
+  for (const child of node.children) {
+    if (child.isNamed) {
+      treeNode.children.push(convertTree(child, source, language));
+      continue;
+    }
+
+    const opType = classifyOperator(child.type);
+    if (opType !== null) {
+      treeNode.children.push(new TreeNode(opType, child.type));
+    }
+  }
 
   return treeNode;
 }
@@ -117,39 +137,41 @@ function extractComments(source: string, tree: Parser.Tree): CommentStats {
     wordFreq: new Map(),
   };
 
-  const lines = source.split("\n");
   const commentNodeTypes = new Set([
     "comment",
     "line_comment",
     "block_comment",
+    "multiline_comment",
   ]);
+
+  function tokenizeDoc(text: string) {
+    const words = text
+      .replace(/[^a-zA-Z0-9_]/g, " ")
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length >= 3 && !STOP_WORDS.has(w));
+
+    for (const word of words) {
+      stats.wordFreq.set(word, (stats.wordFreq.get(word) || 0) + 1);
+    }
+  }
 
   function walk(node: Parser.SyntaxNode) {
     if (commentNodeTypes.has(node.type)) {
       const text = source.slice(node.startIndex, node.endIndex);
       const linesCount = node.endPosition.row - node.startPosition.row + 1;
-
       stats.totalCommentLines += linesCount;
 
-      // Check for documentation comments
-      if (
+      const isDoc =
         text.startsWith("/**") ||
         text.startsWith("///") ||
-        text.startsWith("*")
-      ) {
+        text.startsWith("//!");
+
+      if (isDoc) {
         stats.docCommentCount++;
         stats.totalDocLines += linesCount;
         stats.docTexts.push(text);
-
-        // Extract words for frequency analysis
-        const words = text
-          .replace(/[\/\*\s\@]/g, " ")
-          .split(/\s+/)
-          .filter((w) => w.length > 2);
-
-        for (const word of words) {
-          stats.wordFreq.set(word, (stats.wordFreq.get(word) || 0) + 1);
-        }
+        tokenizeDoc(text);
       } else if (text.startsWith("//")) {
         stats.lineCommentCount++;
       } else {
@@ -186,6 +208,124 @@ function buildHistogram(node: TreeNode): Map<NodeType, number> {
   return histogram;
 }
 
+function canonicalizeIdentifier(name: string): string {
+  return name.replace(/_/g, "").toLowerCase();
+}
+
+function extractIdentifierStats(source: string, tree: Parser.Tree): IdentifierStats {
+  const stats: IdentifierStats = {
+    identifierFreq: new Map(),
+    canonicalFreq: new Map(),
+    totalIdentifiers: 0,
+  };
+
+  const identifierNodeTypes = new Set([
+    "identifier",
+    "simple_identifier",
+    "type_identifier",
+    "field_identifier",
+    "property_identifier",
+  ]);
+
+  function walk(node: Parser.SyntaxNode) {
+    if (identifierNodeTypes.has(node.type)) {
+      const text = source.slice(node.startIndex, node.endIndex);
+      if (text.length > 1 && text !== "it" && text !== "this") {
+        stats.identifierFreq.set(text, (stats.identifierFreq.get(text) || 0) + 1);
+        const canonical = canonicalizeIdentifier(text);
+        stats.canonicalFreq.set(canonical, (stats.canonicalFreq.get(canonical) || 0) + 1);
+        stats.totalIdentifiers++;
+      }
+    }
+
+    for (const child of node.children) {
+      walk(child);
+    }
+  }
+
+  walk(tree.rootNode);
+  return stats;
+}
+
+function textHasStubMarkers(text: string): boolean {
+  const lower = text.toLowerCase();
+  return STUB_MARKERS.some((marker) => lower.includes(marker));
+}
+
+function detectStubBodies(source: string, tree: Parser.Tree, language: Language): boolean {
+  const functionTypesByLang: Record<string, Set<string>> = {
+    [Language.TYPESCRIPT]: new Set([
+      "function_declaration",
+      "function_expression",
+      "arrow_function",
+      "method_definition",
+    ]),
+    [Language.RUST]: new Set(["function_item"]),
+    [Language.CPP]: new Set(["function_definition", "function_declarator"]),
+    [Language.C]: new Set(["function_definition", "function_declarator"]),
+  };
+
+  const bodyTypes = new Set([
+    "function_body",
+    "body",
+    "block",
+    "compound_statement",
+    "statement_block",
+    "expression_body",
+  ]);
+
+  const markerTypes = new Set([
+    "line_comment",
+    "block_comment",
+    "comment",
+    "multiline_comment",
+    "string",
+    "string_literal",
+    "string_content",
+    "raw_string_literal",
+    "template_string",
+  ]);
+
+  const functionTypes = functionTypesByLang[language] || new Set<string>();
+
+  function subtreeHasMarker(root: Parser.SyntaxNode): boolean {
+    const stack: Parser.SyntaxNode[] = [root];
+    while (stack.length > 0) {
+      const node = stack.pop()!;
+      if (markerTypes.has(node.type)) {
+        const text = source.slice(node.startIndex, node.endIndex);
+        if (textHasStubMarkers(text)) {
+          return true;
+        }
+      }
+      for (const child of node.children) {
+        stack.push(child);
+      }
+    }
+    return false;
+  }
+
+  const stack: Parser.SyntaxNode[] = [tree.rootNode];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (functionTypes.has(node.type)) {
+      const bodies = node.children.filter((ch) => bodyTypes.has(ch.type));
+      const scanRoots = bodies.length > 0 ? bodies : [node];
+      for (const body of scanRoots) {
+        if (subtreeHasMarker(body)) {
+          return true;
+        }
+      }
+    }
+
+    for (const child of node.children) {
+      stack.push(child);
+    }
+  }
+
+  return false;
+}
+
 /**
  * Extract import and export paths
  */
@@ -200,12 +340,13 @@ function extractImportsExports(
   const exports: string[] = [];
 
   function walk(node: Parser.SyntaxNode) {
-    if (node.type === "import_statement") {
+    if (node.type === "import_statement" || node.type === "use_declaration" || node.type === "preproc_include") {
       const text = source.slice(node.startIndex, node.endIndex);
-      // Extract from import ... from ...
-      const match = text.match(/import\s+.*?from\s+['"]([^'"]+)['"]/);
-      if (match) {
-        imports.push(match[1]);
+      const fromMatch = text.match(/from\s+['"]([^'"]+)['"]/);
+      if (fromMatch) {
+        imports.push(fromMatch[1]);
+      } else {
+        imports.push(text.trim());
       }
     } else if (node.type === "export_statement") {
       const text = source.slice(node.startIndex, node.endIndex);
@@ -223,10 +364,6 @@ function extractImportsExports(
 
 /**
  * Extract port-lint header from file
- *
- * Matches:
- *   // port-lint: source <path>
- *   // port-lint: tests <path>
  */
 function extractPortLintHeader(
   source: string,
@@ -246,40 +383,69 @@ function extractPortLintHeader(
   return null;
 }
 
+function buildParseResult(
+  source: string,
+  language: Language,
+  filename: string,
+): ParseResult {
+  const parser = new Parser();
+  parser.setLanguage(getTreeSitterLanguage(language));
+
+  let tree: Parser.Tree;
+  try {
+    tree = parser.parse(source);
+  } catch {
+    // Older tree-sitter Node bindings can reject large strings; callback mode is robust.
+    tree = parser.parse((index: number) => {
+      if (index >= source.length) return null;
+      return source.slice(index, index + 8192);
+    });
+  }
+  const rootNode = convertTree(tree.rootNode, source, language);
+  const commentStats = extractComments(source, tree);
+  const identifierStats = extractIdentifierStats(source, tree);
+  const hasStubBodies = detectStubBodies(source, tree, language);
+  const nodeTypes = buildHistogram(rootNode);
+  const { imports, exports } = extractImportsExports(source, tree);
+
+  return {
+    tree: rootNode,
+    filename,
+    language,
+    commentStats,
+    identifierStats,
+    hasStubBodies,
+    nodeTypes,
+    importPaths: imports,
+    exportPaths: exports,
+  };
+}
+
 /**
  * Parse a source file and generate AST
  */
 export function parseFile(
-  filePath: string,
+  filePath: string | string[],
   language: Language,
 ): ParseResult | null {
   try {
-    const source = fs.readFileSync(filePath, "utf-8");
+    const filePaths = Array.isArray(filePath) ? filePath : [filePath];
+    if (filePaths.length === 0) {
+      return null;
+    }
+    const source = filePaths
+      .map((p) => fs.readFileSync(p, "utf-8"))
+      .join("\n\n");
+    const displayName = path.basename(filePaths[0] || "<unknown>");
+    const result = buildParseResult(source, language, displayName);
 
-    const parser = new Parser();
-    parser.setLanguage(getTreeSitterLanguage(language));
-
-    const tree = parser.parse(source);
-    const rootNode = convertTree(tree.rootNode);
-
-    const commentStats = extractComments(source, tree);
-    const nodeTypes = buildHistogram(rootNode);
-    const { imports, exports } = extractImportsExports(source, tree);
-
-    const header = extractPortLintHeader(source, filePath);
-
-    return {
-      tree: rootNode,
-      filename: path.basename(filePath),
-      language,
-      commentStats,
-      nodeTypes,
-      importPaths: imports,
-      exportPaths: exports,
-      portLintHeader: header || undefined,
-    };
+    const headerSource = fs.readFileSync(filePaths[0], "utf-8");
+    const header = extractPortLintHeader(headerSource, filePaths[0]);
+    result.portLintHeader = header || undefined;
+    return result;
   } catch (error) {
-    console.error(`Error parsing ${filePath}:`, (error as Error).message);
+    const desc = Array.isArray(filePath) ? filePath.join(", ") : filePath;
+    console.error(`Error parsing ${desc}:`, (error as Error).message);
     return null;
   }
 }
@@ -293,25 +459,7 @@ export function parseString(
   filename: string = "<stdin>",
 ): ParseResult | null {
   try {
-    const parser = new Parser();
-    parser.setLanguage(getTreeSitterLanguage(language));
-
-    const tree = parser.parse(source);
-    const rootNode = convertTree(tree.rootNode);
-
-    const commentStats = extractComments(source, tree);
-    const nodeTypes = buildHistogram(rootNode);
-    const { imports, exports } = extractImportsExports(source, tree);
-
-    return {
-      tree: rootNode,
-      filename,
-      language,
-      commentStats,
-      nodeTypes,
-      importPaths: imports,
-      exportPaths: exports,
-    };
+    return buildParseResult(source, language, filename);
   } catch (error) {
     console.error(`Error parsing ${filename}:`, (error as Error).message);
     return null;

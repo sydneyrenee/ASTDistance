@@ -11,6 +11,12 @@ export {
 export { parseFile, parseString } from "./ast-parser.js";
 export {
   computeSimilarity,
+  histogramCosineSimilarity,
+  histogramCosineSimilarityMacro,
+  combinedSimilarityWithContent,
+  identifierCosineSimilarity,
+  canonicalIdentifierCosineSimilarity,
+  canonicalIdentifierJaccardSimilarity,
   docCosineSimilarity,
   compareDocumentation,
   printSimilarityReport,

@@ -11,12 +11,14 @@
 #include <set>
 #include <cctype>
 #include <algorithm>
+#include <cmath>
 
 // External declarations for tree-sitter language functions
 extern "C" {
     const TSLanguage* tree_sitter_rust();
     const TSLanguage* tree_sitter_kotlin();
     const TSLanguage* tree_sitter_cpp();
+    const TSLanguage* tree_sitter_python();
 }
 
 namespace ast_distance {
@@ -24,7 +26,8 @@ namespace ast_distance {
 enum class Language {
     RUST,
     KOTLIN,
-    CPP
+    CPP,
+    PYTHON
 };
 
 /**
@@ -33,37 +36,90 @@ enum class Language {
  */
 struct IdentifierStats {
     std::map<std::string, int> identifier_freq;  // Frequency of each identifier
+    std::map<std::string, int> canonical_freq;   // Canonicalized (lowercase, no underscores)
     int total_identifiers = 0;
+
+    /**
+     * Canonicalize an identifier for cross-language comparison.
+     * "foo_bar" and "fooBar" and "FooBar" all become "foobar".
+     * This lets snake_case Rust match camelCase Kotlin.
+     */
+    static std::string canonicalize(const std::string& name) {
+        std::string result;
+        result.reserve(name.size());
+        for (char c : name) {
+            if (c != '_') {
+                result += static_cast<char>(
+                    std::tolower(static_cast<unsigned char>(c)));
+            }
+        }
+        return result;
+    }
 
     void add_identifier(const std::string& name) {
         if (!name.empty()) {
             identifier_freq[name]++;
+            canonical_freq[canonicalize(name)]++;
             total_identifiers++;
         }
     }
 
     /**
      * Compute cosine similarity of identifier frequencies with another IdentifierStats.
-     * Detects naming divergences: collect() vs gather() will have low similarity.
+     * Uses raw identifiers — detects naming divergences when same language.
      */
     float identifier_cosine_similarity(const IdentifierStats& other) const {
-        if (identifier_freq.empty() || other.identifier_freq.empty()) {
-            return 0.0f;
+        return cosine_similarity_of(identifier_freq, other.identifier_freq);
+    }
+
+    /**
+     * Compute cosine similarity using canonicalized identifiers.
+     * This is the key metric for cross-language porting: "foo_bar" matches "fooBar".
+     * A file full of placeholder stubs will score near 0 because the *names* are wrong,
+     * even if the AST shape looks similar.
+     */
+    float canonical_cosine_similarity(const IdentifierStats& other) const {
+        return cosine_similarity_of(canonical_freq, other.canonical_freq);
+    }
+
+    /**
+     * Jaccard similarity of canonicalized identifier sets (ignoring frequency).
+     * What fraction of identifiers are shared between source and target?
+     */
+    float canonical_jaccard_similarity(const IdentifierStats& other) const {
+        if (canonical_freq.empty() && other.canonical_freq.empty()) return 1.0f;
+        if (canonical_freq.empty() || other.canonical_freq.empty()) return 0.0f;
+
+        std::set<std::string> ids1, ids2;
+        for (const auto& [id, _] : canonical_freq) ids1.insert(id);
+        for (const auto& [id, _] : other.canonical_freq) ids2.insert(id);
+
+        int intersection = 0;
+        for (const auto& id : ids1) {
+            if (ids2.count(id)) intersection++;
         }
 
-        // Build union of all identifiers
-        std::set<std::string> all_ids;
-        for (const auto& [id, _] : identifier_freq) all_ids.insert(id);
-        for (const auto& [id, _] : other.identifier_freq) all_ids.insert(id);
+        int union_size = static_cast<int>(ids1.size() + ids2.size()) - intersection;
+        if (union_size == 0) return 1.0f;
+        return static_cast<float>(intersection) / static_cast<float>(union_size);
+    }
 
-        // Compute dot product and norms
+private:
+    static float cosine_similarity_of(const std::map<std::string, int>& a,
+                                       const std::map<std::string, int>& b) {
+        if (a.empty() || b.empty()) return 0.0f;
+
+        std::set<std::string> all_ids;
+        for (const auto& [id, _] : a) all_ids.insert(id);
+        for (const auto& [id, _] : b) all_ids.insert(id);
+
         double dot = 0.0, norm1 = 0.0, norm2 = 0.0;
         for (const auto& id : all_ids) {
             int freq1 = 0, freq2 = 0;
-            auto it1 = identifier_freq.find(id);
-            auto it2 = other.identifier_freq.find(id);
-            if (it1 != identifier_freq.end()) freq1 = it1->second;
-            if (it2 != other.identifier_freq.end()) freq2 = it2->second;
+            auto it1 = a.find(id);
+            auto it2 = b.find(id);
+            if (it1 != a.end()) freq1 = it1->second;
+            if (it2 != b.end()) freq2 = it2->second;
 
             dot += freq1 * freq2;
             norm1 += freq1 * freq1;
@@ -182,17 +238,25 @@ public:
     }
 
     /**
+     * Parse multiple source files into a single normalized AST by concatenating them.
+     */
+    TreePtr parse_file(const std::vector<std::string>& filepaths, Language lang) {
+        std::stringstream unified_buffer;
+        for (const auto& filepath : filepaths) {
+            std::ifstream file(filepath);
+            if (!file.is_open()) {
+                throw std::runtime_error("Cannot open file: " + filepath);
+            }
+            unified_buffer << file.rdbuf() << "\n\n";
+        }
+        return parse_string(unified_buffer.str(), lang);
+    }
+
+    /**
      * Parse a source file into a normalized AST.
      */
     TreePtr parse_file(const std::string& filepath, Language lang) {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            throw std::runtime_error("Cannot open file: " + filepath);
-        }
-
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        return parse_string(buffer.str(), lang);
+        return parse_file(std::vector<std::string>{filepath}, lang);
     }
 
     /**
@@ -205,6 +269,7 @@ public:
             case Language::RUST: ts_lang = tree_sitter_rust(); break;
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
+            case Language::PYTHON: ts_lang = tree_sitter_python(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -239,6 +304,7 @@ public:
             case Language::RUST: ts_lang = tree_sitter_rust(); break;
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
+            case Language::PYTHON: ts_lang = tree_sitter_python(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -260,17 +326,24 @@ public:
     }
 
     /**
+     * Extract comment statistics from multiple files combined.
+     */
+    CommentStats extract_comments_from_file(const std::vector<std::string>& filepaths, Language lang) {
+        std::stringstream unified_buffer;
+        for (const auto& filepath : filepaths) {
+            std::ifstream file(filepath);
+            if (file.is_open()) {
+                unified_buffer << file.rdbuf() << "\n\n";
+            }
+        }
+        return extract_comments(unified_buffer.str(), lang);
+    }
+
+    /**
      * Extract comment statistics from a file.
      */
     CommentStats extract_comments_from_file(const std::string& filepath, Language lang) {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            return CommentStats{};
-        }
-
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        return extract_comments(buffer.str(), lang);
+        return extract_comments_from_file(std::vector<std::string>{filepath}, lang);
     }
 
     /**
@@ -286,6 +359,7 @@ public:
             case Language::RUST: ts_lang = tree_sitter_rust(); break;
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
+            case Language::PYTHON: ts_lang = tree_sitter_python(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -308,17 +382,24 @@ public:
     }
 
     /**
+     * Extract identifier statistics from multiple files combined.
+     */
+    IdentifierStats extract_identifiers_from_file(const std::vector<std::string>& filepaths, Language lang) {
+        std::stringstream unified_buffer;
+        for (const auto& filepath : filepaths) {
+            std::ifstream file(filepath);
+            if (file.is_open()) {
+                unified_buffer << file.rdbuf() << "\n\n";
+            }
+        }
+        return extract_identifiers(unified_buffer.str(), lang);
+    }
+
+    /**
      * Extract identifier statistics from a file.
      */
     IdentifierStats extract_identifiers_from_file(const std::string& filepath, Language lang) {
-        std::ifstream file(filepath);
-        if (!file.is_open()) {
-            return IdentifierStats{};
-        }
-
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        return extract_identifiers(buffer.str(), lang);
+        return extract_identifiers_from_file(std::vector<std::string>{filepath}, lang);
     }
 
     /**
@@ -334,6 +415,7 @@ public:
             case Language::RUST: ts_lang = tree_sitter_rust(); break;
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
+            case Language::PYTHON: ts_lang = tree_sitter_python(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -352,6 +434,66 @@ public:
 
         ts_tree_delete(ts_tree);
         return functions;
+    }
+
+    /**
+     * Check if a string (case-insensitive) contains stub/TODO markers.
+     */
+    static bool text_has_stub_markers(const std::string& text) {
+        std::string lower;
+        lower.reserve(text.size());
+        for (char c : text) {
+            lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        // These patterns inside function bodies mean the code is fake
+        return lower.find("todo") != std::string::npos ||
+               lower.find("stub") != std::string::npos ||
+               lower.find("placeholder") != std::string::npos ||
+               lower.find("fixme") != std::string::npos ||
+               lower.find("not yet implemented") != std::string::npos ||
+               lower.find("not implemented") != std::string::npos;
+    }
+
+    /**
+     * Check if a source file has stub/TODO markers inside function bodies.
+     * Returns true if any function body contains these markers.
+     * File-level comments are ignored — only code that's pretending to be real.
+     */
+    bool has_stub_bodies(const std::string& source, Language lang) {
+        const TSLanguage* ts_lang;
+        switch (lang) {
+            case Language::RUST: ts_lang = tree_sitter_rust(); break;
+            case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
+            case Language::CPP: ts_lang = tree_sitter_cpp(); break;
+            case Language::PYTHON: ts_lang = tree_sitter_python(); break;
+        }
+
+        if (!ts_parser_set_language(parser_, ts_lang)) return false;
+
+        TSTree* ts_tree = ts_parser_parse_string(
+            parser_, nullptr, source.c_str(), source.length());
+        if (!ts_tree) return false;
+
+        TSNode root = ts_tree_root_node(ts_tree);
+        bool found = false;
+        detect_stubs_recursive(root, source, found, false);
+
+        ts_tree_delete(ts_tree);
+        return found;
+    }
+
+    /**
+     * Check if any file in a set has stub bodies.
+     */
+    bool has_stub_bodies_in_files(const std::vector<std::string>& filepaths, Language lang) {
+        for (const auto& filepath : filepaths) {
+            std::ifstream file(filepath);
+            if (!file.is_open()) continue;
+            std::stringstream buf;
+            buf << file.rdbuf();
+            if (has_stub_bodies(buf.str(), lang)) return true;
+        }
+        return false;
     }
 
 private:
@@ -420,6 +562,9 @@ private:
             is_line_comment = (type_s == "line_comment");
             is_block_comment = (type_s == "block_comment");
             is_comment = is_line_comment || is_block_comment;
+        } else if (lang == Language::PYTHON) {
+            is_comment = (type_s == "comment");
+            is_line_comment = is_comment;
         }
 
         if (is_comment) {
@@ -448,6 +593,10 @@ private:
                 is_doc_comment = (text.find("///") == 0) ||
                                  (text.find("//!") == 0) ||
                                  (text.find("/**") == 0);
+            } else if (lang == Language::PYTHON) {
+                // Python has no standardized doc-comment syntax.
+                // Docstrings are AST string nodes, not comment nodes.
+                is_doc_comment = false;
             }
 
             if (is_doc_comment) {
@@ -502,6 +651,64 @@ private:
         }
     }
 
+    /**
+     * Recursively scan function/method bodies for stub markers.
+     * Returns true if ANY function body contains TODO/stub/placeholder/FIXME.
+     */
+    void detect_stubs_recursive(TSNode node, const std::string& source, bool& found, bool in_body) {
+        if (found) return;  // short circuit
+
+        std::string type(ts_node_type(node));
+
+        // Are we entering a function body?
+        bool entering_body = false;
+        if (type == "function_body" ||           // Kotlin
+            type == "block" ||                    // Rust/Kotlin/C++ function body
+            type == "expression_body") {          // Kotlin `fun x() = expr`
+            // Only count blocks that are direct children of function declarations
+            if (in_body) {
+                entering_body = false;  // already inside
+            } else {
+                TSNode parent = ts_node_parent(node);
+                if (!ts_node_is_null(parent)) {
+                    std::string ptype(ts_node_type(parent));
+                    if (ptype == "function_item" ||          // Rust
+                        ptype == "function_declaration" ||   // Kotlin
+                        ptype == "function_definition" ||    // C++
+                        ptype == "function_body") {          // Kotlin wrapper
+                        entering_body = true;
+                    }
+                }
+            }
+        }
+
+        bool now_in_body = in_body || entering_body;
+
+        // If we're inside a function body, check comments and string literals
+        if (now_in_body) {
+            if (type == "line_comment" || type == "block_comment" ||
+                type == "comment" || type == "multiline_comment" ||
+                type == "string_literal" || type == "string_content" ||
+                type == "raw_string_literal" || type == "string") {
+                uint32_t start = ts_node_start_byte(node);
+                uint32_t end = ts_node_end_byte(node);
+                if (end > start && end <= source.length()) {
+                    std::string text = source.substr(start, end - start);
+                    if (text_has_stub_markers(text)) {
+                        found = true;
+                        return;
+                    }
+                }
+            }
+        }
+
+        uint32_t child_count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < child_count && !found; ++i) {
+            TSNode child = ts_node_child(node, i);
+            detect_stubs_recursive(child, source, found, now_in_body);
+        }
+    }
+
     TreePtr convert_node(TSNode node, const std::string& source, Language lang) {
         const char* type_str = ts_node_type(node);
 
@@ -511,6 +718,7 @@ private:
             case Language::RUST: normalized_type = rust_node_to_type(type_str); break;
             case Language::KOTLIN: normalized_type = kotlin_node_to_type(type_str); break;
             case Language::CPP: normalized_type = cpp_node_to_type(type_str); break;
+            case Language::PYTHON: normalized_type = python_node_to_type(type_str); break;
         }
 
         auto tree_node = std::make_shared<Tree>(
@@ -600,6 +808,8 @@ private:
             is_function = (type_s == "function_declaration");
         } else if (lang == Language::CPP) {
             is_function = (type_s == "function_definition" || type_s == "function_declarator");
+        } else if (lang == Language::PYTHON) {
+            is_function = (type_s == "function_definition");
         }
 
         if (is_function) {
@@ -612,7 +822,8 @@ private:
                 std::string ct(child_type);
                 if ((lang == Language::RUST && ct == "identifier") ||
                     (lang == Language::KOTLIN && ct == "simple_identifier") ||
-                    (lang == Language::CPP && (ct == "identifier" || ct == "field_identifier"))) {
+                    (lang == Language::CPP && (ct == "identifier" || ct == "field_identifier")) ||
+                    (lang == Language::PYTHON && ct == "identifier")) {
                     uint32_t start = ts_node_start_byte(child);
                     uint32_t end = ts_node_end_byte(child);
                     if (end > start && end <= source.length()) {

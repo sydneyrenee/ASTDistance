@@ -4,10 +4,18 @@
 #include "codebase.hpp"
 #include "porting_utils.hpp"
 #include "task_manager.hpp"
+#include "symbol_analysis.hpp"
+#include "symbol_extraction.hpp"
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <regex>
+#include <set>
 #include <ctime>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <tree_sitter/api.h>
 
 using namespace ast_distance;
 
@@ -15,7 +23,8 @@ Language parse_language(const std::string& lang_str) {
     if (lang_str == "rust") return Language::RUST;
     if (lang_str == "kotlin") return Language::KOTLIN;
     if (lang_str == "cpp") return Language::CPP;
-    throw std::runtime_error("Unknown language: " + lang_str + " (use rust, kotlin, or cpp)");
+    if (lang_str == "python") return Language::PYTHON;
+    throw std::runtime_error("Unknown language: " + lang_str + " (use rust, kotlin, cpp, or python)");
 }
 
 const char* language_name(Language lang) {
@@ -23,6 +32,7 @@ const char* language_name(Language lang) {
         case Language::RUST: return "Rust";
         case Language::KOTLIN: return "Kotlin";
         case Language::CPP: return "C++";
+        case Language::PYTHON: return "Python";
     }
     return "Unknown";
 }
@@ -34,16 +44,20 @@ void print_usage(const char* program) {
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare functions between files with similarity matrix\n\n";
-    std::cerr << "  " << program << " --dump <file> <rust|kotlin|cpp>\n";
+    std::cerr << "  " << program << " --dump <file> <rust|kotlin|cpp|python>\n";
     std::cerr << "      Dump AST structure of a file\n\n";
-    std::cerr << "  " << program << " --scan <directory> <rust|kotlin|cpp>\n";
+    std::cerr << "  " << program << " --scan <directory> <rust|kotlin|cpp|python>\n";
     std::cerr << "      Scan directory and show file list with import counts\n\n";
-    std::cerr << "  " << program << " --deps <directory> <rust|kotlin|cpp>\n";
+    std::cerr << "  " << program << " --deps <directory> <rust|kotlin|cpp|python>\n";
     std::cerr << "      Build and show dependency graph\n\n";
     std::cerr << "  " << program << " --rank <src_dir> <src_lang> <tgt_dir> <tgt_lang>\n";
     std::cerr << "      Rank files by porting priority (dependents + similarity)\n\n";
     std::cerr << "  " << program << " --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang>\n";
     std::cerr << "      Full analysis: AST + deps + TODOs + lint + line ratios\n\n";
+    std::cerr << "  " << program << " --numpy-mlx <numpy_dir> <mlx_dir>\n";
+    std::cerr << "      Python-focused report: compare two Python codebases and audit residual NumPy usage\n\n";
+    std::cerr << "  " << program << " --emberlint <path>\n";
+    std::cerr << "      Fast multi-language lint: NumPy usage + common MLX graph breakers (casts, conversions, operators)\n\n";
     std::cerr << "  " << program << " --missing <src_dir> <src_lang> <tgt_dir> <tgt_lang>\n";
     std::cerr << "      Show files missing from target, ranked by importance\n\n";
     std::cerr << "  " << program << " --todos <directory>\n";
@@ -52,6 +66,40 @@ void print_usage(const char* program) {
     std::cerr << "      Run lint checks (unused params, missing guards)\n\n";
     std::cerr << "  " << program << " --stats <directory>\n";
     std::cerr << "      Show file statistics (line counts, stubs, TODOs)\n\n";
+    std::cerr << "Symbol Analysis:\n";
+    std::cerr << "  " << program << " --symbols <kotlin_root> <cpp_root>\n";
+    std::cerr << "      Run symbol analysis (duplicates + stubs)\n\n";
+    std::cerr << "  " << program << " --symbols-duplicates <kotlin_root> <cpp_root>\n";
+    std::cerr << "      Show duplicate class/struct definitions\n\n";
+    std::cerr << "  " << program << " --symbols-stubs <kotlin_root> <cpp_root>\n";
+    std::cerr << "      Show stub files/classes\n\n";
+    std::cerr << "  " << program << " --symbols-symbol <kotlin_root> <cpp_root> <symbol> [--json]\n";
+    std::cerr << "      Analyze a specific symbol (optionally output JSON)\n\n";
+    std::cerr << "  " << program << " --symbol-parity <rust_root> <kotlin_root>\n";
+    std::cerr << "      Rust->Kotlin symbol parity analysis\n\n";
+    std::cerr << "  " << program << " --symbol-parity <rust_root> <kotlin_root> --json\n";
+    std::cerr << "      Output symbol parity as JSON\n\n";
+    std::cerr << "  " << program << " --symbol-parity <rust_root> <kotlin_root> --kind <function|struct|enum|trait>\n";
+    std::cerr << "      Filter by symbol kind\n\n";
+    std::cerr << "  " << program << " --symbol-parity <rust_root> <kotlin_root> --file <path>\n";
+    std::cerr << "      Filter to specific source file\n\n";
+    std::cerr << "  " << program << " --symbol-parity <rust_root> <kotlin_root> --missing-only\n";
+    std::cerr << "      Show only missing symbols (concise mode)\n\n";
+    std::cerr << "  " << program << " --import-map <kotlin_root>\n";
+    std::cerr << "      Build type registry and show missing imports per file\n\n";
+    std::cerr << "  " << program << " --import-map <kotlin_root> --summary\n";
+    std::cerr << "      Show only per-file unresolved counts\n\n";
+    std::cerr << "  " << program << " --import-map <kotlin_root> --file <path>\n";
+    std::cerr << "      Show imports for a specific file\n\n";
+    std::cerr << "  " << program << " --import-map <kotlin_root> --json\n";
+    std::cerr << "      Output as JSON\n\n";
+    std::cerr << "Compiler Error Analysis:\n";
+    std::cerr << "  " << program << " --compiler-fixup <kotlin_root> <error_file>\n";
+    std::cerr << "      Parse compiler errors and suggest import fixes\n\n";
+    std::cerr << "  " << program << " --compiler-fixup <kotlin_root> <error_file> --json\n";
+    std::cerr << "      Output as JSON\n\n";
+    std::cerr << "  " << program << " --compiler-fixup <kotlin_root> <error_file> --verbose\n";
+    std::cerr << "      Show alternative imports for ambiguous references\n\n";
     std::cerr << "Swarm Task Management:\n";
     std::cerr << "  " << program << " --init-tasks <src_dir> <src_lang> <tgt_dir> <tgt_lang> <task_file>\n";
     std::cerr << "      Generate task file from missing/incomplete ports\n\n";
@@ -64,7 +112,7 @@ void print_usage(const char* program) {
     std::cerr << "      Mark a task as completed\n\n";
     std::cerr << "  " << program << " --release <task_file> <source_qualified>\n";
     std::cerr << "      Release an assigned task back to pending\n\n";
-    std::cerr << "  Languages: rust, kotlin, cpp\n\n";
+    std::cerr << "  Languages: rust, kotlin, cpp, python\n\n";
     std::cerr << "Port-Lint Headers:\n";
     std::cerr << "  Add a header comment to each ported file to enable accurate source tracking.\n";
     std::cerr << "  This allows --deep analysis to match files by explicit declaration rather\n";
@@ -105,6 +153,671 @@ void print_histogram(const std::vector<int>& hist) {
             std::cout << "  " << std::setw(15) << std::left << name
                       << ": " << hist[i] << "\n";
         }
+    }
+}
+
+struct NumpyMlxAudit {
+    int numpy_imports = 0;
+    int numpy_refs = 0;
+    int mlx_imports = 0;
+    int mlx_refs = 0;
+};
+
+static int count_occurrences(const std::string& haystack, const std::string& needle) {
+    if (needle.empty()) return 0;
+    int count = 0;
+    size_t pos = 0;
+    while (true) {
+        pos = haystack.find(needle, pos);
+        if (pos == std::string::npos) break;
+        count++;
+        pos += needle.size();
+    }
+    return count;
+}
+
+static NumpyMlxAudit audit_numpy_mlx_python_file(const std::string& path) {
+    NumpyMlxAudit a;
+
+    std::ifstream file(path);
+    if (!file.is_open()) return a;
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    std::string s = buffer.str();
+
+    // Imports
+    a.numpy_imports += count_occurrences(s, "import numpy");
+    a.numpy_imports += count_occurrences(s, "from numpy import");
+
+    a.mlx_imports += count_occurrences(s, "import mlx");
+    a.mlx_imports += count_occurrences(s, "from mlx");
+    a.mlx_imports += count_occurrences(s, "_mlx_numpy");
+
+    // References (heuristic)
+    a.numpy_refs += count_occurrences(s, "numpy.");
+    a.numpy_refs += count_occurrences(s, "np.");
+
+    a.mlx_refs += count_occurrences(s, "mlx.");
+    a.mlx_refs += count_occurrences(s, "mx.");
+    a.mlx_refs += count_occurrences(s, "_mlx_numpy.");
+
+    return a;
+}
+
+void cmd_numpy_mlx(const std::string& numpy_dir, const std::string& mlx_dir) {
+    std::cout << "=== NumPy -> MLX (Python) Deep Report ===\n\n";
+    std::cout << "NumPy source: " << numpy_dir << "\n";
+    std::cout << "MLX target:   " << mlx_dir << "\n\n";
+
+    Codebase source(numpy_dir, "python");
+    source.scan();
+    source.extract_imports();
+    source.build_dependency_graph();
+
+    Codebase target(mlx_dir, "python");
+    target.scan();
+    target.extract_imports();
+    target.build_dependency_graph();
+
+    CodebaseComparator comp(source, target);
+    comp.find_matches();
+    comp.compute_similarities();
+
+    int files_with_numpy = 0;
+    int total_numpy_imports = 0;
+    int total_numpy_refs = 0;
+    int total_mlx_imports = 0;
+    int total_mlx_refs = 0;
+
+    struct Row {
+        std::string qualified;
+        std::string rel_path;
+        NumpyMlxAudit audit;
+        float similarity = -1.0f;
+    };
+    std::vector<Row> rows;
+    rows.reserve(comp.matches.size());
+
+    for (const auto& m : comp.matches) {
+        auto a = NumpyMlxAudit{};
+        const auto& tgt_file = target.files.at(m.target_path);
+        for (const auto& tgt_path : tgt_file.paths) {
+            auto part = audit_numpy_mlx_python_file(tgt_path);
+            a.numpy_imports += part.numpy_imports;
+            a.numpy_refs += part.numpy_refs;
+            a.mlx_imports += part.mlx_imports;
+            a.mlx_refs += part.mlx_refs;
+        }
+
+        total_numpy_imports += a.numpy_imports;
+        total_numpy_refs += a.numpy_refs;
+        total_mlx_imports += a.mlx_imports;
+        total_mlx_refs += a.mlx_refs;
+        if (a.numpy_imports > 0 || a.numpy_refs > 0) files_with_numpy++;
+
+        Row r;
+        r.qualified = m.target_qualified;
+        r.rel_path = tgt_file.relative_path;
+        r.audit = a;
+        r.similarity = m.similarity;
+        rows.push_back(std::move(r));
+    }
+
+    std::cout << "Matched files: " << comp.matches.size() << "\n";
+    std::cout << "Unmatched:     " << comp.unmatched_source.size() << " source, "
+              << comp.unmatched_target.size() << " target\n\n";
+
+    std::cout << "=== Residual NumPy Usage In Target ===\n";
+    std::cout << "Files with NumPy patterns: " << files_with_numpy << "\n";
+    std::cout << "NumPy imports (heuristic): " << total_numpy_imports << "\n";
+    std::cout << "NumPy refs (heuristic):    " << total_numpy_refs << "\n\n";
+
+    std::cout << "=== MLX Usage In Target (Informational) ===\n";
+    std::cout << "MLX imports (heuristic): " << total_mlx_imports << "\n";
+    std::cout << "MLX refs (heuristic):    " << total_mlx_refs << "\n\n";
+
+    if (files_with_numpy > 0) {
+        std::cout << "Top files still referencing NumPy (target):\n";
+        std::cout << std::setw(40) << std::left << "File"
+                  << std::setw(8) << "Sim"
+                  << std::setw(8) << "Imp"
+                  << std::setw(8) << "Refs"
+                  << "Path\n";
+        std::cout << std::string(80, '-') << "\n";
+
+        int shown = 0;
+        for (const auto& r : rows) {
+            if (r.audit.numpy_imports == 0 && r.audit.numpy_refs == 0) continue;
+            if (shown++ >= 50) {
+                std::cout << "... and " << (files_with_numpy - 50) << " more\n";
+                break;
+            }
+            std::cout << std::setw(40) << std::left << r.qualified.substr(0, 38)
+                      << std::setw(8) << std::fixed << std::setprecision(2) << r.similarity
+                      << std::setw(8) << r.audit.numpy_imports
+                      << std::setw(8) << r.audit.numpy_refs
+                      << r.rel_path << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    comp.print_report();
+}
+
+struct EmberLintCounts {
+    int python_numpy_imports = 0;
+    int python_numpy_refs = 0;
+    int python_precision_casts = 0;
+    int python_tensor_conversions = 0;
+    int python_operators = 0;
+    int cpp_pybind_numpy_include = 0;
+    int cpp_py_array_t = 0;
+    int dep_numpy_lines = 0;
+};
+
+static bool should_skip_scan_path(const std::filesystem::path& p) {
+    auto s = p.string();
+    return s.find("/target/") != std::string::npos ||
+           s.find("/build/") != std::string::npos ||
+           s.find("/build_") != std::string::npos ||
+           s.find("/_deps/") != std::string::npos ||
+           s.find("/.git/") != std::string::npos ||
+           s.find("/.venv/") != std::string::npos ||
+           s.find("/__pycache__/") != std::string::npos;
+}
+
+static EmberLintCounts emberlint_scan_file(const std::filesystem::path& path) {
+    EmberLintCounts c;
+    std::ifstream f(path);
+    if (!f.is_open()) return c;
+    std::stringstream buffer;
+    buffer << f.rdbuf();
+    std::string s = buffer.str();
+
+    auto ext = path.extension().string();
+
+    if (ext == ".py") {
+        // Semantic checks (tree-sitter-python):
+        // - NumPy imports and alias-aware references (AST-based, ignores comments/strings)
+        // - precision-reducing casts: float(...), int(...), bool(...)
+        // - graph-breaking conversions: .numpy(), .item(), .tolist(), numpy.array/asarray(...)
+        // - python operators on expressions (excluding subscript indices and obvious string concatenation)
+        static thread_local TSParser* parser = nullptr;
+        if (parser == nullptr) {
+            parser = ts_parser_new();
+            if (parser != nullptr) {
+                (void)ts_parser_set_language(parser, tree_sitter_python());
+            }
+        }
+
+        if (parser != nullptr && ts_parser_set_language(parser, tree_sitter_python())) {
+            TSTree* tree = ts_parser_parse_string(parser, nullptr, s.c_str(), static_cast<uint32_t>(s.size()));
+            if (tree != nullptr) {
+                TSNode root = ts_tree_root_node(tree);
+
+                auto node_text = [&](TSNode n) -> std::string {
+                    uint32_t start = ts_node_start_byte(n);
+                    uint32_t end = ts_node_end_byte(n);
+                    if (end > start && end <= s.size()) {
+                        return s.substr(start, end - start);
+                    }
+                    return "";
+                };
+
+                // Collect NumPy aliases and count from-imports.
+                std::set<std::string> numpy_aliases;
+                int from_numpy_imports = 0;
+
+                auto is_numpy_module = [](const std::string& mod) -> bool {
+                    // Avoid false positives like "numpy_to_mlx".
+                    return mod == "numpy" || mod.rfind("numpy.", 0) == 0;
+                };
+
+                std::function<void(TSNode)> collect_imports = [&](TSNode n) {
+                    const char* t = ts_node_type(n);
+                    if (strcmp(t, "import_statement") == 0) {
+                        uint32_t cc = ts_node_child_count(n);
+                        for (uint32_t i = 0; i < cc; ++i) {
+                            TSNode ch = ts_node_child(n, i);
+                            if (!ts_node_is_named(ch)) continue;
+                            const char* ct = ts_node_type(ch);
+                            if (strcmp(ct, "dotted_name") == 0) {
+                                std::string mod = node_text(ch);
+                                if (is_numpy_module(mod)) {
+                                    // `import numpy` or `import numpy.linalg` binds name `numpy`.
+                                    numpy_aliases.insert("numpy");
+                                }
+                            } else if (strcmp(ct, "aliased_import") == 0) {
+                                std::string mod;
+                                std::string alias;
+                                uint32_t icc = ts_node_child_count(ch);
+                                for (uint32_t j = 0; j < icc; ++j) {
+                                    TSNode ich = ts_node_child(ch, j);
+                                    if (!ts_node_is_named(ich)) continue;
+                                    const char* it = ts_node_type(ich);
+                                    if (strcmp(it, "dotted_name") == 0) {
+                                        mod = node_text(ich);
+                                    } else if (strcmp(it, "identifier") == 0) {
+                                        alias = node_text(ich);
+                                    }
+                                }
+                                if (!mod.empty() && is_numpy_module(mod)) {
+                                    // `import numpy as np` or `import numpy.linalg as la`
+                                    if (!alias.empty()) numpy_aliases.insert(alias);
+                                    else numpy_aliases.insert("numpy");
+                                }
+                            }
+                        }
+                    } else if (strcmp(t, "import_from_statement") == 0) {
+                        // Ignore relative imports (`from . import ...`).
+                        bool has_relative = false;
+                        uint32_t cc = ts_node_child_count(n);
+                        for (uint32_t i = 0; i < cc; ++i) {
+                            TSNode ch = ts_node_child(n, i);
+                            if (!ts_node_is_named(ch)) continue;
+                            if (strcmp(ts_node_type(ch), "relative_import") == 0) {
+                                has_relative = true;
+                                break;
+                            }
+                        }
+                        if (!has_relative) {
+                            // First dotted_name child is the module.
+                            TSNode module_dn{};
+                            bool found = false;
+                            for (uint32_t i = 0; i < cc; ++i) {
+                                TSNode ch = ts_node_child(n, i);
+                                if (!ts_node_is_named(ch)) continue;
+                                if (strcmp(ts_node_type(ch), "dotted_name") == 0) {
+                                    module_dn = ch;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (found) {
+                                std::string mod = node_text(module_dn);
+                                if (is_numpy_module(mod)) {
+                                    from_numpy_imports++;
+                                }
+                            }
+                        }
+                    }
+
+                    uint32_t cc = ts_node_child_count(n);
+                    for (uint32_t i = 0; i < cc; ++i) {
+                        collect_imports(ts_node_child(n, i));
+                    }
+                };
+
+                collect_imports(root);
+                c.python_numpy_imports += static_cast<int>(numpy_aliases.size()) + from_numpy_imports;
+
+                std::function<bool(TSNode, const char*)> subtree_has_type = [&](TSNode n, const char* want) -> bool {
+                    if (strcmp(ts_node_type(n), want) == 0) return true;
+                    uint32_t cc = ts_node_child_count(n);
+                    for (uint32_t i = 0; i < cc; ++i) {
+                        if (subtree_has_type(ts_node_child(n, i), want)) return true;
+                    }
+                    return false;
+                };
+
+                std::function<void(TSNode, const std::string&, bool)> walk =
+                    [&](TSNode n, const std::string& current_fn, bool in_subscript_index) {
+                        const char* t = ts_node_type(n);
+                        std::string type_s(t);
+
+                        std::string fn = current_fn;
+                        if (type_s == "function_definition") {
+                            TSNode name_node = ts_node_child_by_field_name(n, "name", 4);
+                            if (!ts_node_is_null(name_node)) {
+                                fn = node_text(name_node);
+                            } else {
+                                // Fallback: first identifier child
+                                uint32_t ncc = ts_node_child_count(n);
+                                for (uint32_t i = 0; i < ncc; ++i) {
+                                    TSNode ch = ts_node_child(n, i);
+                                    if (strcmp(ts_node_type(ch), "identifier") == 0) {
+                                        fn = node_text(ch);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
+                        bool in_stringy_fn = (!fn.empty() &&
+                                              (fn.find("hash") != std::string::npos ||
+                                               fn.find("Hash") != std::string::npos ||
+                                               fn.find("str") != std::string::npos ||
+                                               fn.find("Str") != std::string::npos));
+
+                        if (type_s == "attribute") {
+                            TSNode obj_node = ts_node_child_by_field_name(n, "object", 6);
+                            if (!ts_node_is_null(obj_node) && strcmp(ts_node_type(obj_node), "identifier") == 0) {
+                                std::string obj = node_text(obj_node);
+                                if (numpy_aliases.count(obj)) {
+                                    c.python_numpy_refs++;
+                                }
+                            }
+                        }
+
+                        if (type_s == "call") {
+                            TSNode func_node = ts_node_child_by_field_name(n, "function", 8);
+                            if (!ts_node_is_null(func_node)) {
+                                const char* ft = ts_node_type(func_node);
+                                if (strcmp(ft, "identifier") == 0) {
+                                    std::string callee = node_text(func_node);
+                                    if (callee == "float" || callee == "int" || callee == "bool") {
+                                        // Avoid flagging obvious constant parsing (e.g. float("3") / float(3)).
+                                        TSNode args = ts_node_child_by_field_name(n, "arguments", 9);
+                                        if (ts_node_is_null(args)) {
+                                            // Tree-sitter-python uses argument_list; be robust.
+                                            uint32_t cc2 = ts_node_child_count(n);
+                                            for (uint32_t i = 0; i < cc2; ++i) {
+                                                TSNode ch = ts_node_child(n, i);
+                                                if (ts_node_is_named(ch) && strcmp(ts_node_type(ch), "argument_list") == 0) {
+                                                    args = ch;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        bool count_cast = false;
+                                        if (!ts_node_is_null(args) && ts_node_named_child_count(args) > 0) {
+                                            TSNode first = ts_node_named_child(args, 0);
+                                            const char* at = ts_node_type(first);
+                                            bool is_literal = (strcmp(at, "integer") == 0 ||
+                                                               strcmp(at, "float") == 0 ||
+                                                               strcmp(at, "string") == 0 ||
+                                                               strcmp(at, "true") == 0 ||
+                                                               strcmp(at, "false") == 0 ||
+                                                               strcmp(at, "none") == 0);
+                                            count_cast = !is_literal;
+                                        }
+                                        if (count_cast) {
+                                            c.python_precision_casts++;
+                                        }
+                                    }
+                                } else if (strcmp(ft, "attribute") == 0) {
+                                    TSNode attr_name_node = ts_node_child_by_field_name(func_node, "attribute", 9);
+                                    TSNode attr_obj_node = ts_node_child_by_field_name(func_node, "object", 6);
+                                    std::string attr_name;
+                                    if (!ts_node_is_null(attr_name_node)) {
+                                        attr_name = node_text(attr_name_node);
+                                    }
+
+                                    if (attr_name == "numpy") {
+                                        c.python_tensor_conversions++;
+                                    } else if (attr_name == "item" || attr_name == "tolist") {
+                                        c.python_tensor_conversions++;
+                                    } else if (attr_name == "array" || attr_name == "asarray") {
+                                        // numpy.array/asarray(...)
+                                        if (!ts_node_is_null(attr_obj_node) &&
+                                            strcmp(ts_node_type(attr_obj_node), "identifier") == 0) {
+                                            std::string obj = node_text(attr_obj_node);
+                                            if (numpy_aliases.count(obj)) {
+                                                c.python_tensor_conversions++;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if (type_s == "binary_operator") {
+                            // operator token is an unnamed child.
+                            std::string op;
+                            uint32_t cc = ts_node_child_count(n);
+                            for (uint32_t i = 0; i < cc; ++i) {
+                                TSNode ch = ts_node_child(n, i);
+                                if (!ts_node_is_named(ch)) {
+                                    op = ts_node_type(ch);
+                                    break;
+                                }
+                            }
+
+                            bool is_op = (op == "+" || op == "-" || op == "*" || op == "/" ||
+                                          op == "//" || op == "%" || op == "**" || op == "@");
+                            if (is_op && !in_subscript_index && !in_stringy_fn) {
+                                bool is_non_tensor_op = false;
+                                if (op == "+") {
+                                    // Heuristic: avoid string concatenation.
+                                    if (ts_node_named_child_count(n) >= 2) {
+                                        TSNode left = ts_node_named_child(n, 0);
+                                        TSNode right = ts_node_named_child(n, ts_node_named_child_count(n) - 1);
+                                        if (subtree_has_type(left, "string") || subtree_has_type(right, "string")) {
+                                            is_non_tensor_op = true;
+                                        }
+                                    }
+                                }
+                                if (!is_non_tensor_op) {
+                                    c.python_operators++;
+                                }
+                            }
+                        }
+
+                        // Recurse
+                        if (type_s == "subscript") {
+                            // Only treat the index/slice expression as safe for operators.
+                            TSNode index = ts_node_child_by_field_name(n, "subscript", 9);
+                            if (ts_node_is_null(index)) {
+                                index = ts_node_child_by_field_name(n, "index", 5);
+                            }
+                            if (ts_node_is_null(index)) {
+                                index = ts_node_child_by_field_name(n, "slice", 5);
+                            }
+
+                            uint32_t cc2 = ts_node_child_count(n);
+                            for (uint32_t i = 0; i < cc2; ++i) {
+                                TSNode ch = ts_node_child(n, i);
+                                bool child_is_index = (!ts_node_is_null(index) && ts_node_eq(ch, index));
+                                walk(ch, fn, in_subscript_index || child_is_index);
+                            }
+                            return;
+                        }
+
+                        uint32_t cc2 = ts_node_child_count(n);
+                        for (uint32_t i = 0; i < cc2; ++i) {
+                            walk(ts_node_child(n, i), fn, in_subscript_index);
+                        }
+                    };
+
+                walk(root, "", false);
+                ts_tree_delete(tree);
+            }
+        }
+    } else if (ext == ".cpp" || ext == ".cc" || ext == ".h" || ext == ".hpp") {
+        // Only count real includes / real typed usage, not string literals in tools.
+        static const std::regex include_numpy(R"(^\s*#\s*include\s*[<"]pybind11/numpy\.h[>"])",
+                                             std::regex_constants::multiline);
+        static const std::regex py_array_t(R"(\bpy::array_t\s*<)");
+
+        c.cpp_pybind_numpy_include += static_cast<int>(
+            std::distance(std::sregex_iterator(s.begin(), s.end(), include_numpy), std::sregex_iterator()));
+        c.cpp_py_array_t += static_cast<int>(
+            std::distance(std::sregex_iterator(s.begin(), s.end(), py_array_t), std::sregex_iterator()));
+    } else {
+        // Dependency/config files: detect actual dependencies (not docstring conventions or comments).
+        if (path.filename() == "pyproject.toml" ||
+            path.filename() == "environment.yml" ||
+            path.filename() == "requirements.txt" ||
+            path.string().find("requirements/") != std::string::npos) {
+            std::istringstream lines(s);
+            std::string line;
+
+            auto strip_comment = [](const std::string& line2) -> std::string {
+                auto p = line2.find('#');
+                if (p == std::string::npos) return line2;
+                return line2.substr(0, p);
+            };
+
+            if (path.filename() == "pyproject.toml") {
+                bool in_dep_array = false;
+                while (std::getline(lines, line)) {
+                    std::string no_comment = strip_comment(line);
+                    if (no_comment.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+
+                    if (!in_dep_array) {
+                        static const std::regex dep_start(R"(^\s*(dependencies|requires|optional-dependencies)\s*=\s*\[)");
+                        if (std::regex_search(no_comment, dep_start)) {
+                            in_dep_array = true;
+                        } else {
+                            continue;
+                        }
+                    }
+
+                    if (no_comment.find("\"numpy") != std::string::npos ||
+                        no_comment.find("'numpy") != std::string::npos) {
+                        c.dep_numpy_lines++;
+                    }
+
+                    if (no_comment.find(']') != std::string::npos) {
+                        in_dep_array = false;
+                    }
+                }
+            } else if (path.filename() == "environment.yml") {
+                static const std::regex env_dep(R"(^\s*-\s*numpy(\b|[<>=!~]))");
+                while (std::getline(lines, line)) {
+                    std::string no_comment = strip_comment(line);
+                    if (std::regex_search(no_comment, env_dep)) {
+                        c.dep_numpy_lines++;
+                    }
+                }
+            } else {
+                // requirements*.txt and requirements/...
+                static const std::regex req_dep(R"(^\s*numpy(\b|[<>=!~\[]))", std::regex_constants::icase);
+                while (std::getline(lines, line)) {
+                    std::string no_comment = strip_comment(line);
+                    if (no_comment.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+                    if (std::regex_search(no_comment, req_dep)) {
+                        c.dep_numpy_lines++;
+                    }
+                }
+            }
+        }
+    }
+
+    return c;
+}
+
+void cmd_emberlint(const std::string& root) {
+    std::cout << "=== EmberLint (fast checks) ===\n\n";
+    std::cout << "Path: " << root << "\n\n";
+
+    EmberLintCounts total;
+
+    struct Hit {
+        std::string rel;
+        EmberLintCounts c;
+    };
+    std::vector<Hit> hits;
+
+    std::filesystem::path rp(root);
+    if (std::filesystem::is_regular_file(rp)) {
+        auto c = emberlint_scan_file(rp);
+        total.python_numpy_imports += c.python_numpy_imports;
+        total.python_numpy_refs += c.python_numpy_refs;
+        total.python_precision_casts += c.python_precision_casts;
+        total.python_tensor_conversions += c.python_tensor_conversions;
+        total.python_operators += c.python_operators;
+        total.cpp_pybind_numpy_include += c.cpp_pybind_numpy_include;
+        total.cpp_py_array_t += c.cpp_py_array_t;
+        total.dep_numpy_lines += c.dep_numpy_lines;
+        hits.push_back(Hit{rp.filename().string(), c});
+    } else {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(rp)) {
+            if (!entry.is_regular_file()) continue;
+            if (should_skip_scan_path(entry.path())) continue;
+
+            auto c = emberlint_scan_file(entry.path());
+            total.python_numpy_imports += c.python_numpy_imports;
+            total.python_numpy_refs += c.python_numpy_refs;
+            total.python_precision_casts += c.python_precision_casts;
+            total.python_tensor_conversions += c.python_tensor_conversions;
+            total.python_operators += c.python_operators;
+            total.cpp_pybind_numpy_include += c.cpp_pybind_numpy_include;
+            total.cpp_py_array_t += c.cpp_py_array_t;
+            total.dep_numpy_lines += c.dep_numpy_lines;
+
+            bool has_hard_issue =
+                (c.python_numpy_imports != 0 ||
+                 c.python_numpy_refs != 0 ||
+                 c.python_precision_casts != 0 ||
+                 c.python_tensor_conversions != 0 ||
+                 c.cpp_pybind_numpy_include != 0 ||
+                 c.cpp_py_array_t != 0 ||
+                 c.dep_numpy_lines != 0);
+            if (!has_hard_issue) {
+                continue;
+            }
+
+            hits.push_back(Hit{std::filesystem::relative(entry.path(), rp).string(), c});
+        }
+    }
+
+    std::cout << "Summary:\n";
+    std::cout << "  Python NumPy imports: " << total.python_numpy_imports << "\n";
+    std::cout << "  Python NumPy refs:    " << total.python_numpy_refs << "\n";
+    std::cout << "  Precision casts:      " << total.python_precision_casts << "\n";
+    std::cout << "  Tensor conversions:   " << total.python_tensor_conversions << "\n";
+    std::cout << "  Python operators:     " << total.python_operators << "\n";
+    std::cout << "  C++ pybind NumPy:     " << total.cpp_pybind_numpy_include << "\n";
+    std::cout << "  C++ py::array_t:      " << total.cpp_py_array_t << "\n";
+    std::cout << "  Dep/config 'numpy':   " << total.dep_numpy_lines << "\n\n";
+
+    if (!hits.empty()) {
+        std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+            auto score = [](const EmberLintCounts& c) {
+                return 10 * c.python_numpy_imports +
+                       3 * c.python_numpy_refs +
+                       8 * c.python_precision_casts +
+                       8 * c.python_tensor_conversions +
+                       20 * c.cpp_pybind_numpy_include +
+                       5 * c.cpp_py_array_t +
+                       c.dep_numpy_lines;
+            };
+            return score(a.c) > score(b.c);
+        });
+
+        std::cout << "Top hits:\n";
+        std::cout << std::setw(8) << "PyImp"
+                  << std::setw(8) << "PyRef"
+                  << std::setw(8) << "Cast"
+                  << std::setw(8) << "Conv"
+                  << std::setw(8) << "Ops"
+                  << std::setw(8) << "CppInc"
+                  << std::setw(8) << "ArrT"
+                  << std::setw(8) << "Deps"
+                  << "Path\n";
+        std::cout << std::string(80, '-') << "\n";
+
+        int shown = 0;
+        for (const auto& h : hits) {
+            if (shown++ >= 50) {
+                std::cout << "... and " << (hits.size() - 50) << " more\n";
+                break;
+            }
+            std::cout << std::setw(8) << h.c.python_numpy_imports
+                      << std::setw(8) << h.c.python_numpy_refs
+                      << std::setw(8) << h.c.python_precision_casts
+                      << std::setw(8) << h.c.python_tensor_conversions
+                      << std::setw(8) << h.c.python_operators
+                      << std::setw(8) << h.c.cpp_pybind_numpy_include
+                      << std::setw(8) << h.c.cpp_py_array_t
+                      << std::setw(8) << h.c.dep_numpy_lines
+                      << h.rel << "\n";
+        }
+        std::cout << "\n";
+    }
+
+    bool ok = (total.python_numpy_imports == 0 &&
+               total.python_numpy_refs == 0 &&
+               total.python_precision_casts == 0 &&
+               total.python_tensor_conversions == 0 &&
+               total.cpp_pybind_numpy_include == 0 &&
+               total.cpp_py_array_t == 0 &&
+               total.dep_numpy_lines == 0);
+    if (ok) {
+        std::cout << "OK: no issues found.\n";
+    } else {
+        std::cout << "FAIL: issues found.\n";
     }
 }
 
@@ -201,14 +914,20 @@ void generate_reports(const Codebase& source, const Codebase& target,
                       int incomplete_count,
                       int total_src_doc_lines,
                       int total_tgt_doc_lines) {
+    (void)incomplete_count;
     
     std::cout << "\n=== Generating Reports ===\n\n";
     
     // Calculate statistics
     int total_source = source.files.size();
-    int total_target = target.files.size();
+    int total_target_logical = target.files.size();
+    int total_target_physical = 0;
+    for (auto const& [key, val] : target.files) {
+        (void)key;
+        total_target_physical += static_cast<int>(val.paths.size());
+    }
     int matched = comp.matches.size();
-    float completion_pct = (static_cast<float>(total_target) / static_cast<float>(total_source)) * 100.0f;
+    float completion_pct = (static_cast<float>(matched) / static_cast<float>(total_source)) * 100.0f;
     
     // Count quality distribution
     int excellent = 0, good = 0, critical = 0;
@@ -240,11 +959,11 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "| Metric | Count | Percentage |\n";
         report << "|--------|-------|------------|\n";
         report << "| Total source files | " << total_source << " | 100% |\n";
-        report << "| Ported to target | " << total_target << " | " 
-               << std::fixed << std::setprecision(1) << completion_pct << "% |\n";
-        report << "| Matched files | " << matched << " | "
-               << std::fixed << std::setprecision(1) 
-               << (static_cast<float>(matched) / total_source * 100.0f) << "% |\n";
+        report << "| Target units (paired) | " << total_target_logical << " | - |\n";
+        report << "| Target files (total) | " << total_target_physical << " | - |\n";
+        report << "| Porting progress | " << matched << " | "
+               << std::fixed << std::setprecision(1)
+               << completion_pct << "% (matched) |\n";
         report << "| Missing files | " << comp.unmatched_source.size() << " | "
                << std::fixed << std::setprecision(1)
                << (static_cast<float>(comp.unmatched_source.size()) / total_source * 100.0f) << "% |\n\n";
@@ -369,7 +1088,7 @@ void generate_reports(const Codebase& source, const Codebase& target,
         
         report << "## Summary\n\n";
         report << "- **Current Progress:** " << std::fixed << std::setprecision(1) 
-               << completion_pct << "% (" << total_target << "/" << total_source << " files)\n";
+               << completion_pct << "% (" << total_target_physical << "/" << total_source << " files)\n";
         report << "- **Matched Files:** " << matched << "\n";
         report << "- **Average Similarity:** " << std::fixed << std::setprecision(2) 
                << avg_similarity << "\n";
@@ -1151,11 +1870,13 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
         if (tm.source_lang == "rust") src_lang = Language::RUST;
         else if (tm.source_lang == "kotlin") src_lang = Language::KOTLIN;
         else if (tm.source_lang == "cpp") src_lang = Language::CPP;
+        else if (tm.source_lang == "python") src_lang = Language::PYTHON;
         
         Language tgt_lang = Language::KOTLIN;  // default
         if (tm.target_lang == "rust") tgt_lang = Language::RUST;
         else if (tm.target_lang == "kotlin") tgt_lang = Language::KOTLIN;
         else if (tm.target_lang == "cpp") tgt_lang = Language::CPP;
+        else if (tm.target_lang == "python") tgt_lang = Language::PYTHON;
         
         ASTParser parser;
         auto src_tree = parser.parse_file(source_path.string(), src_lang);
@@ -1168,12 +1889,23 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
             return;
         }
         
-        float similarity = ASTSimilarity::combined_similarity(src_tree.get(), tgt_tree.get());
-        
-        // Require >= 0.70 similarity to release
-        if (similarity < 0.70f) {
+        bool has_stubs = parser.has_stub_bodies_in_files({target_path.string()}, tgt_lang);
+        if (has_stubs) {
+            std::cerr << "Error: Cannot release task - target file contains stub/TODO markers in function bodies\n";
+            std::cerr << "The code is fake. Complete the real implementation or delete the file.\n";
+            return;
+        }
+
+        auto src_ids = parser.extract_identifiers_from_file(source_path.string(), src_lang);
+        auto tgt_ids = parser.extract_identifiers_from_file(target_path.string(), tgt_lang);
+        float similarity = ASTSimilarity::combined_similarity_with_content(
+            src_tree.get(), tgt_tree.get(), src_ids, tgt_ids);
+
+        // Require >= 0.50 content-aware similarity to release.
+        // Content-aware scoring is stricter than structure-only scoring.
+        if (similarity < 0.50f) {
             std::cerr << "Error: Cannot release task with low similarity: " << similarity << "\n";
-            std::cerr << "Target file exists but is incomplete (< 0.70 similarity required)\n";
+            std::cerr << "Target file exists but identifier content doesn't match source\n";
             std::cerr << "Either complete the port or delete the target file to release.\n";
             return;
         }
@@ -1189,6 +1921,25 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
 }
 
 int main(int argc, char* argv[]) {
+    // Refuse to run when stdout or stderr is piped to another program.
+    // Piping has caused model-driven wrappers to truncate output silently.
+    {
+        struct stat st;
+        if (fstat(STDOUT_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            const char msg[] = "Error: stdout is piped to another program.\n"
+                               "ast_distance does not support piping (|).\n"
+                               "Run it directly in a terminal.\n";
+            write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            return 2;
+        }
+        if (fstat(STDERR_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
+            std::cout << "Error: stderr is piped to another program.\n";
+            std::cout << "ast_distance does not support piping (|).\n";
+            std::cout << "Run it directly in a terminal.\n";
+            return 2;
+        }
+    }
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
@@ -1209,6 +1960,12 @@ int main(int argc, char* argv[]) {
         } else if (mode == "--deep" && argc >= 6) {
             cmd_deep(argv[2], argv[3], argv[4], argv[5]);
 
+        } else if (mode == "--numpy-mlx" && argc >= 4) {
+            cmd_numpy_mlx(argv[2], argv[3]);
+
+        } else if (mode == "--emberlint" && argc >= 3) {
+            cmd_emberlint(argv[2]);
+
         } else if (mode == "--missing" && argc >= 6) {
             cmd_missing(argv[2], argv[3], argv[4], argv[5]);
 
@@ -1224,6 +1981,80 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "--stats" && argc >= 3) {
             cmd_stats(argv[2]);
+
+        } else if (mode == "--symbols" && argc >= 4) {
+            SymbolAnalysisOptions options;
+            cmd_symbols(argv[2], argv[3], options);
+
+        } else if (mode == "--symbols-duplicates" && argc >= 4) {
+            SymbolAnalysisOptions options;
+            options.duplicates = true;
+            cmd_symbols(argv[2], argv[3], options);
+
+        } else if (mode == "--symbols-stubs" && argc >= 4) {
+            SymbolAnalysisOptions options;
+            options.stubs = true;
+            cmd_symbols(argv[2], argv[3], options);
+
+        } else if (mode == "--symbols-symbol" && argc >= 5) {
+            SymbolAnalysisOptions options;
+            options.symbol = argv[4];
+            if (argc >= 6 && std::string(argv[5]) == "--json") {
+                options.json = true;
+            }
+            cmd_symbol_lookup(argv[2], argv[3], options);
+
+        } else if (mode == "--symbol-parity" && argc >= 4) {
+            SymbolParityOptions options;
+            for (int i = 4; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--json") {
+                    options.json = true;
+                } else if (arg == "--verbose" || arg == "-v") {
+                    options.verbose = true;
+                } else if (arg == "--missing-only" || arg == "--missing") {
+                    options.missing_only = true;
+                } else if (arg == "--include-stubs") {
+                    options.include_stubs = true;
+                } else if (arg == "--kind" && i + 1 < argc) {
+                    options.filter_kind = argv[++i];
+                } else if (arg == "--file" && i + 1 < argc) {
+                    options.filter_file = argv[++i];
+                }
+            }
+            cmd_symbol_parity(argv[2], argv[3], options);
+
+        } else if (mode == "--import-map" && argc >= 3) {
+            ImportMapOptions options;
+            for (int i = 3; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--json") {
+                    options.json = true;
+                } else if (arg == "--summary") {
+                    options.summary_only = true;
+                } else if (arg == "--file" && i + 1 < argc) {
+                    options.filter_file = argv[++i];
+                } else if (arg == "--min" && i + 1 < argc) {
+                    options.min_unresolved = std::stoi(argv[++i]);
+                }
+            }
+            cmd_import_map(argv[2], options);
+
+        } else if (mode == "--compiler-fixup" && argc >= 4) {
+            CompilerFixupOptions options;
+            for (int i = 4; i < argc; ++i) {
+                std::string arg = argv[i];
+                if (arg == "--json") {
+                    options.json = true;
+                } else if (arg == "--verbose" || arg == "-v") {
+                    options.verbose = true;
+                } else if (arg == "--file" && i + 1 < argc) {
+                    options.filter_file = argv[++i];
+                } else if (arg == "--min" && i + 1 < argc) {
+                    options.min_errors = std::stoi(argv[++i]);
+                }
+            }
+            cmd_compiler_fixup(argv[2], argv[3], options);
 
         // Swarm task management commands
         } else if (mode == "--init-tasks" && argc >= 7) {
@@ -1249,6 +2080,7 @@ int main(int argc, char* argv[]) {
             Language lang;
             if (lang_str == "rust") lang = Language::RUST;
             else if (lang_str == "cpp") lang = Language::CPP;
+            else if (lang_str == "python") lang = Language::PYTHON;
             else lang = Language::KOTLIN;
 
             std::cout << "Parsing " << filepath << " as " << lang_str << "...\n\n";
@@ -1320,6 +2152,19 @@ int main(int argc, char* argv[]) {
             std::string file2 = argv[3];
             Language lang2 = parse_language(argv[4]);
 
+            auto file_contains_macro_rules = [](const std::string& path) -> bool {
+                std::ifstream in(path);
+                if (!in) return false;
+                std::string content(
+                    (std::istreambuf_iterator<char>(in)),
+                    std::istreambuf_iterator<char>());
+                return content.find("macro_rules!") != std::string::npos;
+            };
+
+            bool macro_friendly = false;
+            if (lang1 == Language::RUST) macro_friendly |= file_contains_macro_rules(file1);
+            if (lang2 == Language::RUST) macro_friendly |= file_contains_macro_rules(file2);
+
             std::cout << "Parsing " << language_name(lang1) << " file: " << file1 << "\n";
             TreePtr tree1 = parser.parse_file(file1, lang1);
 
@@ -1327,8 +2172,44 @@ int main(int argc, char* argv[]) {
             TreePtr tree2 = parser.parse_file(file2, lang2);
 
             std::cout << "\n";
-            auto report = ASTSimilarity::compare(tree1.get(), tree2.get());
+            auto report = ASTSimilarity::compare(tree1.get(), tree2.get(), macro_friendly);
             report.print();
+
+            auto ids1 = parser.extract_identifiers_from_file(file1, lang1);
+            auto ids2 = parser.extract_identifiers_from_file(file2, lang2);
+            float content_score = ASTSimilarity::combined_similarity_with_content(
+                tree1.get(), tree2.get(), ids1, ids2);
+
+            std::cout << "\n=== Identifier Content Analysis ===\n";
+            std::cout << "Identifiers:          "
+                      << ids1.total_identifiers << " vs " << ids2.total_identifiers << "\n";
+            std::cout << "Unique (raw):         "
+                      << ids1.identifier_freq.size() << " vs " << ids2.identifier_freq.size() << "\n";
+            std::cout << "Unique (canonical):   "
+                      << ids1.canonical_freq.size() << " vs " << ids2.canonical_freq.size() << "\n";
+            std::cout << "Raw cosine:           " << std::fixed << std::setprecision(4)
+                      << ids1.identifier_cosine_similarity(ids2) << "\n";
+            std::cout << "Canonical cosine:     " << std::fixed << std::setprecision(4)
+                      << ids1.canonical_cosine_similarity(ids2) << "\n";
+            std::cout << "Canonical jaccard:    " << std::fixed << std::setprecision(4)
+                      << ids1.canonical_jaccard_similarity(ids2) << "\n";
+
+            bool file1_stubs = parser.has_stub_bodies_in_files({file1}, lang1);
+            bool file2_stubs = parser.has_stub_bodies_in_files({file2}, lang2);
+            if (file1_stubs || file2_stubs) {
+                content_score = 0.0f;
+                std::cout << "\n*** STUB DETECTED ***\n";
+                if (file1_stubs) {
+                    std::cout << "  " << file1 << " has TODO/stub/placeholder in function bodies\n";
+                }
+                if (file2_stubs) {
+                    std::cout << "  " << file2 << " has TODO/stub/placeholder in function bodies\n";
+                }
+                std::cout << "  Content-Aware Score forced to 0.0000\n";
+            } else {
+                std::cout << "\nContent-Aware Score:  " << std::fixed << std::setprecision(4)
+                          << content_score << "\n";
+            }
 
             std::cout << "\n=== " << language_name(lang1) << " AST Histogram ===\n";
             print_histogram(report.hist1);

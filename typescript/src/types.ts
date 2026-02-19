@@ -75,6 +75,11 @@ export enum NodeType {
   WHILE = "while",
   METHOD_EXPRESSION = "method_expression",
   INDEX = "index",
+  ARITHMETIC_OP = "arithmetic_op",
+  COMPARISON_OP = "comparison_op",
+  LOGICAL_OP = "logical_op",
+  BITWISE_OP = "bitwise_op",
+  ASSIGNMENT_OP = "assignment_op",
 
   // Unknown/Fallback
   UNKNOWN = "unknown",
@@ -150,6 +155,15 @@ export interface CommentStats {
 }
 
 /**
+ * Identifier statistics used for content-aware similarity.
+ */
+export interface IdentifierStats {
+  identifierFreq: Map<string, number>;
+  canonicalFreq: Map<string, number>;
+  totalIdentifiers: number;
+}
+
+/**
  * AST parse result with metadata
  */
 export interface ParseResult {
@@ -157,6 +171,8 @@ export interface ParseResult {
   filename: string;
   language: Language;
   commentStats: CommentStats;
+  identifierStats: IdentifierStats;
+  hasStubBodies: boolean;
   nodeTypes: Map<NodeType, number>; // Histogram
   importPaths: string[];
   exportPaths: string[];

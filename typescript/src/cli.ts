@@ -2,13 +2,15 @@
 
 import { Command } from "commander";
 import * as fs from "fs";
-import * as path from "path";
 import chalk from "chalk";
-import { parseFile, parseString } from "./ast-parser.js";
+import { parseFile } from "./ast-parser.js";
 import {
   computeSimilarity,
   printSimilarityReport,
-  formatSimilarity,
+  combinedSimilarityWithContent,
+  identifierCosineSimilarity,
+  canonicalIdentifierCosineSimilarity,
+  canonicalIdentifierJaccardSimilarity,
 } from "./similarity.js";
 import {
   parseDirectory,
@@ -16,15 +18,11 @@ import {
   rankPortingPriority,
   findMissingFiles,
   printCodebaseStats,
-  FileEntry,
 } from "./codebase.js";
 import { Language } from "./types.js";
 
 const program = new Command();
 
-/**
- * Parse language string to enum
- */
 function parseLanguage(lang: string): Language {
   const normalized = lang.toLowerCase();
   switch (normalized) {
@@ -41,22 +39,29 @@ function parseLanguage(lang: string): Language {
     case "cpp":
     case "c++":
       return Language.CPP;
+    case "c":
+      return Language.C;
     default:
       throw new Error(
-        `Unknown language: ${lang} (use typescript, rust, kotlin, or cpp)`,
+        `Unknown language: ${lang} (use typescript, rust, kotlin, cpp, or c)`,
       );
   }
 }
 
-/**
- * Print tree structure
- */
 function dumpTree(node: any, indent: number = 0): void {
   const pad = "  ".repeat(indent);
   console.log(`${pad}${node.nodeType} (${node.label})`);
 
   for (const child of node.children) {
     dumpTree(child, indent + 1);
+  }
+}
+
+function containsMacroRules(filePath: string): boolean {
+  try {
+    return fs.readFileSync(filePath, "utf-8").includes("macro_rules!");
+  } catch {
+    return false;
   }
 }
 
@@ -72,15 +77,66 @@ program
   .argument("<file2>")
   .argument("<lang2>")
   .action(async (file1, lang1, file2, lang2) => {
-    const result1 = parseFile(file1, parseLanguage(lang1));
-    const result2 = parseFile(file2, parseLanguage(lang2));
+    const l1 = parseLanguage(lang1);
+    const l2 = parseLanguage(lang2);
+
+    const result1 = parseFile(file1, l1);
+    const result2 = parseFile(file2, l2);
 
     if (!result1 || !result2) {
       console.error(chalk.red("Failed to parse files"));
       process.exit(1);
     }
 
-    printSimilarityReport(result1, result2);
+    const macroFriendly =
+      (l1 === Language.RUST && containsMacroRules(file1)) ||
+      (l2 === Language.RUST && containsMacroRules(file2));
+
+    printSimilarityReport(result1, result2, {
+      macroFriendly,
+      includeContent: false,
+    });
+
+    const shape = computeSimilarity(result1, result2, { macroFriendly });
+    const contentScore = combinedSimilarityWithContent(result1, result2, {
+      macroFriendly,
+    });
+
+    console.log("=== Identifier Content Analysis ===");
+    console.log(
+      `Identifiers:          ${result1.identifierStats.totalIdentifiers} vs ${result2.identifierStats.totalIdentifiers}`,
+    );
+    console.log(
+      `Unique (raw):         ${result1.identifierStats.identifierFreq.size} vs ${result2.identifierStats.identifierFreq.size}`,
+    );
+    console.log(
+      `Unique (canonical):   ${result1.identifierStats.canonicalFreq.size} vs ${result2.identifierStats.canonicalFreq.size}`,
+    );
+    console.log(
+      `Raw cosine:           ${identifierCosineSimilarity(result1.identifierStats, result2.identifierStats).toFixed(4)}`,
+    );
+    console.log(
+      `Canonical cosine:     ${canonicalIdentifierCosineSimilarity(result1.identifierStats, result2.identifierStats).toFixed(4)}`,
+    );
+    console.log(
+      `Canonical jaccard:    ${canonicalIdentifierJaccardSimilarity(result1.identifierStats, result2.identifierStats).toFixed(4)}`,
+    );
+
+    if (result1.hasStubBodies || result2.hasStubBodies) {
+      console.log("\n*** STUB DETECTED ***");
+      if (result1.hasStubBodies) {
+        console.log(`  ${file1} has TODO/stub/placeholder in function bodies`);
+      }
+      if (result2.hasStubBodies) {
+        console.log(`  ${file2} has TODO/stub/placeholder in function bodies`);
+      }
+      console.log("  Content-Aware Score forced to 0.0000");
+    } else {
+      console.log(`\nContent-Aware Score:  ${contentScore.toFixed(4)}`);
+    }
+
+    console.log(`Shape Combined Score: ${shape.combined.toFixed(4)}`);
+    console.log(`Shape Histogram:      ${shape.cosineHistogram.toFixed(4)}`);
   });
 
 // Dump AST
@@ -141,10 +197,8 @@ program
     console.log(chalk.bold("Target Statistics:"));
     printCodebaseStats(tgtFiles);
 
-    // Build dependency graph
     const depGraph = buildDepGraph(srcFiles);
 
-    // Find missing files
     const missing = findMissingFiles(srcFiles, tgtFiles);
     console.log(chalk.bold(`\nMissing Files: ${missing.length}\n`));
 
@@ -156,9 +210,8 @@ program
       console.log(`  ... and ${missing.length - 20} more`);
     }
 
-    // Rank porting priority
     const rankings = rankPortingPriority(srcFiles, tgtFiles, depGraph);
-    console.log(chalk.bold(`\nPorting Priorities (Top 10):\n`));
+    console.log(chalk.bold("\nPorting Priorities (Top 10):\n"));
 
     for (const item of rankings.slice(0, 10)) {
       const status =
@@ -199,18 +252,20 @@ program
 
     console.log(chalk.bold("=== TODO Scan ===\n"));
 
-    for (const [relPath, file] of files.entries()) {
-      const content = fs.readFileSync(file.filepath, "utf-8");
-      const lines = content.split("\n");
+    for (const file of files.values()) {
+      for (const filePath of file.paths) {
+        const content = fs.readFileSync(filePath, "utf-8");
+        const lines = content.split("\n");
 
-      lines.forEach((line, idx) => {
-        const matches = line.match(/TODO[:\s](.*)/i);
-        if (matches) {
-          totalTodos++;
-          console.log(`${chalk.cyan(file.filename)}:${idx + 1}`);
-          console.log(`  ${matches[1].trim()}\n`);
-        }
-      });
+        lines.forEach((line, idx) => {
+          const matches = line.match(/TODO[:\s](.*)/i);
+          if (matches) {
+            totalTodos++;
+            console.log(`${chalk.cyan(file.filename)}:${idx + 1}`);
+            console.log(`  ${matches[1].trim()}\n`);
+          }
+        });
+      }
     }
 
     console.log(`Total TODOs: ${totalTodos}`);

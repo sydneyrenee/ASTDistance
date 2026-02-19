@@ -400,10 +400,7 @@ export const CPP_NODE_MAP: NodeMap = {
 
   // Comments
   comment: NodeType.COMMENT,
-  raw_string_literal: NodeType.LITERAL,
-
-  // Attributes
-  attribute: NodeType.UNKNOWN,
+  // Attributes not otherwise mapped
   attribute_declaration: NodeType.UNKNOWN,
 };
 

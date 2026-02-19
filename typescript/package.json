@@ -51,9 +51,9 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "tree-sitter": "^0.22.6",
+    "tree-sitter": "^0.21.1",
     "tree-sitter-typescript": "^0.21.2",
-    "tree-sitter-rust": "^0.21.2",
+    "tree-sitter-rust": "^0.21.0",
     "tree-sitter-cpp": "^0.22.3",
     "commander": "^12.0.0",
     "chalk": "^5.3.0"

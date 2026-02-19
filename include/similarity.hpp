@@ -3,6 +3,7 @@
 #include "tree.hpp"
 #include "tensor.hpp"
 #include "node_types.hpp"
+#include "ast_parser.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -79,6 +80,39 @@ public:
     }
 
     /**
+     * Macro-friendly cosine similarity.
+     *
+     * Rust macro-heavy files (e.g. `macro_rules!`) often do not produce comparable AST shapes
+     * across languages because the Rust parser represents macro bodies as token trees.
+     * For such files we compute a cosine similarity over a small subset of node types
+     * (VARIABLE + UNKNOWN), which better captures whether the port contains a similar set of
+     * identifiers/tokens without over-penalizing language-specific structure.
+     */
+    static float histogram_cosine_similarity_macro(Tree* tree1, Tree* tree2) {
+        auto hist1 = tree1->node_type_histogram(NUM_NODE_TYPES);
+        auto hist2 = tree2->node_type_histogram(NUM_NODE_TYPES);
+
+        float dot = 0.0f, norm1 = 0.0f, norm2 = 0.0f;
+        for (int i = 0; i < NUM_NODE_TYPES; ++i) {
+            NodeType nt = static_cast<NodeType>(i);
+            float weight = 0.0f;
+            if (nt == NodeType::VARIABLE || nt == NodeType::UNKNOWN) {
+                weight = 1.0f;
+            }
+
+            float weighted1 = weight * static_cast<float>(hist1[i]);
+            float weighted2 = weight * static_cast<float>(hist2[i]);
+
+            dot += weighted1 * weighted2;
+            norm1 += weighted1 * weighted1;
+            norm2 += weighted2 * weighted2;
+        }
+
+        if (norm1 < 1e-8f || norm2 < 1e-8f) return 0.0f;
+        return dot / (std::sqrt(norm1) * std::sqrt(norm2));
+    }
+
+    /**
      * Jaccard similarity of node type sets.
      */
     static float node_type_jaccard(Tree* tree1, Tree* tree2) {
@@ -119,6 +153,11 @@ public:
 
     /**
      * Combined similarity score using multiple metrics.
+     * SHAPE-ONLY version (no identifier content). Used as a structural baseline.
+     *
+     * WARNING: This metric cannot distinguish real code from placeholder stubs.
+     * A file of `fun x() = null` scores the same as `fun computeHash() = ...`.
+     * Use combined_similarity_with_content() for real porting assessment.
      */
     static float combined_similarity(Tree* tree1, Tree* tree2,
                                      float hist_weight = 0.5f,
@@ -131,6 +170,37 @@ public:
         return hist_weight * hist_sim +
                struct_weight * struct_sim +
                jaccard_weight * jaccard_sim;
+    }
+
+    /**
+     * Content-aware combined similarity.
+     * Uses identifier comparison as the DOMINANT signal.
+     *
+     * A real port reuses the same identifiers (with naming convention changes).
+     * A file of stubs has completely different identifiers and scores near 0.
+     *
+     * Weights:
+     *   0.50 - Canonical identifier cosine (the killer metric)
+     *   0.15 - Canonical identifier jaccard (set overlap)
+     *   0.15 - AST histogram cosine (structural shape)
+     *   0.10 - Node type jaccard
+     *   0.10 - Structure similarity (tree size/depth)
+     */
+    static float combined_similarity_with_content(
+            Tree* tree1, Tree* tree2,
+            const IdentifierStats& ids1, const IdentifierStats& ids2) {
+
+        float id_cosine = ids1.canonical_cosine_similarity(ids2);
+        float id_jaccard = ids1.canonical_jaccard_similarity(ids2);
+        float hist_sim = histogram_cosine_similarity(tree1, tree2);
+        float jaccard_sim = node_type_jaccard(tree1, tree2);
+        float struct_sim = structure_similarity(tree1, tree2);
+
+        return 0.50f * id_cosine +
+               0.15f * id_jaccard +
+               0.15f * hist_sim +
+               0.10f * jaccard_sim +
+               0.10f * struct_sim;
     }
 
     /**
@@ -207,7 +277,7 @@ public:
         }
     };
 
-    static ComparisonReport compare(Tree* tree1, Tree* tree2) {
+    static ComparisonReport compare(Tree* tree1, Tree* tree2, bool macro_friendly = false) {
         ComparisonReport report;
 
         report.size1 = tree1->size();
@@ -218,7 +288,9 @@ public:
         report.hist1 = tree1->node_type_histogram(NUM_NODE_TYPES);
         report.hist2 = tree2->node_type_histogram(NUM_NODE_TYPES);
 
-        report.cosine_sim = histogram_cosine_similarity(tree1, tree2);
+        report.cosine_sim = macro_friendly
+            ? histogram_cosine_similarity_macro(tree1, tree2)
+            : histogram_cosine_similarity(tree1, tree2);
         report.structure_sim = structure_similarity(tree1, tree2);
         report.jaccard_sim = node_type_jaccard(tree1, tree2);
         report.edit_distance_sim = normalized_edit_distance(tree1, tree2);
