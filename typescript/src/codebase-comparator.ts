@@ -38,7 +38,7 @@ export interface Match {
 const HEADER_EXTENSIONS = new Set([".hpp", ".h", ".hxx", ".hh"]);
 
 function canonicalizeName(name: string): string {
-  return name.replace(/_/g, "").toLowerCase();
+  return name.replace(/[_-]/g, "").toLowerCase();
 }
 
 function isHeaderFile(entry: FileEntry): boolean {

@@ -31,6 +31,8 @@ export {
 } from "./codebase.js";
 export { CodebaseComparator } from "./codebase-comparator.js";
 export type { Match } from "./codebase-comparator.js";
+export { TaskManager, TaskStatus } from "./task-manager.js";
+export type { PortTask } from "./task-manager.js";
 export {
   getNodeMap,
   TYPESCRIPT_NODE_MAP,

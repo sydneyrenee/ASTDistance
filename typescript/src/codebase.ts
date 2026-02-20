@@ -79,7 +79,7 @@ function normalizeStem(stem: string): string {
 }
 
 function normalizeName(name: string): string {
-  return name.replace(/_/g, "").toLowerCase();
+  return name.replace(/[_-]/g, "").toLowerCase();
 }
 
 function makeQualifiedName(relPath: string): string {
