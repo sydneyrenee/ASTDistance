@@ -250,6 +250,166 @@ function extractIdentifierStats(source: string, tree: Parser.Tree): IdentifierSt
   return stats;
 }
 
+function extractFunctionNames(source: string, tree: Parser.Tree, language: Language): string[] {
+  const names: string[] = [];
+
+  const functionTypesByLang: Record<string, Set<string>> = {
+    [Language.TYPESCRIPT]: new Set([
+      "function_declaration",
+      "method_definition",
+      // Note: arrow_function / function_expression are often anonymous; parity scoring
+      // treats "<anonymous>" as ignorable noise, so we keep the set minimal.
+    ]),
+    [Language.RUST]: new Set(["function_item"]),
+    [Language.CPP]: new Set(["function_definition", "function_declarator"]),
+    [Language.C]: new Set(["function_definition", "function_declarator"]),
+  };
+
+  const funcTypes = functionTypesByLang[language] || new Set<string>();
+
+  function nodeText(node: Parser.SyntaxNode): string {
+    return source.slice(node.startIndex, node.endIndex);
+  }
+
+  function extractTsLikeName(node: Parser.SyntaxNode): string | null {
+    const byField = node.childForFieldName("name");
+    if (byField) {
+      const text = nodeText(byField).trim();
+      if (text) return text;
+    }
+
+    // Fallback: find first identifier-like named child.
+    for (const child of node.namedChildren) {
+      if (child.type === "identifier" || child.type === "property_identifier") {
+        const text = nodeText(child).trim();
+        if (text) return text;
+      }
+    }
+    return null;
+  }
+
+  function extractRustName(node: Parser.SyntaxNode): string | null {
+    const byField = node.childForFieldName("name");
+    if (byField) {
+      const text = nodeText(byField).trim();
+      if (text) return text;
+    }
+    for (const child of node.namedChildren) {
+      if (child.type === "identifier") {
+        const text = nodeText(child).trim();
+        if (text) return text;
+      }
+    }
+    return null;
+  }
+
+  function extractCppDeclaratorName(node: Parser.SyntaxNode | null): string | null {
+    if (!node) return null;
+
+    const leafTypes = new Set([
+      "identifier",
+      "field_identifier",
+      "operator_name",
+      "destructor_name",
+      "qualified_identifier",
+      "namespace_identifier",
+    ]);
+
+    // Unwrap declarator wrappers that often contain another declarator field.
+    const unwrapTypes = new Set([
+      "pointer_declarator",
+      "reference_declarator",
+      "array_declarator",
+      "parenthesized_declarator",
+      "attributed_declarator",
+    ]);
+
+    let cur: Parser.SyntaxNode | null = node;
+    for (let i = 0; i < 32 && cur && unwrapTypes.has(cur.type); i++) {
+      const inner = cur.childForFieldName("declarator");
+      if (inner) {
+        cur = inner;
+        continue;
+      }
+      cur = cur.namedChildren.length > 0 ? cur.namedChildren[0]! : null;
+    }
+    if (!cur) return null;
+
+    if (cur.type === "qualified_identifier") {
+      // Prefer the last identifier-like token inside the qualified name.
+      let best: string | null = null;
+      for (const ch of cur.namedChildren) {
+        if (
+          ch.type === "identifier" ||
+          ch.type === "field_identifier" ||
+          ch.type === "operator_name" ||
+          ch.type === "destructor_name"
+        ) {
+          const t = nodeText(ch).trim();
+          if (t) best = t;
+        }
+      }
+      return best;
+    }
+
+    if (leafTypes.has(cur.type)) {
+      const t = nodeText(cur).trim();
+      return t || null;
+    }
+
+    // Generic fallback: recurse into named children looking for a leaf.
+    for (const ch of cur.namedChildren) {
+      const t = extractCppDeclaratorName(ch);
+      if (t) return t;
+    }
+    return null;
+  }
+
+  function extractCppName(node: Parser.SyntaxNode): string | null {
+    // Prefer extracting name from the function_declarator's base declarator field,
+    // to avoid picking up parameter identifiers.
+    const funcDecl =
+      node.type === "function_declarator"
+        ? node
+        : (node.descendantsOfType?.("function_declarator")?.[0] as Parser.SyntaxNode | undefined);
+    if (funcDecl) {
+      const base = funcDecl.childForFieldName("declarator");
+      const name = extractCppDeclaratorName(base);
+      if (name) return name;
+    }
+
+    // Fallback: best-effort search for an identifier in the declarator subtree.
+    const decl = node.childForFieldName("declarator");
+    if (decl) {
+      const name = extractCppDeclaratorName(decl);
+      if (name) return name;
+    }
+
+    return null;
+  }
+
+  const stack: Parser.SyntaxNode[] = [tree.rootNode];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (funcTypes.has(node.type)) {
+      let name: string | null = null;
+      if (language === Language.TYPESCRIPT) {
+        name = extractTsLikeName(node);
+      } else if (language === Language.RUST) {
+        name = extractRustName(node);
+      } else if (language === Language.CPP || language === Language.C) {
+        name = extractCppName(node);
+      }
+      names.push(name && name.length > 0 ? name : "<anonymous>");
+    }
+    for (const child of node.children) {
+      stack.push(child);
+    }
+  }
+
+  return names;
+}
+
 function textHasStubMarkers(text: string): boolean {
   const lower = text.toLowerCase();
 
@@ -498,6 +658,7 @@ function buildParseResult(
   const rootNode = convertTree(tree.rootNode, source, language);
   const commentStats = extractComments(source, tree);
   const identifierStats = extractIdentifierStats(source, tree);
+  const functionNames = extractFunctionNames(source, tree, language);
   const hasStubBodies = detectStubBodies(source, tree, language);
   const nodeTypes = buildHistogram(rootNode);
   const { imports, exports } = extractImportsExports(source, tree);
@@ -508,6 +669,7 @@ function buildParseResult(
     language,
     commentStats,
     identifierStats,
+    functionNames,
     hasStubBodies,
     nodeTypes,
     importPaths: imports,

@@ -172,6 +172,7 @@ export interface ParseResult {
   language: Language;
   commentStats: CommentStats;
   identifierStats: IdentifierStats;
+  functionNames: string[]; // canonicalized names used for parity checks
   hasStubBodies: boolean;
   nodeTypes: Map<NodeType, number>; // Histogram
   importPaths: string[];

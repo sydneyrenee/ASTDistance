@@ -29,6 +29,8 @@ export {
   findMissingFiles,
   printCodebaseStats,
 } from "./codebase.js";
+export { CodebaseComparator } from "./codebase-comparator.js";
+export type { Match } from "./codebase-comparator.js";
 export {
   getNodeMap,
   TYPESCRIPT_NODE_MAP,

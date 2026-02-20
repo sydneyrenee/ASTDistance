@@ -20,6 +20,7 @@ import {
   findMissingFiles,
   printCodebaseStats,
 } from "./codebase.js";
+import { CodebaseComparator } from "./codebase-comparator.js";
 import { Language } from "./types.js";
 
 const program = new Command();
@@ -285,41 +286,159 @@ program
   .argument("<tgtDir>")
   .argument("<tgtLang>")
   .action(async (srcDir, srcLang, tgtDir, tgtLang) => {
-    console.log(chalk.bold("=== Deep Codebase Analysis ===\n"));
+    const sl = parseLanguage(srcLang);
+    const tl = parseLanguage(tgtLang);
+
+    console.log(chalk.bold("=== Deep Analysis ===\n"));
     console.log(`Source: ${srcDir} (${srcLang})`);
     console.log(`Target: ${tgtDir} (${tgtLang})\n`);
 
-    const srcFiles = parseDirectory(srcDir, parseLanguage(srcLang));
-    const tgtFiles = parseDirectory(tgtDir, parseLanguage(tgtLang));
+    const comp = new CodebaseComparator(srcDir, sl, tgtDir, tl);
 
     console.log(chalk.bold("Source Statistics:"));
-    printCodebaseStats(srcFiles);
+    printCodebaseStats(comp.sourceFiles);
 
     console.log(chalk.bold("Target Statistics:"));
-    printCodebaseStats(tgtFiles);
+    printCodebaseStats(comp.targetFiles);
 
-    const depGraph = buildDepGraph(srcFiles);
+    console.log("Comparing codebases...");
+    comp.findMatches();
 
-    const missing = findMissingFiles(srcFiles, tgtFiles);
-    console.log(chalk.bold(`\nMissing Files: ${missing.length}\n`));
+    console.log("Computing AST similarities...");
+    comp.computeSimilarities();
 
-    for (const item of missing.slice(0, 20)) {
-      console.log(`  ${item.path}`);
+    console.log(comp.formatReport());
+
+    // Porting quality summary
+    console.log(chalk.bold("\n=== Porting Quality Summary ===\n"));
+    const totalTodos = comp.matches.reduce((a, m) => a + m.todoCount, 0);
+    const totalLint = comp.matches.reduce((a, m) => a + m.lintCount, 0);
+    const stubCount = comp.matches.filter((m) => m.isStub).length;
+    const headerMatched = comp.matches.filter((m) => m.matchedByHeader).length;
+    const totalMatched = comp.matches.length;
+    const ranked = comp.rankedForPorting();
+    const incomplete = ranked.filter((m) => m.similarity < 0.6).length;
+    const missingCount = comp.unmatchedSource.length;
+
+    console.log(`Matched by header:     ${headerMatched} / ${totalMatched}`);
+    console.log(`Matched by name:       ${totalMatched - headerMatched} / ${totalMatched}`);
+    console.log(`Total TODOs in target: ${totalTodos}`);
+    console.log(`Total lint errors:     ${totalLint}`);
+    console.log(`Stub files:            ${stubCount}`);
+
+    const issues = ranked.filter(
+      (m) =>
+        m.todoCount > 0 ||
+        m.lintCount > 0 ||
+        m.isStub ||
+        m.similarity < 0.6 ||
+        (m.sourceFunctionCount > 0 && m.functionCoverage < 1.0),
+    );
+
+    if (issues.length > 0) {
+      console.log(chalk.bold("\n=== Files with Issues ===\n"));
+      console.log(
+        `${"File".padEnd(30)} ${"Similarity".padStart(10)} ${"LineRatio".padStart(9)} ${"FunctionParity".padStart(14)} ${"TODOs".padStart(5)} ${"Lint".padStart(5)} Status`,
+      );
+      console.log("-".repeat(90));
+      for (const m of issues.slice(0, 20)) {
+        let status = "";
+        if (m.isStub) status = "STUB";
+        else if (m.todoCount > 0) status = "TODO";
+        else if (m.lintCount > 0) status = "LINT";
+        else if (m.sourceFunctionCount > 0 && m.functionCoverage < 1.0) status = "MISSING_FUNCTIONS";
+        else if (m.similarity < 0.4) status = "LOW_SIM";
+
+        const ratio = m.sourceLines > 0 ? m.targetLines / m.sourceLines : 0.0;
+        const funcs =
+          m.sourceFunctionCount > 0
+            ? `${m.matchedFunctionCount}/${m.sourceFunctionCount}`
+            : "-";
+        console.log(
+          `${m.targetQualified.slice(0, 28).padEnd(30)} ${m.similarity.toFixed(2).padStart(10)} ${ratio.toFixed(2).padStart(9)} ${funcs.padStart(14)} ${String(m.todoCount).padStart(5)} ${String(m.lintCount).padStart(5)} ${status}`,
+        );
+      }
+      if (issues.length > 20) {
+        console.log(`... and ${issues.length - 20} more files`);
+      }
     }
 
-    if (missing.length > 20) {
-      console.log(`  ... and ${missing.length - 20} more`);
+    console.log(chalk.bold("\n=== Porting Recommendations ===\n"));
+    console.log(`Incomplete ports (similarity < 60%): ${incomplete}`);
+    console.log(`Missing files: ${missingCount}`);
+
+    if (incomplete > 0) {
+      console.log("\nTop priority to complete:");
+      for (const m of ranked.filter((m) => m.similarity < 0.6).slice(0, 10)) {
+        const flags: string[] = [];
+        if (m.isStub) flags.push("[STUB]");
+        if (m.todoCount > 0) flags.push(`[${m.todoCount} TODOs]`);
+        if (m.sourceFunctionCount > 0 && m.functionCoverage < 1.0) {
+          flags.push(`[FunctionParity ${m.matchedFunctionCount}/${m.sourceFunctionCount}]`);
+        }
+        console.log(
+          `  ${m.sourceQualified.padEnd(30)} sim=${m.similarity.toFixed(2)} deps=${m.sourceDependents} ${flags.join(" ")}`,
+        );
+      }
     }
 
-    const rankings = rankPortingPriority(srcFiles, tgtFiles, depGraph);
-    console.log(chalk.bold("\nPorting Priorities (Top 10):\n"));
+    if (comp.unmatchedSource.length > 0) {
+      console.log("\nTop priority to create:");
+      const missing = [...comp.unmatchedSource]
+        .map((k) => ({ key: k, file: comp.sourceFiles.get(k) }))
+        .filter((x): x is { key: string; file: any } => Boolean(x.file))
+        .sort((a, b) => (comp.sourceDeps.nodes.get(b.key)?.dependents.length || 0) - (comp.sourceDeps.nodes.get(a.key)?.dependents.length || 0));
+      for (const it of missing.slice(0, 10)) {
+        const deps = comp.sourceDeps.nodes.get(it.key)?.dependents.length || 0;
+        console.log(`  ${it.file.qualifiedName.padEnd(30)} deps=${deps}`);
+      }
+    }
 
-    for (const item of rankings.slice(0, 10)) {
-      const status =
-        item.dependents > 0
-          ? chalk.yellow(item.dependents.toString())
-          : chalk.gray("0");
-      console.log(`  ${status} dependents  ${item.path}`);
+    // Documentation gaps
+    function docGapRatio(m: any): number {
+      if (m.sourceDocLines === 0) return 0.0;
+      if (m.targetDocLines === 0) return 1.0;
+      const r = 1.0 - m.targetDocLines / m.sourceDocLines;
+      return Math.max(0.0, r);
+    }
+
+    const docGaps = comp.matches
+      .map((m) => ({ gap: docGapRatio(m), m }))
+      .filter((x) => x.gap > 0.2 && x.m.sourceDocLines > 5)
+      .sort((a, b) => b.gap * b.m.sourceDocLines - a.gap * a.m.sourceDocLines);
+
+    const totalSrcDoc = comp.matches.reduce((a, m) => a + m.sourceDocLines, 0);
+    const totalTgtDoc = comp.matches.reduce((a, m) => a + m.targetDocLines, 0);
+    console.log(chalk.bold("\n=== Documentation Gaps ===\n"));
+    const pct = totalSrcDoc > 0 ? (100.0 * totalTgtDoc) / totalSrcDoc : null;
+    const docsMissing = pct !== null && pct < 85.0;
+    if (docsMissing) {
+      console.log("There is missing documentation that is hurting overall scoring.");
+    }
+    if (pct !== null) {
+      console.log(
+        `Documentation coverage: ${totalTgtDoc} / ${totalSrcDoc} lines (${pct.toFixed(0)}%)`,
+      );
+    } else {
+      console.log("Documentation coverage: N/A (source has no docs)");
+    }
+    console.log(`Files with >20% doc gap: ${docGaps.length}\n`);
+
+    if (docGaps.length > 0) {
+      console.log(
+        `${"File".padEnd(30)} ${"Src Docs".padStart(10)} ${"Tgt Docs".padStart(10)} ${"Gap %".padStart(8)} ${"DocSim".padStart(8)}`,
+      );
+      console.log("-".repeat(74));
+      for (const it of docGaps.slice(0, 25)) {
+        console.log(
+          `${it.m.sourceQualified.slice(0, 28).padEnd(30)} ${String(it.m.sourceDocLines).padStart(10)} ${String(it.m.targetDocLines).padStart(10)} ${String(Math.trunc(it.gap * 100)).padStart(7)}% ${it.m.docSimilarity.toFixed(2).padStart(8)}`,
+        );
+      }
+      if (docGaps.length > 25) {
+        console.log(`... and ${docGaps.length - 25} more files with doc gaps`);
+      }
+    } else {
+      console.log("No significant documentation gaps found.");
     }
   });
 
