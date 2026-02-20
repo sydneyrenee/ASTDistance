@@ -1029,6 +1029,55 @@ public:
             "multiline_comment"
         };
 
+        if (lang == Language::PYTHON) {
+            // Treat "pass"/"..." as a stub only when it is the *entire* function body
+            // (after skipping a docstring). This avoids false positives from
+            // legitimate uses like `except: pass`.
+            std::vector<TSNode> stmts;
+            uint32_t child_count = ts_node_named_child_count(node);
+            stmts.reserve(child_count);
+            for (uint32_t i = 0; i < child_count; ++i) {
+                TSNode ch = ts_node_named_child(node, i);
+                std::string t(ts_node_type(ch));
+                if (t == "expression_statement") {
+                    // Skip docstring: expression_statement -> string
+                    if (ts_node_named_child_count(ch) > 0) {
+                        TSNode first = ts_node_named_child(ch, 0);
+                        if (!ts_node_is_null(first) &&
+                            std::string(ts_node_type(first)) == "string") {
+                            continue;
+                        }
+                    }
+                }
+                stmts.push_back(ch);
+            }
+
+            if (stmts.size() == 1) {
+                std::string t(ts_node_type(stmts[0]));
+                if (t == "pass_statement" || t == "ellipsis") {
+                    return true;
+                }
+                if (t == "expression_statement" && ts_node_named_child_count(stmts[0]) > 0) {
+                    TSNode first = ts_node_named_child(stmts[0], 0);
+                    if (!ts_node_is_null(first) &&
+                        std::string(ts_node_type(first)) == "ellipsis") {
+                        return true;
+                    }
+                }
+                if (t == "raise_statement") {
+                    uint32_t start = ts_node_start_byte(stmts[0]);
+                    uint32_t end = ts_node_end_byte(stmts[0]);
+                    if (end > start && end <= source.length()) {
+                        std::string text = source.substr(start, end - start);
+                        if (text.find("NotImplementedError") != std::string::npos ||
+                            text.find("notimplementederror") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
         std::vector<TSNode> stack;
         stack.push_back(node);
 
@@ -1041,9 +1090,6 @@ public:
             // Strong stub constructs that don't rely on string/comment markers.
             // Keep these conservative to avoid false positives.
             if (lang == Language::PYTHON) {
-                if (current_type == "pass_statement" || current_type == "ellipsis") {
-                    return true;
-                }
                 if (current_type == "raise_statement") {
                     uint32_t start = ts_node_start_byte(current);
                     uint32_t end = ts_node_end_byte(current);

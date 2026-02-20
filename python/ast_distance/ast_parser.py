@@ -406,13 +406,38 @@ class ASTParser:
         }
 
         def body_has_markers(root: tree_sitter.Node) -> bool:
+            if lang == Language.PYTHON:
+                # Treat "pass"/"..." as a stub only when it is the *entire* function body
+                # (after skipping a docstring). This avoids false positives from
+                # legitimate uses like `except: pass`.
+                stmts: list[tree_sitter.Node] = []
+                for ch in root.children:
+                    if not getattr(ch, "is_named", False):
+                        continue
+                    if ch.type == "expression_statement":
+                        first_named = next((cc for cc in ch.children if getattr(cc, "is_named", False)), None)
+                        if first_named is not None and first_named.type == "string":
+                            continue  # docstring
+                    stmts.append(ch)
+
+                if len(stmts) == 1:
+                    st = stmts[0]
+                    if st.type in {"pass_statement", "ellipsis"}:
+                        return True
+                    if st.type == "expression_statement":
+                        first_named = next((cc for cc in st.children if getattr(cc, "is_named", False)), None)
+                        if first_named is not None and first_named.type == "ellipsis":
+                            return True
+                    if st.type == "raise_statement":
+                        text = (st.text or b"")
+                        if b"NotImplementedError" in text or b"notimplementederror" in text.lower():
+                            return True
+
             stack = [root]
             while stack:
                 node = stack.pop()
                 # Strong stub constructs that don't rely on comments/strings.
                 if lang == Language.PYTHON:
-                    if node.type in {"pass_statement", "ellipsis"}:
-                        return True
                     if node.type == "raise_statement":
                         text = (node.text or b"")
                         if b"NotImplementedError" in text or b"notimplementederror" in text.lower():
