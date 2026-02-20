@@ -13,29 +13,34 @@ import subprocess
 from pathlib import Path
 from dataclasses import dataclass
 
-from .ast_parser import ASTParser, Language
-from .codebase import Codebase, CodebaseComparator, SourceFile
-from .node_types import NodeType, node_type_name
 from .porting_utils import PortingAnalyzer
-from .similarity import ASTSimilarity
 from .task_manager import TaskManager, TaskStatus, PortTask
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _parse_language(s: str) -> Language:
+def _parse_language(s: str) -> "Language":
+    try:
+        from .ast_parser import Language
+    except Exception as e:
+        # Help and task-management commands should still work without parser deps.
+        raise SystemExit(str(e)) from e
     try:
         return Language(s)
     except ValueError:
         raise SystemExit(f"Unknown language: {s} (use rust, kotlin, cpp, or python)")
 
 
-_LANG_NAMES = {
-    Language.RUST: "Rust",
-    Language.KOTLIN: "Kotlin",
-    Language.CPP: "C++",
-    Language.PYTHON: "Python",
-}
+def _language_display_name(lang: object) -> str:
+    key = getattr(lang, "value", None)
+    if not isinstance(key, str):
+        key = str(lang)
+    return {
+        "rust": "Rust",
+        "kotlin": "Kotlin",
+        "cpp": "C++",
+        "python": "Python",
+    }.get(key, str(key))
 
 _EXT_MAP: dict[str, str] = {
     ".rs": ".kt", ".kt": ".rs",
@@ -439,6 +444,10 @@ def _parse_global_flags(args: list[str]) -> tuple[int, str, bool, list[str]]:
 
 def cmd_compare(file1: str, lang1: str, file2: str, lang2: str) -> None:
     """Compare two files and print AST similarity report."""
+    from .ast_parser import ASTParser, Language
+    from .node_types import NodeType
+    from .similarity import ASTSimilarity
+
     parser = ASTParser()
     l1 = _parse_language(lang1)
     l2 = _parse_language(lang2)
@@ -452,10 +461,10 @@ def cmd_compare(file1: str, lang1: str, file2: str, lang2: str) -> None:
     macro_friendly = ((l1 == Language.RUST and _file_contains_macro_rules(file1)) or
                       (l2 == Language.RUST and _file_contains_macro_rules(file2)))
 
-    print(f"Parsing {_LANG_NAMES[l1]} file: {file1}")
+    print(f"Parsing {_language_display_name(l1)} file: {file1}")
     tree1 = parser.parse_file(file1, l1)
 
-    print(f"Parsing {_LANG_NAMES[l2]} file: {file2}")
+    print(f"Parsing {_language_display_name(l2)} file: {file2}")
     tree2 = parser.parse_file(file2, l2)
 
     report = ASTSimilarity.compare(tree1, tree2, macro_friendly=macro_friendly)
@@ -494,10 +503,10 @@ def cmd_compare(file1: str, lang1: str, file2: str, lang2: str) -> None:
 
     num_types = int(NodeType.NUM_TYPES)
     if tree1:
-        print(f"\n=== {_LANG_NAMES[l1]} AST Histogram ===")
+        print(f"\n=== {_language_display_name(l1)} AST Histogram ===")
         _print_histogram(tree1.node_type_histogram(num_types))
     if tree2:
-        print(f"\n=== {_LANG_NAMES[l2]} AST Histogram ===")
+        print(f"\n=== {_language_display_name(l2)} AST Histogram ===")
         _print_histogram(tree2.node_type_histogram(num_types))
 
     # Comments comparison
@@ -516,6 +525,9 @@ def cmd_compare(file1: str, lang1: str, file2: str, lang2: str) -> None:
 
 def cmd_dump(filepath: str, lang_str: str) -> None:
     """Dump AST structure of a file."""
+    from .ast_parser import ASTParser
+    from .node_types import NodeType
+
     parser = ASTParser()
     lang = _parse_language(lang_str)
 
@@ -538,6 +550,8 @@ def cmd_dump(filepath: str, lang_str: str) -> None:
 
 def cmd_scan(directory: str, lang: str) -> None:
     """Scan directory and show file list with import counts."""
+    from .codebase import Codebase
+
     cb = Codebase(directory, lang)
     cb.scan()
     cb.extract_imports()
@@ -551,6 +565,8 @@ def cmd_scan(directory: str, lang: str) -> None:
 
 def cmd_deps(directory: str, lang: str) -> None:
     """Build and show dependency graph."""
+    from .codebase import Codebase
+
     cb = Codebase(directory, lang)
     cb.scan()
     cb.extract_imports()
@@ -585,6 +601,8 @@ def cmd_deps(directory: str, lang: str) -> None:
 
 def cmd_rank(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> None:
     """Rank files by porting priority (dependents + similarity)."""
+    from .codebase import CodebaseComparator
+
     source = _scan_codebase(src_dir, src_lang, build_deps=True)
     target = _scan_codebase(tgt_dir, tgt_lang, build_deps=True)
 
@@ -599,6 +617,8 @@ def cmd_deep(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> dict:
 
     Returns structured metrics dict in addition to printing human-readable output.
     """
+    from .codebase import CodebaseComparator
+
     print(f"=== Deep Analysis: {src_dir} ({src_lang}) -> {tgt_dir} ({tgt_lang}) ===\n")
 
     print(f"Scanning source codebase ({src_lang})...")
@@ -902,6 +922,8 @@ def cmd_missing(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> dic
 
     Returns dict with missing file list for programmatic use.
     """
+    from .codebase import Codebase, CodebaseComparator
+
     source = _scan_codebase(src_dir, src_lang, build_deps=True)
     target = Codebase(tgt_dir, tgt_lang)
     target.scan()
@@ -991,6 +1013,8 @@ def cmd_init_tasks(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str,
 
     Returns dict with task count and top priorities for programmatic use.
     """
+    from .codebase import CodebaseComparator
+
     print("=== Initializing Task File ===\n")
 
     source = _scan_codebase(src_dir, src_lang, build_deps=True)
@@ -1220,6 +1244,10 @@ def cmd_complete(task_file: str, source_qualified: str, agent: int, override_mod
         src_lang = _parse_language(tm.source_lang)
         tgt_lang = _parse_language(tm.target_lang)
 
+        from .ast_parser import ASTParser
+        from .codebase import SourceFile
+        from .similarity import ASTSimilarity
+
         parser = ASTParser()
         has_stubs = parser.has_stub_bodies_in_files([str(target_path)], tgt_lang)
         if has_stubs and not override_mode:
@@ -1296,6 +1324,8 @@ def cmd_complete(task_file: str, source_qualified: str, agent: int, override_mod
     print("Rescanning codebases to update priorities...")
     source = _scan_codebase(tm.source_root, tm.source_lang, build_deps=True)
     target = _scan_codebase(tm.target_root, tm.target_lang, build_deps=True, porting_data=True)
+
+    from .codebase import CodebaseComparator
 
     comp = CodebaseComparator(source, target)
     comp.find_matches()
@@ -1395,6 +1425,11 @@ def cmd_release(task_file: str, source_qualified: str, agent: int, override_mode
 
         src_lang = _parse_language(tm.source_lang)
         tgt_lang = _parse_language(tm.target_lang)
+
+        from .ast_parser import ASTParser
+        from .codebase import SourceFile
+        from .similarity import ASTSimilarity
+
         parser = ASTParser()
 
         has_stubs = parser.has_stub_bodies_in_files([str(target_path)], tgt_lang)
@@ -1476,6 +1511,7 @@ def cmd_release(task_file: str, source_qualified: str, agent: int, override_mode
 
 def _scan_codebase(root: str, lang: str, *, build_deps: bool = False,
                    porting_data: bool = False) -> Codebase:
+    from .codebase import Codebase
     cb = Codebase(root, lang)
     cb.scan()
     cb.extract_imports()
@@ -1498,6 +1534,7 @@ def _print_tree(tree, indent: int = 0) -> None:
 
 
 def _print_histogram(hist: list[int]) -> None:
+    from .node_types import node_type_name, NodeType
     print("Node Type Histogram:")
     for i, count in enumerate(hist):
         if count > 0:
@@ -1514,6 +1551,9 @@ def print_usage() -> None:
 Usage:
   {prog} [--agent <number>] [--task-file <tasks.json>] [--override] <command>
       Guardrails: when a task system is initialized, commands require --agent.
+
+  {prog} --help
+      Show this message
 
   {prog} <file1> <lang1> <file2> <lang2>
       Compare AST similarity between two files
@@ -1532,6 +1572,9 @@ Usage:
 
   {prog} --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang>
       Full analysis: AST + deps + TODOs + lint + line ratios
+
+  {prog} --deep --help
+      Extended help for --deep (dashboard format, scoring, and guardrails)
 
   {prog} --missing <src_dir> <src_lang> <tgt_dir> <tgt_lang>
       Show files missing from target, ranked by importance
@@ -1587,6 +1630,64 @@ Swarm Task Management:
   Languages: rust, kotlin, cpp, python""", file=sys.stderr)
 
 
+def print_deep_help() -> None:
+    prog = "ast_distance"
+    print(f"""AST Distance - Extended Help: --deep
+
+Usage:
+  {prog} --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang>
+
+Overview:
+  --deep prints a full project dashboard intended for porting work.
+  It is whole-file comparison by default (not signature-only), and it includes
+  guardrails to penalize stubs and missing function parity.
+
+What the dashboard does:
+  1. Scan both codebases (files + imports) and build dependency graphs.
+  2. Match source->target files using:
+     - port-lint headers (preferred)
+     - name-based heuristics (fallback)
+  3. Compute whole-file similarity using normalized AST structure + identifier content.
+  4. Apply a FunctionParity penalty (missing functions reduce the score).
+  5. Report missing files, incomplete ports, stub/TODO failures, and documentation gaps.
+
+Scoring (high level):
+  Similarity = WholeFileSimilarity * FunctionParityRatio
+  - WholeFileSimilarity blends identifier similarity with normalized AST shape.
+  - FunctionParityRatio = matched/source function count (by canonicalized name).
+
+Thresholds used by the dashboard:
+  - similarity < 0.60: incomplete port (needs attention)
+  - similarity >= 0.85: typical completion threshold used by task guardrails
+
+Stub/TODO guardrails:
+  - Stub markers inside target function bodies force similarity to 0.
+    (TODO/STUB/FIXME/placeholder/not implemented/etc)
+  - TODOs in destination files are treated as incomplete work.
+
+Documentation scoring:
+  - Compares doc coverage and doc text similarity across matched files.
+  - Counts doc comments and Python docstrings.
+
+Guardrails and task system:
+  - If a task file exists (default: tasks.json), commands require --agent <n>
+    except --assign and --help.
+  - In task mode, the dashboard may lock to the assigned file + direct imports to
+    prevent out-of-scope prioritization.
+  - Use --override only when explicitly taking over a session/task or when you need
+    full-project output.
+
+Examples:
+  {prog} --deep src cpp python python
+  {prog} --init-tasks src cpp python python tasks.json ../../AGENTS.md
+  {prog} --assign tasks.json
+  {prog} --agent 3 --task-file tasks.json --deep src cpp python python
+
+Notes:
+  - Piping output (|) is refused to prevent silent dashboard filtering.
+  - Languages supported by this CLI: rust, kotlin, cpp, python""", file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_args = argv if argv is not None else sys.argv[1:]
 
@@ -1601,6 +1702,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     mode = args[0]
+    wants_deep_help = mode == "--deep" and len(args) >= 2 and args[1] in {"--help", "-h"}
+    wants_help = mode in {"--help", "-h"} or wants_deep_help
+
+    if mode in {"--help", "-h"}:
+        print_usage()
+        return 0
+    if wants_deep_help:
+        print_deep_help()
+        return 0
 
     # Preserve global flags for C++ proxy calls.
     proxy_prefix: list[str] = []
@@ -1644,7 +1754,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Guardrails: once a task system exists, require --agent for all commands (except --assign).
     agent_lock: _AgentLock | None = None
-    if guard_active and mode != "--assign" and not proxy_to_cpp:
+    if guard_active and not wants_help and mode != "--assign" and not proxy_to_cpp:
         if agent <= 0:
             print(f"Error: task system detected ({task_file}).", file=sys.stderr)
             print("All commands require an agent session number.", file=sys.stderr)

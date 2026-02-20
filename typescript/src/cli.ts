@@ -306,6 +306,31 @@ program
 // Deep analysis
 program
   .command("deep")
+  .description(
+    "Full project dashboard: scan, match files, compute similarity, apply FunctionParity penalty, and report gaps.",
+  )
+  .addHelpText(
+    "after",
+    `\nExtended help:\n` +
+      `  deep prints a full project dashboard intended for porting work.\n` +
+      `\n` +
+      `  Scoring (high level):\n` +
+      `    Similarity = WholeFileSimilarity * FunctionParityRatio\n` +
+      `\n` +
+      `  Guardrails:\n` +
+      `    - Stub markers inside destination function bodies force similarity to 0.\n` +
+      `    - If a task system exists (tasks.json), commands require --agent <n> except --assign and --help.\n` +
+      `    - In task mode, deep may lock to the assigned file + direct imports (agent scope).\n` +
+      `\n` +
+      `  Port-lint header (recommended for reliable matching):\n` +
+      `    // port-lint: source <relative-path-to-source-file>\n` +
+      `\n` +
+      `  Examples:\n` +
+      `    ast_distance --deep src cpp typescript/src typescript\n` +
+      `    ast_distance --init-tasks src cpp typescript/src typescript tasks.json ../../AGENTS.md\n` +
+      `    ast_distance --assign tasks.json\n` +
+      `    ast_distance --agent 3 --task-file tasks.json --deep src cpp typescript/src typescript\n`,
+  )
   .argument("<srcDir>")
   .argument("<srcLang>")
   .argument("<tgtDir>")
@@ -1365,6 +1390,7 @@ const parsed = parseGuardrailFlags(process.argv.slice(2));
 const rest = mapLegacyFlagCommand(parsed.rest);
 const mode = rest[0] || "";
 const taskFile = resolveTaskFile(mode, rest, parsed.taskFileFlag);
+const wantsHelp = rest.includes("--help") || rest.includes("-h");
 
 GUARD.agent = parsed.agent;
 GUARD.taskFile = taskFile;
@@ -1378,7 +1404,7 @@ if (taskFile) {
 }
 
 // Guardrails: if a task system exists, require --agent and lock the session number.
-if (GUARD.active && mode !== "assign" && GUARD.agent <= 0) {
+if (GUARD.active && !wantsHelp && mode !== "assign" && GUARD.agent <= 0) {
   console.error(`Error: task system detected (${GUARD.taskFile}).`);
   console.error("All commands require an agent session number.");
   console.error(`Get one with: ast_distance --assign ${GUARD.taskFile}`);
@@ -1386,7 +1412,7 @@ if (GUARD.active && mode !== "assign" && GUARD.agent <= 0) {
   process.exit(2);
 }
 
-if (GUARD.active && mode !== "assign" && GUARD.agent > 0) {
+if (GUARD.active && !wantsHelp && mode !== "assign" && GUARD.agent > 0) {
   gAgentLock = new AgentLock(GUARD.taskFile, GUARD.agent, GUARD.overrideMode);
   if (!gAgentLock.locked()) {
     const holder = gAgentLock.holderPid();

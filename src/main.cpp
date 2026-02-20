@@ -57,11 +57,19 @@ const char* language_name(Language lang) {
     return "Unknown";
 }
 
+static bool is_help_flag(const std::string& s) {
+    return s == "--help" || s == "-h" || s == "help";
+}
+
 void print_usage(const char* program) {
     std::cerr << "AST Distance - Cross-language AST comparison and porting analysis\n\n";
     std::cerr << "Usage:\n";
     std::cerr << "  " << program << " [--agent <number>] [--task-file <tasks.json>] [--override] <command>\n";
     std::cerr << "      Guardrails: when a task system is initialized, commands require --agent.\n\n";
+
+    std::cerr << "  " << program << " --help\n";
+    std::cerr << "      Show this message\n\n";
+
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
@@ -76,6 +84,8 @@ void print_usage(const char* program) {
     std::cerr << "      Rank files by porting priority (dependents + similarity)\n\n";
     std::cerr << "  " << program << " --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang>\n";
     std::cerr << "      Full analysis: AST + deps + TODOs + lint + line ratios\n\n";
+    std::cerr << "  " << program << " --deep --help\n";
+    std::cerr << "      Extended help for --deep (dashboard format, scoring, and guardrails)\n\n";
     std::cerr << "  " << program << " --numpy-mlx <numpy_dir> <mlx_dir>\n";
     std::cerr << "      Python-focused report: compare two Python codebases and audit residual NumPy usage\n\n";
     std::cerr << "  " << program << " --emberlint <path>\n";
@@ -152,6 +162,64 @@ void print_usage(const char* program) {
     std::cerr << "    - Match files explicitly instead of by name similarity\n";
     std::cerr << "    - Compare documentation coverage between source and target\n";
     std::cerr << "    - Report 'Matched by header' vs 'Matched by name' statistics\n\n";
+}
+
+static void print_deep_help(const char* program) {
+    std::cerr << "AST Distance - Extended Help: --deep\n\n";
+
+    std::cerr << "Usage:\n";
+    std::cerr << "  " << program << " --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang>\n\n";
+
+    std::cerr << "Overview:\n";
+    std::cerr << "  --deep prints a full project dashboard intended for porting work.\n";
+    std::cerr << "  It is whole-file comparison by default (not signature-only), and it\n";
+    std::cerr << "  includes guardrails to penalize stubs and missing function parity.\n\n";
+
+    std::cerr << "What the dashboard does:\n";
+    std::cerr << "  1. Scan both codebases (files + imports) and build dependency graphs.\n";
+    std::cerr << "  2. Match source->target files using:\n";
+    std::cerr << "     - port-lint headers (preferred)\n";
+    std::cerr << "     - name-based heuristics (fallback)\n";
+    std::cerr << "  3. Compute whole-file similarity using normalized AST structure + identifier content.\n";
+    std::cerr << "  4. Apply a FunctionParity penalty (missing functions reduce the score).\n";
+    std::cerr << "  5. Report missing files, incomplete ports, stub/TODO failures, and documentation gaps.\n\n";
+
+    std::cerr << "Scoring (high level):\n";
+    std::cerr << "  Similarity = WholeFileSimilarity * FunctionParityRatio\n";
+    std::cerr << "  - WholeFileSimilarity blends identifier similarity with normalized AST shape.\n";
+    std::cerr << "  - FunctionParityRatio = matched/source function count (by canonicalized name).\n";
+    std::cerr << "    If the target is missing functions, the score is reduced even if the AST shape matches.\n\n";
+
+    std::cerr << "Thresholds used by the dashboard:\n";
+    std::cerr << "  - similarity < 0.60: incomplete port (needs attention)\n";
+    std::cerr << "  - similarity >= 0.85: typical completion threshold used by task guardrails\n\n";
+
+    std::cerr << "Stub/TODO guardrails:\n";
+    std::cerr << "  - Stub markers inside target function bodies force similarity to 0.\n";
+    std::cerr << "    (TODO/STUB/FIXME/placeholder/not implemented/etc)\n";
+    std::cerr << "  - TODOs in destination files are treated as incomplete work.\n\n";
+
+    std::cerr << "Documentation scoring:\n";
+    std::cerr << "  - Compares doc coverage and doc text similarity across matched files.\n";
+    std::cerr << "  - Counts doc comments and Python docstrings.\n\n";
+
+    std::cerr << "Guardrails and task system:\n";
+    std::cerr << "  - If a task file exists (default: tasks.json), commands require --agent <n>\n";
+    std::cerr << "    except --assign and --help.\n";
+    std::cerr << "  - In task mode, the dashboard may lock to the assigned file + direct imports\n";
+    std::cerr << "    to prevent out-of-scope prioritization.\n";
+    std::cerr << "  - Use --override only when explicitly taking over a session/task or when you\n";
+    std::cerr << "    need full-project output.\n\n";
+
+    std::cerr << "Examples:\n";
+    std::cerr << "  " << program << " --deep src cpp python python\n";
+    std::cerr << "  " << program << " --init-tasks src cpp python python tasks.json ../../AGENTS.md\n";
+    std::cerr << "  " << program << " --assign tasks.json\n";
+    std::cerr << "  " << program << " --agent 3 --task-file tasks.json --deep src cpp python python\n\n";
+
+    std::cerr << "Notes:\n";
+    std::cerr << "  - Piping output (|) is refused to prevent silent dashboard filtering.\n";
+    std::cerr << "  - Languages supported by this binary: rust, kotlin, cpp, python\n";
 }
 
 void dump_tree(Tree* node, int indent = 0) {
@@ -2854,6 +2922,8 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
+    bool wants_deep_help = (mode == "--deep" && argc >= 3 && is_help_flag(argv[2]));
+    bool wants_help = is_help_flag(mode) || wants_deep_help;
 
     // Guardrails: if a task system exists, require --agent and lock the session number.
     GuardrailsContext guard;
@@ -2877,7 +2947,7 @@ int main(int argc, char* argv[]) {
         guard.active = tm.load();
     }
 
-    if (guard.active && mode != "--assign" && agent <= 0) {
+    if (guard.active && !wants_help && mode != "--assign" && agent <= 0) {
         std::cerr << "Error: task system detected (" << guard.task_file << ").\n";
         std::cerr << "All commands require an agent session number.\n";
         std::cerr << "Get one with: ast_distance --assign " << guard.task_file << "\n";
@@ -2886,7 +2956,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::unique_ptr<AgentLock> agent_lock;
-    if (guard.active && mode != "--assign" && agent > 0) {
+    if (guard.active && !wants_help && mode != "--assign" && agent > 0) {
         agent_lock = std::make_unique<AgentLock>(guard.task_file, agent, override_mode);
         if (!agent_lock->locked()) {
             int holder = agent_lock->holder_pid();
@@ -2908,6 +2978,14 @@ int main(int argc, char* argv[]) {
     g_guardrails = guard;
 
     try {
+        if (is_help_flag(mode)) {
+            print_usage(argv[0]);
+            return 0;
+        } else if (wants_deep_help) {
+            print_deep_help(argv[0]);
+            return 0;
+        }
+
         if (mode == "--scan" && argc >= 4) {
             cmd_scan(argv[2], argv[3]);
 
