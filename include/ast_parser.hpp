@@ -708,6 +708,67 @@ public:
         const char* type_str = ts_node_type(node);
         std::string type_s(type_str);
 
+        if (lang == Language::PYTHON && type_s == "expression_statement") {
+            // Python docstrings are AST string nodes, not comment nodes.
+            // Count module/function/class docstrings as documentation for scoring.
+            auto is_first_named_child = [](TSNode container, TSNode child) -> bool {
+                uint32_t n = ts_node_named_child_count(container);
+                for (uint32_t i = 0; i < n; ++i) {
+                    TSNode c = ts_node_named_child(container, i);
+                    if (ts_node_eq(c, child)) {
+                        return i == 0;
+                    }
+                }
+                return false;
+            };
+
+            TSNode parent = ts_node_parent(node);
+            std::string parent_type(ts_node_type(parent));
+
+            bool is_docstring_context = false;
+            if (parent_type == "module" && is_first_named_child(parent, node)) {
+                is_docstring_context = true;
+            } else if (parent_type == "block" && is_first_named_child(parent, node)) {
+                TSNode gp = ts_node_parent(parent);
+                std::string gp_type(ts_node_type(gp));
+                if (gp_type == "function_definition" ||
+                    gp_type == "async_function_definition" ||
+                    gp_type == "class_definition") {
+                    is_docstring_context = true;
+                }
+            }
+
+            if (is_docstring_context) {
+                TSNode str_node;
+                bool found = false;
+                uint32_t nn = ts_node_named_child_count(node);
+                for (uint32_t i = 0; i < nn; ++i) {
+                    TSNode c = ts_node_named_child(node, i);
+                    const char* ct = ts_node_type(c);
+                    if (ct && std::string(ct) == "string") {
+                        str_node = c;
+                        found = true;
+                        break;
+                    }
+                }
+                if (found) {
+                    uint32_t start = ts_node_start_byte(str_node);
+                    uint32_t end = ts_node_end_byte(str_node);
+                    std::string text;
+                    if (end > start && end <= source.length()) {
+                        text = source.substr(start, end - start);
+                    }
+
+                    int lines = count_lines(text);
+                    stats.total_comment_lines += lines;
+                    stats.doc_comment_count++;
+                    stats.total_doc_lines += lines;
+                    stats.doc_texts.push_back(text);
+                    tokenize_doc_comment(text, stats.word_freq);
+                }
+            }
+        }
+
         // Check for comment nodes (tree-sitter node types vary by language)
         bool is_comment = false;
         bool is_doc_comment = false;

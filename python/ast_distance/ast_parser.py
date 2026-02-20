@@ -530,6 +530,42 @@ class ASTParser:
         is_comment = False
         is_doc = False
 
+        if lang == Language.PYTHON and type_s == "expression_statement":
+            # Python docstrings are AST string nodes, not comment nodes.
+            # Count module/function/class docstrings as documentation for scoring.
+            parent = getattr(node, "parent", None)
+            if parent is not None:
+                parent_type = getattr(parent, "type", "")
+
+                named_children = getattr(parent, "named_children", None)
+                if named_children is None:
+                    named_children = [c for c in parent.children if getattr(c, "is_named", False)]
+
+                is_first_named = bool(named_children) and named_children[0] == node
+
+                is_docstring_context = False
+                if is_first_named and parent_type == "module":
+                    is_docstring_context = True
+                elif is_first_named and parent_type == "block":
+                    gparent = getattr(parent, "parent", None)
+                    gp_type = getattr(gparent, "type", "") if gparent is not None else ""
+                    if gp_type in ("function_definition", "async_function_definition", "class_definition"):
+                        is_docstring_context = True
+
+                if is_docstring_context:
+                    node_named = getattr(node, "named_children", None)
+                    if node_named is None:
+                        node_named = [c for c in node.children if getattr(c, "is_named", False)]
+                    string_node = next((c for c in node_named if getattr(c, "type", "") == "string"), None)
+                    if string_node is not None:
+                        text = (string_node.text or b"").decode(errors="replace")
+                        lines = text.count("\n") + 1
+                        stats.total_comment_lines += lines
+                        stats.doc_comment_count += 1
+                        stats.total_doc_lines += lines
+                        stats.doc_texts.append(text)
+                        _tokenize_doc(text, stats.word_freq)
+
         if lang == Language.KOTLIN:
             is_comment = type_s in ("line_comment", "multiline_comment")
         elif lang == Language.CPP:

@@ -753,6 +753,11 @@ def cmd_deep(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> dict:
                 print("Replace the stub with a real implementation (stubs are a failure mode).")
             elif focus_match.todo_count > 0:
                 print("Remove TODOs and finish the implementation (TODOs are a failure mode).")
+            elif focus_match.source_function_count > 0 and focus_match.function_coverage < 1.0:
+                print(
+                    "Add missing functions for parity "
+                    f"({focus_match.matched_function_count}/{focus_match.source_function_count})."
+                )
             elif focus_match.similarity < 0.85:
                 print("Improve similarity to >= 0.85 (whole-file + identifier-content + parity).")
             else:
@@ -784,23 +789,41 @@ def cmd_deep(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> dict:
     print(f"Stub files:            {stub_count}")
 
     # Files with issues
-    issues = [m for m in ranked if m.todo_count > 0 or m.lint_count > 0 or m.is_stub or m.similarity < 0.6]
+    issues = [
+        m for m in ranked
+        if m.todo_count > 0
+        or m.lint_count > 0
+        or m.is_stub
+        or m.similarity < 0.6
+        or (m.source_function_count > 0 and m.function_coverage < 1.0)
+    ]
     if issues:
         print("\n=== Files with Issues ===\n")
-        print(f"{'File':<30} {'Sim':>6} {'Ratio':>6} {'TODOs':>5} {'Lint':>5} Status")
-        print("-" * 70)
+        print(
+            f"{'File':<30} {'Similarity':>10} {'LineRatio':>9} "
+            f"{'FunctionParity':>14} {'TODOs':>5} {'Lint':>5} Status"
+        )
+        print("-" * 90)
         for m in issues[:20]:
             status = ""
             if m.is_stub:
                 status = "STUB"
-            elif m.similarity < 0.4:
-                status = "LOW_SIM"
-            elif m.lint_count > 0:
-                status = "LINT"
             elif m.todo_count > 0:
                 status = "TODO"
+            elif m.lint_count > 0:
+                status = "LINT"
+            elif m.source_function_count > 0 and m.function_coverage < 1.0:
+                status = "MISSING_FUNCTIONS"
+            elif m.similarity < 0.4:
+                status = "LOW_SIM"
             ratio = m.target_lines / m.source_lines if m.source_lines > 0 else 0.0
-            print(f"{m.target_qualified[:28]:<30} {m.similarity:>5.2f} {ratio:>6.2f} {m.todo_count:>5} {m.lint_count:>5} {status}")
+            funcs = "-"
+            if m.source_function_count > 0:
+                funcs = f"{m.matched_function_count}/{m.source_function_count}"
+            print(
+                f"{m.target_qualified[:28]:<30} {m.similarity:>10.2f} {ratio:>9.2f} "
+                f"{funcs:>14} {m.todo_count:>5} {m.lint_count:>5} {status}"
+            )
         if len(issues) > 20:
             print(f"... and {len(issues) - 20} more files")
 

@@ -304,6 +304,13 @@ class Match:
     is_stub: bool = False
     matched_by_header: bool = False
 
+    # Function parity (by canonicalized name). Ports should preserve the set of
+    # functions within a file; this is a guardrail against "signature-only" stubs.
+    source_function_count: int = 0
+    target_function_count: int = 0
+    matched_function_count: int = 0
+    function_coverage: float = 1.0  # matched / source
+
     source_doc_lines: int = 0
     target_doc_lines: int = 0
     source_doc_comments: int = 0
@@ -508,12 +515,12 @@ class CodebaseComparator:
         src_lang = _parse_language(self.source.language)
         tgt_lang = _parse_language(self.target.language)
 
-        def _function_name_coverage_ratio(src_paths: list[str], tgt_paths: list[str]) -> float:
+        def _function_name_coverage(src_paths: list[str], tgt_paths: list[str]) -> tuple[int, int, int, float]:
             try:
                 src_bytes = parser._read_combined_files(src_paths)
                 tgt_bytes = parser._read_combined_files(tgt_paths)
             except OSError:
-                return 1.0
+                return (0, 0, 0, 1.0)
 
             src_funcs = parser.extract_functions_bytes(src_bytes, src_lang)
             tgt_funcs = parser.extract_functions_bytes(tgt_bytes, tgt_lang)
@@ -523,14 +530,19 @@ class CodebaseComparator:
                 for name, _tree in src_funcs
                 if name and name != "<anonymous>"
             ]
-            if not src_names:
-                return 1.0
+            src_total = len(src_names)
 
-            tgt_counts = Counter(
+            tgt_names = [
                 SourceFile.normalize_name(name)
                 for name, _tree in tgt_funcs
                 if name and name != "<anonymous>"
-            )
+            ]
+            tgt_total = len(tgt_names)
+
+            if src_total == 0:
+                return (src_total, tgt_total, 0, 1.0)
+
+            tgt_counts = Counter(tgt_names)
 
             matched = 0
             for n in src_names:
@@ -538,7 +550,7 @@ class CodebaseComparator:
                     matched += 1
                     tgt_counts[n] -= 1
 
-            return matched / len(src_names)
+            return (src_total, tgt_total, matched, matched / src_total)
 
         for m in self.matches:
             try:
@@ -560,6 +572,14 @@ class CodebaseComparator:
                 tgt_ids = parser.extract_identifiers_from_file(tgt_file.paths, tgt_lang)
                 has_stubs = parser.has_stub_bodies_in_files(tgt_file.paths, tgt_lang)
 
+                src_total, tgt_total, matched, fn_ratio = _function_name_coverage(
+                    src_file.paths, tgt_file.paths
+                )
+                m.source_function_count = src_total
+                m.target_function_count = tgt_total
+                m.matched_function_count = matched
+                m.function_coverage = fn_ratio
+
                 if has_stubs:
                     m.similarity = 0.0
                     m.is_stub = True
@@ -567,8 +587,7 @@ class CodebaseComparator:
                     file_sim = ASTSimilarity.combined_similarity_with_content(
                         src_tree, tgt_tree, src_ids, tgt_ids
                     )
-                    fn_cov = _function_name_coverage_ratio(src_file.paths, tgt_file.paths)
-                    m.similarity = file_sim * fn_cov
+                    m.similarity = file_sim * fn_ratio
 
                 # Documentation stats
                 src_docs = parser.extract_comments_from_file(src_file.paths, src_lang)
@@ -599,16 +618,22 @@ class CodebaseComparator:
 
         if self.matches:
             lines.append("=== Matched Files (by porting priority) ===\n")
-            lines.append(f"{'Source':<30} {'Target':<30} {'Sim':>6} {'Deps':>5} {'Pri':>6}")
-            lines.append("-" * 80)
+            lines.append(
+                f"{'Source':<30} {'Target':<30} {'Similarity':>10} {'Dependents':>11} {'FunctionParity':>14} {'Priority':>9}"
+            )
+            lines.append("-" * 110)
             for m in self.ranked_for_porting():
                 priority = m.source_dependents * (1.0 - m.similarity)
+                funcs = "-"
+                if m.source_function_count > 0:
+                    funcs = f"{m.matched_function_count}/{m.source_function_count}"
                 lines.append(
                     f"{m.source_qualified[:28]:<30} "
                     f"{m.target_qualified[:28]:<30} "
-                    f"{m.similarity:>5.2f} "
-                    f"{m.source_dependents:>5} "
-                    f"{priority:>6.1f}"
+                    f"{m.similarity:>10.2f} "
+                    f"{m.source_dependents:>11} "
+                    f"{funcs:>14} "
+                    f"{priority:>9.1f}"
                 )
 
         if self.unmatched_source:
