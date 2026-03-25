@@ -809,7 +809,8 @@ public:
             // Rust: /// or //! or /** */
             if (lang == Language::KOTLIN) {
                 is_doc_comment = (text.find("/**") == 0) ||
-                                 (text.find("/*") == 0 && text.find("*") != std::string::npos);
+                                 (text.find("/*") == 0 && text.find("*") != std::string::npos) ||
+                                 (text.find("//") == 0);
             } else if (lang == Language::CPP) {
                 is_doc_comment = (text.find("/**") == 0) ||
                                  (text.find("///") == 0) ||
