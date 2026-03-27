@@ -162,7 +162,8 @@ inline NodeType rust_node_to_type(const std::string& node_type) {
         {"struct_item", NodeType::STRUCT},
         {"enum_item", NodeType::ENUM},
         {"trait_item", NodeType::INTERFACE},
-        {"impl_item", NodeType::CLASS},
+        {"impl_item", NodeType::BLOCK},     // Treat like block (matches Kotlin class_body → BLOCK)
+        {"declaration_list", NodeType::BLOCK}, // impl body — maps to Kotlin class_body (also BLOCK)
         {"let_declaration", NodeType::VAR_DECL},
         {"parameter", NodeType::PARAM},
         {"type_parameter", NodeType::TYPE_PARAM},

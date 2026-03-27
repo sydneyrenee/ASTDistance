@@ -204,38 +204,67 @@ public:
     }
 
     /**
-     * Tree edit distance (Zhang-Shasha algorithm).
-     * Returns a distance, not similarity. Lower = more similar.
+     * Maximum nodes for full edit distance. Beyond this, use strided sampling.
+     * 2000 × 2000 two-row DP = 16KB — safe everywhere.
+     */
+    static constexpr int MAX_EDIT_DISTANCE_NODES = 2000;
+
+    /**
+     * Core DP for edit distance on node-type sequences.
+     * Uses two-row rolling DP: O(m) memory instead of O(n*m).
+     */
+    static int edit_distance_dp(const std::vector<Tree*>& nodes1,
+                                const std::vector<Tree*>& nodes2) {
+        int n = static_cast<int>(nodes1.size());
+        int m = static_cast<int>(nodes2.size());
+
+        std::vector<int> prev(m + 1), curr(m + 1);
+        for (int j = 0; j <= m; ++j) prev[j] = j;
+
+        for (int i = 1; i <= n; ++i) {
+            curr[0] = i;
+            for (int j = 1; j <= m; ++j) {
+                int cost = (nodes1[i-1]->node_type == nodes2[j-1]->node_type) ? 0 : 1;
+                curr[j] = std::min({
+                    prev[j] + 1,        // Delete
+                    curr[j-1] + 1,      // Insert
+                    prev[j-1] + cost    // Replace/Match
+                });
+            }
+            std::swap(prev, curr);
+        }
+        return prev[m];
+    }
+
+    /**
+     * Tree edit distance with OOM protection.
+     *
+     * For trees with more than MAX_EDIT_DISTANCE_NODES nodes, samples
+     * every Kth node to fit within budget, then scales the result.
+     * Two-row DP keeps memory at O(min(n,m)) regardless.
      */
     static int tree_edit_distance(Tree* tree1, Tree* tree2) {
-        // Simplified implementation using dynamic programming
-        // Full Zhang-Shasha is more complex but this gives a reasonable estimate
-
         std::vector<Tree*> nodes1, nodes2;
         tree1->traverse_postorder([&nodes1](Tree* n) { nodes1.push_back(n); });
         tree2->traverse_postorder([&nodes2](Tree* n) { nodes2.push_back(n); });
 
-        int n = static_cast<int>(nodes1.size());
-        int m = static_cast<int>(nodes2.size());
+        int full_n = static_cast<int>(nodes1.size());
+        int full_m = static_cast<int>(nodes2.size());
 
-        // Simple DP: compare sequences of node types
-        std::vector<std::vector<int>> dp(n + 1, std::vector<int>(m + 1, 0));
-
-        for (int i = 0; i <= n; ++i) dp[i][0] = i;
-        for (int j = 0; j <= m; ++j) dp[0][j] = j;
-
-        for (int i = 1; i <= n; ++i) {
-            for (int j = 1; j <= m; ++j) {
-                int cost = (nodes1[i-1]->node_type == nodes2[j-1]->node_type) ? 0 : 1;
-                dp[i][j] = std::min({
-                    dp[i-1][j] + 1,      // Delete
-                    dp[i][j-1] + 1,      // Insert
-                    dp[i-1][j-1] + cost  // Replace/Match
-                });
-            }
+        if (full_n <= MAX_EDIT_DISTANCE_NODES && full_m <= MAX_EDIT_DISTANCE_NODES) {
+            return edit_distance_dp(nodes1, nodes2);
         }
 
-        return dp[n][m];
+        // Strided sampling
+        int stride1 = (full_n + MAX_EDIT_DISTANCE_NODES - 1) / MAX_EDIT_DISTANCE_NODES;
+        int stride2 = (full_m + MAX_EDIT_DISTANCE_NODES - 1) / MAX_EDIT_DISTANCE_NODES;
+        int stride = std::max(stride1, stride2);
+
+        std::vector<Tree*> s1, s2;
+        for (int i = 0; i < full_n; i += stride) s1.push_back(nodes1[i]);
+        for (int i = 0; i < full_m; i += stride) s2.push_back(nodes2[i]);
+
+        return edit_distance_dp(s1, s2) * stride;
     }
 
     /**
