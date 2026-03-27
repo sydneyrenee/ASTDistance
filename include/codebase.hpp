@@ -308,7 +308,9 @@ public:
             }
 
             // If any part has meaningful code, treat logical unit as non-stub.
-            sf.is_stub = all_parts_stub && sf.code_lines <= 50;
+            // Threshold: 100 code lines — files under this with no real content
+            // after boilerplate stripping are stubs.
+            sf.is_stub = all_parts_stub && sf.code_lines <= 100;
         }
     }
 
@@ -731,6 +733,16 @@ public:
             m.todo_count = tgt_file.todos.size();
             m.lint_count = tgt_file.lint_errors.size();
             m.is_stub = tgt_file.is_stub;
+            // File size ratio stub detection: if target has < 30% of
+            // source code lines, it's effectively a stub regardless of
+            // what the content-based check thinks.
+            if (!m.is_stub && src_file.code_lines > 20 && tgt_file.code_lines > 0) {
+                float ratio = static_cast<float>(tgt_file.code_lines) /
+                              static_cast<float>(src_file.code_lines);
+                if (ratio < 0.30f) {
+                    m.is_stub = true;
+                }
+            }
             m.matched_by_header = true;
 
             matches.push_back(m);
@@ -782,6 +794,14 @@ public:
             m.todo_count = tgt_file.todos.size();
             m.lint_count = tgt_file.lint_errors.size();
             m.is_stub = tgt_file.is_stub;
+            // File size ratio stub detection (same as header-matched path)
+            if (!m.is_stub && src_file.code_lines > 20 && tgt_file.code_lines > 0) {
+                float ratio = static_cast<float>(tgt_file.code_lines) /
+                              static_cast<float>(src_file.code_lines);
+                if (ratio < 0.30f) {
+                    m.is_stub = true;
+                }
+            }
             m.matched_by_header = false;
 
             matches.push_back(m);

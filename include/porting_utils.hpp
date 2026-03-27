@@ -274,27 +274,39 @@ public:
             stats.has_header_guard = true;  // Not applicable for .cpp
         }
 
-        // Stub detection - remove comments and includes, check remaining content
+        // Stub detection - remove boilerplate, check remaining content.
+        // Works for C++, Kotlin, Rust, and Python.
         std::string clean = content;
         // Remove line comments
         clean = std::regex_replace(clean, std::regex(R"(//[^\n]*)"), "");
         // Remove block comments
         clean = std::regex_replace(clean, std::regex(R"(/\*[\s\S]*?\*/)"), "");
-        // Remove includes
+        // Remove C++ includes
         clean = std::regex_replace(clean, std::regex(R"(#include[^\n]*)"), "");
-        // Remove namespace declarations
+        // Remove C++ namespace declarations
         clean = std::regex_replace(clean, std::regex(R"(namespace[^\{]*\{?)"), "");
-        // Remove pragma
+        // Remove C++ pragma
         clean = std::regex_replace(clean, std::regex(R"(#pragma[^\n]*)"), "");
+        // Remove Kotlin/Java package declarations
+        clean = std::regex_replace(clean, std::regex(R"(package\s+[^\n]*)"), "");
+        // Remove Kotlin/Java/Rust import/use statements
+        clean = std::regex_replace(clean, std::regex(R"(import\s+[^\n]*)"), "");
+        clean = std::regex_replace(clean, std::regex(R"(use\s+[^\n]*)"), "");
+        // Remove Rust mod declarations
+        clean = std::regex_replace(clean, std::regex(R"(mod\s+\w+\s*;)"), "");
+        // Remove Python import statements
+        clean = std::regex_replace(clean, std::regex(R"(from\s+[^\n]*)"), "");
+        // Remove license/copyright blocks (common multi-line pattern)
+        clean = std::regex_replace(clean, std::regex(R"(Copyright[^\n]*)"), "");
+        clean = std::regex_replace(clean, std::regex(R"(Licensed under[^\n]*)"), "");
+        clean = std::regex_replace(clean, std::regex(R"(Apache License[^\n]*)"), "");
         // Remove whitespace
         clean.erase(std::remove_if(clean.begin(), clean.end(),
                    [](unsigned char c) { return std::isspace(c); }), clean.end());
 
-        // Length-based stub detection is only reliable for C/C++ skeleton files.
-        // For other languages we rely on AST-based stub detection (TODO()/pass/unimplemented!/etc).
-        bool is_cpp_like = (ext == ".cpp" || ext == ".cc" || ext == ".cxx" ||
-                            ext == ".hpp" || ext == ".h" || ext == ".hxx" || ext == ".hh");
-        stats.is_stub = is_cpp_like && (clean.length() < 50);
+        // If after stripping all boilerplate less than 100 chars remain,
+        // this file has no real implementation.
+        stats.is_stub = (clean.length() < 100);
 
         // Extract transliterated from
         stats.transliterated_from = extract_transliterated_from(filepath);

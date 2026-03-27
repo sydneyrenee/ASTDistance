@@ -10,3 +10,6 @@ compile_commands.json
 *.swp
 *~
 *.pyc
+*.egg-info/
+typescript/dist/
+typescript/node_modules/
