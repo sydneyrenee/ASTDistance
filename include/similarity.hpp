@@ -174,7 +174,7 @@ public:
 
     /**
      * Content-aware combined similarity.
-     * Uses identifier comparison as the DOMINANT signal.
+     * Uses identifier comparison as the DOMINANT signal at the function level.
      *
      * A real port reuses the same identifiers (with naming convention changes).
      * A file of stubs has completely different identifiers and scores near 0.

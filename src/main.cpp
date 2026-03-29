@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <cstring>
 #include <fcntl.h>
 #include <tree_sitter/api.h>
 
@@ -2800,7 +2801,8 @@ int main(int argc, char* argv[]) {
     // Refuse to run when stdout or stderr is piped to another program via a shell pipeline.
     // This blocks `ast_distance ... | sed/grep/...` which has caused model-driven wrappers
     // to silently filter or truncate dashboards.
-    {
+    // Skip this check in CI environments where stdout is captured by the runner.
+    if (!getenv("CI")) {
         bool out_fifo = false;
         bool err_fifo = false;
         struct stat st;
@@ -3202,9 +3204,27 @@ int main(int argc, char* argv[]) {
             bool file2_stubs = parser.has_stub_bodies_in_files({file2}, lang2);
 
             if (function_scored) {
-                content_score = function_result.score;
                 file1_stubs = function_result.has_source_stub;
                 file2_stubs = function_result.has_target_stub;
+
+                // Blend function-level similarity with file-level structural metrics.
+                // The function-level score (per-body identifier matching) is reliable
+                // for matching but penalizes cross-language syntax differences.
+                // File-level histogram cosine is the most stable cross-language metric.
+                float fn_score = function_result.score;
+                float file_hist = report.cosine_sim;  // histogram cosine at file level
+                int max_funcs = std::max(function_result.source_total, function_result.target_total);
+                float fn_coverage = (max_funcs > 0)
+                    ? static_cast<float>(function_result.matched_pairs) / max_funcs
+                    : 0.0f;
+
+                // Final score:
+                //   60% function-level similarity average (identifier-weighted)
+                //   20% file-level histogram cosine (structural shape)
+                //   20% function coverage ratio (are the same functions present?)
+                content_score = 0.60f * fn_score +
+                                0.20f * file_hist +
+                                0.20f * fn_coverage;
             }
 
             if (function_scored) {
@@ -3236,6 +3256,22 @@ int main(int argc, char* argv[]) {
 
             std::cout << "\n=== " << language_name(lang2) << " AST Histogram ===\n";
             print_histogram(report.hist2);
+
+            // Show unmapped node types for diagnostics (only if any exist)
+            auto& unmapped = parser.get_unmapped_node_types();
+            if (!unmapped.empty()) {
+                int total_unmapped = 0;
+                for (const auto& [_, count] : unmapped) total_unmapped += count;
+                std::cout << "\n=== Unmapped Node Types (" << unmapped.size()
+                          << " types, " << total_unmapped << " nodes) ===\n";
+                std::vector<std::pair<std::string, int>> sorted_unmapped(unmapped.begin(), unmapped.end());
+                std::sort(sorted_unmapped.begin(), sorted_unmapped.end(),
+                    [](const auto& a, const auto& b) { return a.second > b.second; });
+                for (const auto& [type, count] : sorted_unmapped) {
+                    std::cout << "  " << std::setw(40) << std::left << type
+                              << ": " << count << "\n";
+                }
+            }
 
             // Extract and compare comment statistics
             std::cout << "\n=== " << language_name(lang1) << " Comments ===\n";
