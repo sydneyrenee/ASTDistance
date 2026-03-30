@@ -1,333 +1,422 @@
-"""Codebase scanning, import resolution, dependency graphs, and cross-codebase comparison."""
+"""Codebase management — transliterated from codebase.hpp."""
 
-from __future__ import annotations
-
-from collections import Counter
-from dataclasses import dataclass, field
 from pathlib import Path
-
-from .ast_parser import ASTParser, Language
-from .imports import ImportExtractor, Import, PackageDecl
+from typing import Dict, List, Set, Tuple, Optional
+from .imports import PackageDecl, Import, ImportExtractor
+from .ast_parser import ASTParser, Language, FunctionInfo
 from .porting_utils import PortingAnalyzer, FileStats, TodoItem, LintError
 from .similarity import ASTSimilarity
 
 
-# ── Valid extensions per language ────────────────────────────────────────────
-
-_VALID_EXTENSIONS: dict[str, frozenset[str]] = {
-    "rust": frozenset({".rs"}),
-    "kotlin": frozenset({".kt", ".kts"}),
-    "cpp": frozenset({".cpp", ".hpp", ".cc", ".h", ".hxx", ".hh"}),
-    "python": frozenset({".py"}),
-}
-
-_SKIP_DIRS = frozenset({
-    "target", "build", "build_", "_deps", "__pycache__",
-    ".git", "node_modules", "dist", ".tox", ".mypy_cache",
-})
-
-_HEADER_EXTENSIONS = frozenset({".hpp", ".h", ".hxx", ".hh"})
+def _has_valid_ext(path: str, language: str) -> bool:
+    """Check if path has a valid extension for the given language."""
+    if language == "rust":
+        return path.endswith(".rs")
+    elif language == "kotlin":
+        return path.endswith(".kt") or path.endswith(".kts")
+    elif language == "cpp":
+        return (path.endswith(".cpp") or path.endswith(".hpp") or
+                path.endswith(".cc") or path.endswith(".h"))
+    elif language == "python":
+        return path.endswith(".py")
+    return False
 
 
-# ── SourceFile ──────────────────────────────────────────────────────────────
+def _is_header_file(ext: str) -> bool:
+    """Check if extension is a header file."""
+    return ext in (".hpp", ".h", ".hxx", ".hh")
 
-@dataclass
+
 class SourceFile:
-    """A source file with metadata, imports, dependency info, and porting analysis."""
-
-    paths: list[str] = field(default_factory=list)
-    relative_path: str = ""
-    filename: str = ""
-    stem: str = ""
-    qualified_name: str = ""
-    extension: str = ""
-
-    package: PackageDecl = field(default_factory=PackageDecl)
-    imports: list[Import] = field(default_factory=list)
-    imported_by: set[str] = field(default_factory=set)
-    depends_on: set[str] = field(default_factory=set)
-
-    dependent_count: int = 0
-    dependency_count: int = 0
-
-    similarity_score: float = 0.0
-    matched_file: str = ""
-
-    transliterated_from: str = ""
-    line_count: int = 0
-    code_lines: int = 0
-    is_stub: bool = False
-    todos: list[TodoItem] = field(default_factory=list)
-    lint_errors: list[LintError] = field(default_factory=list)
+    """Represents a source file with its metadata."""
+    
+    def __init__(self):
+        self.paths: List[str] = []
+        self.relative_path: str = ""
+        self.filename: str = ""
+        self.stem: str = ""
+        self.qualified_name: str = ""
+        self.extension: str = ""
+        
+        self.package = PackageDecl()
+        self.imports: List[Import] = []
+        self.imported_by: Set[str] = set()
+        self.depends_on: Set[str] = set()
+        
+        self.dependent_count: int = 0
+        self.dependency_count: int = 0
+        
+        self.similarity_score: float = 0.0
+        self.matched_file: str = ""
+        
+        self.transliterated_from: str = ""
+        self.line_count: int = 0
+        self.code_lines: int = 0
+        self.is_stub: bool = False
+        self.todos: List[TodoItem] = []
+        self.lint_errors: List[LintError] = []
 
     def identity(self) -> str:
+        """Get the 'identity' for matching - last part of package + filename."""
         if self.package.parts:
             return self.package.path
         return self.qualified_name
 
     @staticmethod
     def make_qualified_name(rel_path: str) -> str:
+        """Compute qualified name from path."""
         p = Path(rel_path)
-        parts = [
-            s for s in p.parent.parts
-            if s and s != "." and s != "src"
-        ]
+        
+        parts = []
+        for part in p.parts[:-1]:
+            if part and part != "." and part != "src":
+                parts.append(part)
+        
         stem = p.stem
+        
         if parts:
-            return f"{parts[-1]}.{stem}"
+            return parts[-1] + "." + stem
         return stem
 
     @staticmethod
     def normalize_name(name: str) -> str:
-        result: list[str] = []
+        """Normalize name for matching (snake_case <-> PascalCase)."""
+        result = ""
         prev_lower = False
-        for ch in name:
-            if ch == "_":
+        
+        for c in name:
+            if c == '_':
                 continue
-            result.append(ch.lower())
-            prev_lower = ch.islower()
-        return "".join(result)
+            
+            if c.isupper() and prev_lower and result:
+                result += c.lower()
+            else:
+                result += c.lower()
+            
+            prev_lower = c.islower()
+        
+        return result
 
     @staticmethod
-    def is_header(ext: str) -> bool:
-        return ext in _HEADER_EXTENSIONS
+    def to_pascal_case(name: str) -> str:
+        """Convert snake_case to PascalCase for Kotlin filename generation.
+        
+        Example: "value" -> "Value", "my_file_name" -> "MyFileName"
+        """
+        result = ""
+        capitalize_next = True
+        
+        for c in name:
+            if c == '_':
+                capitalize_next = True
+                continue
+            
+            if capitalize_next:
+                result += c.upper()
+                capitalize_next = False
+            else:
+                result += c
+        
+        return result
 
-
-# ── Codebase ────────────────────────────────────────────────────────────────
 
 class Codebase:
-    """Scans a directory tree, extracts imports, and builds a dependency graph."""
-
-    def __init__(self, root: str, language: str) -> None:
+    """Manages a codebase - scans files, extracts imports, builds dependency graph."""
+    
+    def __init__(self, root: str, lang: str):
         self.root_path = root
-        self.language = language
-        self.files: dict[str, SourceFile] = {}
-        self.by_stem: dict[str, list[str]] = {}
-        self.by_qualified: dict[str, str] = {}
+        self.language = lang
+        self.files: Dict[str, SourceFile] = {}
+        self.by_stem: Dict[str, List[str]] = {}
+        self.by_qualified: Dict[str, str] = {}
 
-    def scan(self) -> None:
-        valid_ext = _VALID_EXTENSIONS.get(self.language, frozenset())
+    def scan(self):
+        """Scan directory and build file list."""
         root = Path(self.root_path)
-
-        # Handle single file input
+        
         if root.is_file():
-            if root.suffix in valid_ext:
-                sf = SourceFile(
-                    paths=[str(root)],
-                    relative_path=root.name,
-                    filename=root.name,
-                    stem=root.stem,
-                    extension=root.suffix,
-                    qualified_name=SourceFile.make_qualified_name(root.name),
-                )
-                key = sf.stem
-                self.files[key] = sf
-                self.by_stem.setdefault(sf.stem, []).append(key)
-                self.by_qualified[sf.qualified_name] = key
+            if _has_valid_ext(str(root), self.language):
+                sf = SourceFile()
+                sf.paths.append(str(root))
+                sf.relative_path = root.name
+                sf.filename = root.name
+                sf.stem = root.stem
+                sf.extension = root.suffix
+                sf.qualified_name = SourceFile.make_qualified_name(sf.relative_path)
+                
+                self.files[sf.relative_path] = sf
+                self.by_stem[sf.stem] = [sf.relative_path]
+                self.by_qualified[sf.qualified_name] = sf.relative_path
             return
-
-        for entry in _walk_files(root):
-            if entry.suffix not in valid_ext:
+        
+        suffixes = [".common", ".concurrent", ".native", ".common_native", ".darwin", ".apple"]
+        
+        for entry in root.rglob("*"):
+            if not entry.is_file():
                 continue
-            rel = str(entry.relative_to(root))
-
+            
+            path = str(entry)
+            if not _has_valid_ext(path, self.language):
+                continue
+            
+            if any(skip in path for skip in ("/target/", "/build/", "/build_", "/_deps/")):
+                continue
+            
+            rel_path = str(Path(path).relative_to(root))
             stem = entry.stem
-            directory = str(Path(rel).parent)
-            if directory == ".":
-                directory = ""
-
-            # Group platform/variant files into one logical unit.
+            filename = entry.name
+            extension = entry.suffix
+            
+            directory = str(Path(rel_path).parent)
             normalized_stem = stem
-            for suffix in (".common", ".concurrent", ".native", ".common_native", ".darwin", ".apple"):
-                if normalized_stem.endswith(suffix):
-                    normalized_stem = normalized_stem[: -len(suffix)]
+            
+            for suffix in suffixes:
+                if (len(normalized_stem) > len(suffix) and 
+                    normalized_stem.endswith(suffix)):
+                    normalized_stem = normalized_stem[:-len(suffix)]
                     break
-            logical_key = normalized_stem if not directory else f"{directory}/{normalized_stem}"
-
+            
+            logical_key = directory if directory and directory != "." else normalized_stem
+            if "/" not in logical_key and "\\" not in logical_key:
+                logical_key = normalized_stem
+            
             if logical_key in self.files:
-                sf = self.files[logical_key]
-                sf.paths.append(str(entry))
-                if entry.suffix in _HEADER_EXTENSIONS:
-                    sf.filename = entry.name
-                    sf.extension = entry.suffix
-                    sf.relative_path = rel
+                self.files[logical_key].paths.append(path)
+                if extension in (".hpp", ".h"):
+                    self.files[logical_key].filename = filename
+                    self.files[logical_key].extension = extension
+                    self.files[logical_key].relative_path = rel_path
             else:
-                sf = SourceFile(
-                    paths=[str(entry)],
-                    relative_path=rel,
-                    filename=entry.name,
-                    stem=stem,
-                    extension=entry.suffix,
-                    qualified_name=SourceFile.make_qualified_name(rel),
-                )
+                sf = SourceFile()
+                sf.paths.append(path)
+                sf.relative_path = rel_path
+                sf.filename = filename
+                sf.stem = stem
+                sf.extension = extension
+                sf.qualified_name = SourceFile.make_qualified_name(rel_path)
+                
                 self.files[logical_key] = sf
-                self.by_stem.setdefault(sf.stem, []).append(logical_key)
+                if sf.stem not in self.by_stem:
+                    self.by_stem[sf.stem] = []
+                self.by_stem[sf.stem].append(logical_key)
                 self.by_qualified[sf.qualified_name] = logical_key
+        
+        for stem, paths in self.by_stem.items():
+            if len(paths) > 1:
+                paths.sort(key=lambda p: (
+                    not _is_header_file(self.files[p].extension),
+                    len(p)
+                ))
+                
+                seen_qualified = set()
+                for path in paths:
+                    sf = self.files[path]
+                    if sf.qualified_name in seen_qualified:
+                        p = Path(sf.relative_path)
+                        full_qualified = ""
+                        for part in p.parts[:-1]:
+                            if part and part != "." and part != "src":
+                                if full_qualified:
+                                    full_qualified += "."
+                                full_qualified += part
+                        if full_qualified:
+                            full_qualified += "."
+                        full_qualified += sf.stem
+                        sf.qualified_name = full_qualified
+                    seen_qualified.add(sf.qualified_name)
+                    self.by_qualified[sf.qualified_name] = path
 
-        # Disambiguate duplicate stems
-        for _stem, keys in self.by_stem.items():
-            if len(keys) <= 1:
-                continue
-            # Sort: headers first, then shorter paths
-            keys.sort(key=lambda key: (
-                not SourceFile.is_header(self.files[key].extension),
-                len(key),
-            ))
-            seen: set[str] = set()
-            for key in keys:
-                sf = self.files[key]
-                if sf.qualified_name in seen:
-                    # Need more context — use full parent path
-                    parts = [
-                        s for s in Path(sf.relative_path).parent.parts
-                        if s and s != "." and s != "src"
-                    ]
-                    parts.append(sf.stem)
-                    sf.qualified_name = ".".join(parts)
-                seen.add(sf.qualified_name)
-                self.by_qualified[sf.qualified_name] = key
-
-    def extract_imports(self) -> None:
+    def extract_imports(self):
+        """Extract imports and packages from all files."""
         extractor = ImportExtractor()
-        for _path, sf in self.files.items():
-            sf.imports.clear()
+        
+        for path, sf in self.files.items():
             for p in sf.paths:
-                sf.imports.extend(extractor.extract_from_file(p))
+                file_imports = extractor.extract_from_file(p)
+                sf.imports.extend(file_imports)
+                
                 if self.language == "python":
                     if not sf.package.parts:
-                        sf.package = _derive_python_module(sf.relative_path)
+                        sf.package = self._derive_python_module(sf.relative_path)
                 elif not sf.package.parts:
                     sf.package = extractor.extract_package_from_file(p)
+            
             sf.dependency_count = len(sf.imports)
 
-    def extract_porting_data(self) -> None:
-        for _path, sf in self.files.items():
-            sf.line_count = 0
-            sf.code_lines = 0
-            sf.transliterated_from = ""
-            sf.todos.clear()
-            sf.lint_errors.clear()
-            sf.is_stub = False
-
-            all_parts_stub = bool(sf.paths)
+    def extract_porting_data(self):
+        """Extract porting analysis data."""
+        for path, sf in self.files.items():
+            all_parts_stub = len(sf.paths) > 0
+            
             for p in sf.paths:
                 if not sf.transliterated_from:
                     sf.transliterated_from = PortingAnalyzer.extract_transliterated_from(p)
-
+                
                 stats = PortingAnalyzer.analyze_file(p)
                 sf.line_count += stats.line_count
                 sf.code_lines += stats.code_lines
                 sf.todos.extend(stats.todos)
-                sf.lint_errors.extend(PortingAnalyzer.lint_file(p))
-                sf.is_stub = sf.is_stub or stats.is_stub
+                
+                lints = PortingAnalyzer.lint_file(p)
+                sf.lint_errors.extend(lints)
+                
                 all_parts_stub = all_parts_stub and stats.is_stub
+            
+            sf.is_stub = all_parts_stub and sf.code_lines <= 100
 
-            if sf.code_lines > 50:
-                sf.is_stub = False
-            else:
-                sf.is_stub = all_parts_stub
+    def transliteration_map(self) -> Dict[str, str]:
+        """Build map of transliterated_from paths to files."""
+        result = {}
+        for path, sf in self.files.items():
+            if sf.transliterated_from:
+                result[sf.transliterated_from] = path
+        return result
 
-    def transliteration_map(self) -> dict[str, str]:
-        return {
-            sf.transliterated_from: path
-            for path, sf in self.files.items()
-            if sf.transliterated_from
-        }
-
-    def build_dependency_graph(self) -> None:
+    def build_dependency_graph(self):
+        """Build dependency graph - resolve imports to actual files."""
         for path, sf in self.files.items():
             for imp in sf.imports:
                 resolved = self._resolve_import(imp)
                 if resolved and resolved != path:
                     sf.depends_on.add(resolved)
                     self.files[resolved].imported_by.add(path)
+        
         for path, sf in self.files.items():
             sf.dependent_count = len(sf.imported_by)
 
-    def ranked_by_dependents(self) -> list[SourceFile]:
-        return sorted(self.files.values(), key=lambda s: s.dependent_count, reverse=True)
-
-    def leaf_files(self) -> list[SourceFile]:
-        return [sf for sf in self.files.values() if sf.dependent_count == 0]
-
-    def root_files(self, min_dependents: int = 3) -> list[SourceFile]:
-        result = [sf for sf in self.files.values() if sf.dependent_count >= min_dependents]
-        result.sort(key=lambda s: s.dependent_count, reverse=True)
+    def ranked_by_dependents(self) -> List[SourceFile]:
+        """Get files sorted by dependent count (most depended-on first)."""
+        result = list(self.files.values())
+        result.sort(key=lambda sf: sf.dependent_count, reverse=True)
         return result
 
-    def print_summary(self) -> str:
-        lines = [
-            f"Codebase: {self.root_path} ({self.language})",
-            f"  Files: {len(self.files)}",
-        ]
-        total_imports = sum(len(sf.imports) for sf in self.files.values())
-        lines.append(f"  Total imports: {total_imports}")
-        if self.files:
-            most = max(self.files.values(), key=lambda s: s.dependent_count)
-            if most.dependent_count > 0:
-                lines.append(f"  Most depended: {most.qualified_name} ({most.dependent_count} dependents)")
-        return "\n".join(lines) + "\n"
+    def leaf_files(self) -> List[SourceFile]:
+        """Get leaf files (no dependents - safe to port first)."""
+        return [sf for sf in self.files.values() if sf.dependent_count == 0]
 
-    # ── Private ─────────────────────────────────────────────────────────────
+    def root_files(self, min_dependents: int = 3) -> List[SourceFile]:
+        """Get root files (many dependents - core infrastructure)."""
+        result = [sf for sf in self.files.values() if sf.dependent_count >= min_dependents]
+        result.sort(key=lambda sf: sf.dependent_count, reverse=True)
+        return result
+
+    def print_summary(self):
+        """Print codebase summary."""
+        print(f"Codebase: {self.root_path} ({self.language})")
+        print(f"  Files: {len(self.files)}")
+        
+        total_imports = 0
+        max_dependents = 0
+        most_depended = ""
+        
+        for sf in self.files.values():
+            total_imports += len(sf.imports)
+            if sf.dependent_count > max_dependents:
+                max_dependents = sf.dependent_count
+                most_depended = sf.qualified_name
+        
+        print(f"  Total imports: {total_imports}")
+        if most_depended:
+            print(f"  Most depended: {most_depended} ({max_dependents} dependents)")
+
+    def _derive_python_module(self, rel_path: str) -> PackageDecl:
+        """Derive Python package from relative path."""
+        pkg = PackageDecl()
+        p = Path(rel_path)
+        
+        parts = []
+        for part in p.parts[:-1]:
+            if part and part != "." and part != "src" and part != "lib":
+                parts.append(part)
+        
+        stem = p.stem
+        if stem and stem != "__init__":
+            parts.append(stem)
+        
+        pkg.parts = parts
+        pkg.path = ".".join(parts)
+        
+        return pkg
 
     def _resolve_import(self, imp: Import) -> str:
+        """Resolve import to a file."""
+        module = imp.module_path
         item = imp.item
+        
         if item == "*":
             sep = "::" if self.language == "rust" else "."
-            pos = imp.module_path.rfind(sep)
-            if pos >= 0:
-                item = imp.module_path[pos + len(sep):]
+            last_sep = module.rfind(sep)
+            if last_sep != -1:
+                item = module[last_sep + (2 if self.language == "rust" else 1):]
+        
         normalized = SourceFile.normalize_name(item)
+        
         for stem, paths in self.by_stem.items():
             if SourceFile.normalize_name(stem) == normalized:
                 return paths[0]
+        
         return ""
 
 
-# ── CodebaseComparator ──────────────────────────────────────────────────────
-
-@dataclass
-class Match:
-    """A matched pair of source/target files with comparison data."""
-
-    source_path: str = ""
-    target_path: str = ""
-    source_qualified: str = ""
-    target_qualified: str = ""
-    similarity: float = 0.0
-    source_dependents: int = 0
-    target_dependents: int = 0
-    source_lines: int = 0
-    target_lines: int = 0
-    todo_count: int = 0
-    lint_count: int = 0
-    is_stub: bool = False
-    matched_by_header: bool = False
-
-    source_doc_lines: int = 0
-    target_doc_lines: int = 0
-    source_doc_comments: int = 0
-    target_doc_comments: int = 0
-    doc_similarity: float = 0.0
-
-    def doc_gap_ratio(self) -> float:
-        if self.source_doc_lines == 0:
-            return 0.0
-        if self.target_doc_lines == 0:
-            return 1.0
-        ratio = 1.0 - (self.target_doc_lines / self.source_doc_lines)
-        return max(0.0, ratio)
-
-
 class CodebaseComparator:
-    """Compare two codebases, find matching files, compute AST similarity."""
+    """Compare two codebases and find matches."""
+    
+    class FunctionComparisonResult:
+        def __init__(self):
+            self.score: float = -1.0
+            self.matched_pairs: int = 0
+            self.source_total: int = 0
+            self.target_total: int = 0
+            self.unmatched_source: int = 0
+            self.unmatched_target: int = 0
+            self.has_source_stub: bool = False
+            self.has_target_stub: bool = False
 
-    def __init__(self, source: Codebase, target: Codebase) -> None:
-        self.source = source
-        self.target = target
-        self.matches: list[Match] = []
-        self.unmatched_source: list[str] = []
-        self.unmatched_target: list[str] = []
+    class Match:
+        def __init__(self):
+            self.source_path: str = ""
+            self.target_path: str = ""
+            self.source_qualified: str = ""
+            self.target_qualified: str = ""
+            self.similarity: float = 0.0
+            self.source_dependents: int = 0
+            self.target_dependents: int = 0
+            self.source_lines: int = 0
+            self.target_lines: int = 0
+            self.todo_count: int = 0
+            self.lint_count: int = 0
+            self.is_stub: bool = False
+            self.matched_by_header: bool = False
+            
+            self.source_function_count: int = 0
+            self.target_function_count: int = 0
+            self.matched_function_count: int = 0
+            self.function_coverage: float = 1.0
+            
+            self.source_doc_lines: int = 0
+            self.target_doc_lines: int = 0
+            self.source_doc_comments: int = 0
+            self.target_doc_comments: int = 0
+            self.doc_similarity: float = 0.0
+
+        def doc_gap_ratio(self) -> float:
+            if self.source_doc_lines == 0:
+                return 0.0
+            if self.target_doc_lines == 0:
+                return 1.0
+            ratio = 1.0 - (float(self.target_doc_lines) / float(self.source_doc_lines))
+            return max(0.0, ratio)
+
+    def __init__(self, src: Codebase, tgt: Codebase):
+        self.source = src
+        self.target = tgt
+        self.matches: List[CodebaseComparator.Match] = []
+        self.unmatched_source: List[str] = []
+        self.unmatched_target: List[str] = []
+
+    @staticmethod
+    def is_header_file(file: SourceFile) -> bool:
+        return _is_header_file(file.extension)
 
     @staticmethod
     def name_match_score(src: SourceFile, tgt: SourceFile) -> float:
@@ -335,318 +424,379 @@ class CodebaseComparator:
         tgt_norm = SourceFile.normalize_name(tgt.stem)
         src_qual_norm = SourceFile.normalize_name(src.qualified_name)
         tgt_qual_norm = SourceFile.normalize_name(tgt.qualified_name)
-
-        header_boost = 0.02 if SourceFile.is_header(tgt.extension) else 0.0
-
-        # Exact qualified name match
+        
+        header_boost = 0.02 if CodebaseComparator.is_header_file(tgt) else 0.0
+        
         if src_qual_norm == tgt_qual_norm:
             return 1.0 + header_boost
-
-        # Extract parent directories
-        src_parent = ""
-        tgt_parent = ""
-        src_dot = src.qualified_name.rfind(".")
-        tgt_dot = tgt.qualified_name.rfind(".")
-        if src_dot >= 0:
-            src_parent = src.qualified_name[:src_dot]
-        if tgt_dot >= 0:
-            tgt_parent = tgt.qualified_name[:tgt_dot]
-
-        # Same stem + same parent directory
+        
+        src_dot = src.qualified_name.rfind('.')
+        tgt_dot = tgt.qualified_name.rfind('.')
+        src_parent = src.qualified_name[:src_dot] if src_dot != -1 else ""
+        tgt_parent = tgt.qualified_name[:tgt_dot] if tgt_dot != -1 else ""
+        
         if src_norm == tgt_norm and src_parent and tgt_parent:
-            if SourceFile.normalize_name(src_parent) == SourceFile.normalize_name(tgt_parent):
+            src_parent_norm = SourceFile.normalize_name(src_parent)
+            tgt_parent_norm = SourceFile.normalize_name(tgt_parent)
+            if src_parent_norm == tgt_parent_norm:
                 return 0.95 + header_boost
-
-        # Exact stem match (different directory)
+        
         if src_norm == tgt_norm:
             return 0.7 + header_boost
-
-        # Substring containment
-        if src_norm in tgt_norm:
-            ratio = len(src_norm) / len(tgt_norm)
+        
+        if tgt_norm.find(src_norm) != -1:
+            ratio = float(len(src_norm)) / float(len(tgt_norm))
             return 0.5 + 0.2 * ratio + header_boost
-        if tgt_norm in src_norm:
-            ratio = len(tgt_norm) / len(src_norm)
+        if src_norm.find(tgt_norm) != -1:
+            ratio = float(len(tgt_norm)) / float(len(src_norm))
             return 0.5 + 0.2 * ratio + header_boost
-
-        # Package path similarity
+        
         if src.package.parts and tgt.package.parts:
             pkg_sim = src.package.similarity_to(tgt.package)
             if pkg_sim > 0.5:
                 return pkg_sim * 0.6 + header_boost
-
-        # Package last component matches filename
+        
         if src.package.parts:
             src_last = PackageDecl.normalize(src.package.last())
-            if src_last == tgt_norm or tgt_norm in src_last or src_last in tgt_norm:
+            if src_last == tgt_norm or tgt_norm.find(src_last) != -1:
                 return 0.5 + header_boost
         if tgt.package.parts:
             tgt_last = PackageDecl.normalize(tgt.package.last())
-            if tgt_last == src_norm or src_norm in tgt_last or tgt_last in src_norm:
+            if tgt_last == src_norm or src_norm.find(tgt_last) != -1:
                 return 0.5 + header_boost
-
-        # Same parent directory, different filename
-        if src_parent and tgt_parent:
-            if SourceFile.normalize_name(src_parent) == SourceFile.normalize_name(tgt_parent):
-                return 0.4 + header_boost
-
+        
+        if (SourceFile.normalize_name(src_parent) == SourceFile.normalize_name(tgt_parent) 
+            and src_parent):
+            return 0.4 + header_boost
+        
         return 0.0
 
-    def find_matches(self) -> None:
-        matched_sources: set[str] = set()
-        matched_targets: set[str] = set()
-
-        # ── Pass 1: Match by "Transliterated from:" header ──────────────────
-        header_candidates: list[tuple[float, str, str]] = []
-
+    def find_matches(self):
+        """Find matching files between codebases."""
+        matched_sources: Set[str] = set()
+        matched_targets: Set[str] = set()
+        
+        header_candidates: List[Tuple[float, str, str]] = []
+        
         for tgt_path, tgt_file in self.target.files.items():
             if not tgt_file.transliterated_from:
                 continue
+            
             for src_path, src_file in self.source.files.items():
-                score = 0.0
-
-                # Full relative path match
-                if src_file.relative_path in tgt_file.transliterated_from:
-                    score = 1.0
-                # Exact filename with path separator
-                elif (tgt_file.transliterated_from.endswith("/" + src_file.filename)
-                      or tgt_file.transliterated_from == src_file.filename):
-                    # Verify directory context
+                match_score = 0.0
+                
+                if tgt_file.transliterated_from.find(src_file.relative_path) != -1:
+                    match_score = 1.0
+                elif (tgt_file.transliterated_from.endswith("/" + src_file.filename) or
+                      tgt_file.transliterated_from == src_file.filename):
                     tgt_dir = tgt_file.qualified_name
                     src_dir = src_file.qualified_name
-                    td = tgt_dir.rfind(".")
-                    sd = src_dir.rfind(".")
-                    tgt_dir = tgt_dir[:td] if td >= 0 else ""
-                    src_dir = src_dir[:sd] if sd >= 0 else ""
-                    if SourceFile.normalize_name(tgt_dir) == SourceFile.normalize_name(src_dir):
-                        score = 0.9
+                    tgt_dot = tgt_dir.rfind('.')
+                    src_dot = src_dir.rfind('.')
+                    if tgt_dot != -1:
+                        tgt_dir = tgt_dir[:tgt_dot]
+                    if src_dot != -1:
+                        src_dir = src_dir[:src_dot]
+                    
+                    if (SourceFile.normalize_name(tgt_dir) == 
+                        SourceFile.normalize_name(src_dir)):
+                        match_score = 0.9
                     else:
-                        score = 0.5
-                # Stem with known extensions
-                elif any(
-                    tgt_file.transliterated_from.endswith("/" + src_file.stem + ext)
-                    for ext in (".kt", ".rs", ".py", ".cpp", ".hpp")
-                ):
-                    score = 0.3
-
-                if score > 0.0:
-                    header_candidates.append((score, src_path, tgt_path))
-
-        # Sort: highest score first, then prefer headers, then shorter paths
-        header_candidates.sort(key=lambda c: (
-            -c[0],
-            not SourceFile.is_header(self.target.files[c[2]].extension),
-            len(c[2]),
-        ))
-
+                        match_score = 0.5
+                elif any(tgt_file.transliterated_from.endswith("/" + src_file.stem + ext) 
+                         for ext in (".kt", ".rs", ".py", ".cpp", ".cc", ".hpp", ".h")):
+                    match_score = 0.3
+                
+                if match_score > 0.0:
+                    header_candidates.append((match_score, src_path, tgt_path))
+        
+        header_candidates.sort(key=lambda x: (-x[0], 
+            not CodebaseComparator.is_header_file(self.target.files.get(x[2], SourceFile())),
+            len(x[2])))
+        
         for score, src_path, tgt_path in header_candidates:
             if src_path in matched_sources or tgt_path in matched_targets:
                 continue
+            
             src_file = self.source.files[src_path]
             tgt_file = self.target.files[tgt_path]
-            self.matches.append(Match(
-                source_path=src_path,
-                target_path=tgt_path,
-                source_qualified=src_file.qualified_name,
-                target_qualified=tgt_file.qualified_name,
-                similarity=0.0,
-                source_dependents=src_file.dependent_count,
-                target_dependents=tgt_file.dependent_count,
-                source_lines=src_file.line_count,
-                target_lines=tgt_file.line_count,
-                todo_count=len(tgt_file.todos),
-                lint_count=len(tgt_file.lint_errors),
-                is_stub=tgt_file.is_stub,
-                matched_by_header=True,
-            ))
+            
+            m = CodebaseComparator.Match()
+            m.source_path = src_path
+            m.target_path = tgt_path
+            m.source_qualified = src_file.qualified_name
+            m.target_qualified = tgt_file.qualified_name
+            m.similarity = 0.0
+            m.source_dependents = src_file.dependent_count
+            m.target_dependents = tgt_file.dependent_count
+            m.source_lines = src_file.line_count
+            m.target_lines = tgt_file.line_count
+            m.todo_count = len(tgt_file.todos)
+            m.lint_count = len(tgt_file.lint_errors)
+            m.is_stub = tgt_file.is_stub
+            
+            if not m.is_stub and src_file.code_lines > 20 and tgt_file.code_lines > 0:
+                ratio = float(tgt_file.code_lines) / float(src_file.code_lines)
+                if ratio < 0.30:
+                    m.is_stub = True
+            
+            m.matched_by_header = True
+            
+            self.matches.append(m)
             matched_sources.add(src_path)
             matched_targets.add(tgt_path)
-
-        # ── Pass 2: Name-based matching ─────────────────────────────────────
-        name_candidates: list[tuple[float, str, str]] = []
+        
+        candidates: List[Tuple[float, str, str]] = []
+        
         for src_path, src_file in self.source.files.items():
             if src_path in matched_sources:
                 continue
+            
             for tgt_path, tgt_file in self.target.files.items():
                 if tgt_path in matched_targets:
                     continue
-                score = self.name_match_score(src_file, tgt_file)
+                
+                score = CodebaseComparator.name_match_score(src_file, tgt_file)
                 if score > 0.4:
-                    name_candidates.append((score, src_path, tgt_path))
-
-        name_candidates.sort(key=lambda c: -c[0])
-
-        for score, src_path, tgt_path in name_candidates:
+                    candidates.append((score, src_path, tgt_path))
+        
+        candidates.sort(key=lambda x: -x[0])
+        
+        for score, src_path, tgt_path in candidates:
             if src_path in matched_sources or tgt_path in matched_targets:
                 continue
+            
             src_file = self.source.files[src_path]
             tgt_file = self.target.files[tgt_path]
-            self.matches.append(Match(
-                source_path=src_path,
-                target_path=tgt_path,
-                source_qualified=src_file.qualified_name,
-                target_qualified=tgt_file.qualified_name,
-                similarity=0.0,
-                source_dependents=src_file.dependent_count,
-                target_dependents=tgt_file.dependent_count,
-                source_lines=src_file.line_count,
-                target_lines=tgt_file.line_count,
-                todo_count=len(tgt_file.todos),
-                lint_count=len(tgt_file.lint_errors),
-                is_stub=tgt_file.is_stub,
-                matched_by_header=False,
-            ))
+            
+            m = CodebaseComparator.Match()
+            m.source_path = src_path
+            m.target_path = tgt_path
+            m.source_qualified = src_file.qualified_name
+            m.target_qualified = tgt_file.qualified_name
+            m.similarity = 0.0
+            m.source_dependents = src_file.dependent_count
+            m.target_dependents = tgt_file.dependent_count
+            m.source_lines = src_file.line_count
+            m.target_lines = tgt_file.line_count
+            m.todo_count = len(tgt_file.todos)
+            m.lint_count = len(tgt_file.lint_errors)
+            m.is_stub = tgt_file.is_stub
+            
+            if not m.is_stub and src_file.code_lines > 20 and tgt_file.code_lines > 0:
+                ratio = float(tgt_file.code_lines) / float(src_file.code_lines)
+                if ratio < 0.30:
+                    m.is_stub = True
+            
+            m.matched_by_header = False
+            
+            self.matches.append(m)
             matched_sources.add(src_path)
             matched_targets.add(tgt_path)
+        
+        for src_path in self.source.files:
+            if src_path not in matched_sources:
+                self.unmatched_source.append(src_path)
+        for tgt_path in self.target.files:
+            if tgt_path not in matched_targets:
+                self.unmatched_target.append(tgt_path)
 
-        # ── Collect unmatched ───────────────────────────────────────────────
-        self.unmatched_source = [p for p in self.source.files if p not in matched_sources]
-        self.unmatched_target = [p for p in self.target.files if p not in matched_targets]
+    @staticmethod
+    def _string_to_language(lang: str) -> Language:
+        if lang == "rust":
+            return Language.RUST
+        if lang == "kotlin":
+            return Language.KOTLIN
+        if lang == "cpp":
+            return Language.CPP
+        if lang == "python":
+            return Language.PYTHON
+        return Language.KOTLIN
 
-    def compute_similarities(self) -> None:
+    @staticmethod
+    def compare_function_sets(source_functions: List[FunctionInfo],
+                              target_functions: List[FunctionInfo]) -> 'CodebaseComparator.FunctionComparisonResult':
+        result = CodebaseComparator.FunctionComparisonResult()
+        result.source_total = len(source_functions)
+        result.target_total = len(target_functions)
+        
+        for func in source_functions:
+            if func.has_stub_markers:
+                result.has_source_stub = True
+        for func in target_functions:
+            if func.has_stub_markers:
+                result.has_target_stub = True
+        
+        if not source_functions or not target_functions:
+            return result
+        
+        candidates = []
+        
+        for i, source_func in enumerate(source_functions):
+            for j, target_func in enumerate(target_functions):
+                sim = 0.0
+                if not source_func.has_stub_markers and not target_func.has_stub_markers:
+                    sim = ASTSimilarity.combined_similarity_with_content(
+                        source_func.body_tree,
+                        target_func.body_tree,
+                        source_func.identifiers,
+                        target_func.identifiers)
+                
+                candidates.append((sim, i, j))
+        
+        candidates.sort(key=lambda x: -x[0])
+        
+        source_used = [False] * len(source_functions)
+        target_used = [False] * len(target_functions)
+        
+        total_score = 0.0
+        for score, src_idx, tgt_idx in candidates:
+            if source_used[src_idx] or target_used[tgt_idx]:
+                continue
+            source_used[src_idx] = True
+            target_used[tgt_idx] = True
+            total_score += score
+            result.matched_pairs += 1
+        
+        result.unmatched_source = result.source_total - result.matched_pairs
+        result.unmatched_target = result.target_total - result.matched_pairs
+        
+        denominator = max(result.source_total, result.target_total)
+        if denominator > 0:
+            result.score = total_score / float(denominator)
+        
+        return result
+
+    @staticmethod
+    def function_name_coverage(source_functions: List[FunctionInfo],
+                              target_functions: List[FunctionInfo]) -> Dict[str, int]:
+        from .ast_parser import IdentifierStats
+        
+        cov = {"source_total": 0, "target_total": 0, "matched": 0, "ratio": 1.0}
+        
+        tgt_names = []
+        for f in target_functions:
+            if f.name and f.name != "<anonymous>":
+                tgt_names.append(IdentifierStats.canonicalize(f.name))
+                cov["target_total"] += 1
+        
+        for f in source_functions:
+            if f.name and f.name != "<anonymous>":
+                cov["source_total"] += 1
+                key = IdentifierStats.canonicalize(f.name)
+                if key in tgt_names:
+                    cov["matched"] += 1
+                    tgt_names.remove(key)
+        
+        if cov["source_total"] > 0:
+            cov["ratio"] = float(cov["matched"]) / float(cov["source_total"])
+        
+        return cov
+
+    def compute_similarities(self):
+        """Compute AST similarity for all matches."""
         parser = ASTParser()
-        src_lang = _parse_language(self.source.language)
-        tgt_lang = _parse_language(self.target.language)
-
-        def _function_name_coverage_ratio(src_paths: list[str], tgt_paths: list[str]) -> float:
-            try:
-                src_bytes = parser._read_combined_files(src_paths)
-                tgt_bytes = parser._read_combined_files(tgt_paths)
-            except OSError:
-                return 1.0
-
-            src_funcs = parser.extract_functions_bytes(src_bytes, src_lang)
-            tgt_funcs = parser.extract_functions_bytes(tgt_bytes, tgt_lang)
-
-            src_names = [
-                SourceFile.normalize_name(name)
-                for name, _tree in src_funcs
-                if name and name != "<anonymous>"
-            ]
-            if not src_names:
-                return 1.0
-
-            tgt_counts = Counter(
-                SourceFile.normalize_name(name)
-                for name, _tree in tgt_funcs
-                if name and name != "<anonymous>"
-            )
-
-            matched = 0
-            for n in src_names:
-                if tgt_counts.get(n, 0) > 0:
-                    matched += 1
-                    tgt_counts[n] -= 1
-
-            return matched / len(src_names)
-
+        
         for m in self.matches:
             try:
                 src_file = self.source.files[m.source_path]
                 tgt_file = self.target.files[m.target_path]
-
-                src_tree = parser.parse_file(src_file.paths, src_lang)
-                tgt_tree = parser.parse_file(tgt_file.paths, tgt_lang)
-
-                # Flatten package/namespace nodes to reduce structural noise
-                from .node_types import NodeType
-                pkg_type = int(NodeType.PACKAGE)
-                if src_tree:
-                    src_tree.flatten_node_type(pkg_type)
-                if tgt_tree:
-                    tgt_tree.flatten_node_type(pkg_type)
-
-                src_ids = parser.extract_identifiers_from_file(src_file.paths, src_lang)
-                tgt_ids = parser.extract_identifiers_from_file(tgt_file.paths, tgt_lang)
+                src_lang = CodebaseComparator._string_to_language(self.source.language)
+                tgt_lang = CodebaseComparator._string_to_language(self.target.language)
+                
                 has_stubs = parser.has_stub_bodies_in_files(tgt_file.paths, tgt_lang)
-
+                
                 if has_stubs:
                     m.similarity = 0.0
                     m.is_stub = True
                 else:
+                    src_tree = parser.parse_file(src_file.paths, src_lang)
+                    tgt_tree = parser.parse_file(tgt_file.paths, tgt_lang)
+                    
+                    from .node_types import NodeType
+                    if src_tree:
+                        src_tree.flatten_node_type(int(NodeType.PACKAGE))
+                    if tgt_tree:
+                        tgt_tree.flatten_node_type(int(NodeType.PACKAGE))
+                    
+                    src_ids = parser.extract_identifiers_from_file(src_file.paths, src_lang)
+                    tgt_ids = parser.extract_identifiers_from_file(tgt_file.paths, tgt_lang)
+                    
                     file_sim = ASTSimilarity.combined_similarity_with_content(
-                        src_tree, tgt_tree, src_ids, tgt_ids
-                    )
-                    fn_cov = _function_name_coverage_ratio(src_file.paths, tgt_file.paths)
-                    m.similarity = file_sim * fn_cov
-
-                # Documentation stats
+                        src_tree, tgt_tree, src_ids, tgt_ids)
+                    
+                    source_functions = parser.extract_function_infos_from_files(
+                        src_file.paths, src_lang)
+                    target_functions = parser.extract_function_infos_from_files(
+                        tgt_file.paths, tgt_lang)
+                    
+                    fn_cov = CodebaseComparator.function_name_coverage(
+                        source_functions, target_functions)
+                    
+                    m.source_function_count = fn_cov["source_total"]
+                    m.target_function_count = fn_cov["target_total"]
+                    m.matched_function_count = fn_cov["matched"]
+                    m.function_coverage = fn_cov["ratio"]
+                    
+                    m.similarity = file_sim * fn_cov["ratio"]
+                
                 src_docs = parser.extract_comments_from_file(src_file.paths, src_lang)
                 tgt_docs = parser.extract_comments_from_file(tgt_file.paths, tgt_lang)
+                
                 m.source_doc_lines = src_docs.total_doc_lines
                 m.target_doc_lines = tgt_docs.total_doc_lines
                 m.source_doc_comments = src_docs.doc_comment_count
                 m.target_doc_comments = tgt_docs.doc_comment_count
                 m.doc_similarity = src_docs.doc_cosine_similarity(tgt_docs)
+                
             except Exception:
                 m.similarity = -1.0
 
-    def ranked_for_porting(self) -> list[Match]:
-        result = list(self.matches)
+    def ranked_for_porting(self) -> List[Match]:
+        """Get matches sorted by priority for porting."""
+        result = self.matches[:]
         result.sort(key=lambda m: m.source_dependents * (1.0 - m.similarity), reverse=True)
         return result
 
-    def format_report(self) -> str:
-        lines: list[str] = [
-            "\n=== Codebase Comparison Report ===\n",
-            f"Source: {self.source.root_path} ({len(self.source.files)} files)",
-            f"Target: {self.target.root_path} ({len(self.target.files)} files)",
-            "",
-            f"Matched:   {len(self.matches)} files",
-            f"Unmatched: {len(self.unmatched_source)} source, {len(self.unmatched_target)} target",
-            "",
-        ]
-
+    def print_report(self):
+        """Print comparison report."""
+        print("\n=== Codebase Comparison Report ===\n")
+        
+        print(f"Source: {self.source.root_path} ({len(self.source.files)} files)")
+        print(f"Target: {self.target.root_path} ({len(self.target.files)} files)")
+        print()
+        
+        print(f"Matched:   {len(self.matches)} files")
+        print(f"Unmatched: {len(self.unmatched_source)} source, {len(self.unmatched_target)} target\n")
+        
         if self.matches:
-            lines.append("=== Matched Files (by porting priority) ===\n")
-            lines.append(f"{'Source':<30} {'Target':<30} {'Sim':>6} {'Deps':>5} {'Pri':>6}")
-            lines.append("-" * 80)
-            for m in self.ranked_for_porting():
+            print("=== Matched Files (by porting priority) ===\n")
+            print(f"{'Source':<30}{'Target':<30}{'Similarity':<10}{'Dependents':<11}{'FunctionParity':<14}{'Priority':<10}")
+            print("-" * 110)
+            
+            ranked = self.ranked_for_porting()
+            for m in ranked:
+                funcs = "-"
+                if m.source_function_count > 0:
+                    funcs = f"{m.matched_function_count}/{m.source_function_count}"
                 priority = m.source_dependents * (1.0 - m.similarity)
-                lines.append(
-                    f"{m.source_qualified[:28]:<30} "
-                    f"{m.target_qualified[:28]:<30} "
-                    f"{m.similarity:>5.2f} "
-                    f"{m.source_dependents:>5} "
-                    f"{priority:>6.1f}"
-                )
-
+                
+                print(f"{m.source_qualified[:28]:<30}{m.target_qualified[:28]:<30}"
+                      f"{m.similarity:<10.2f}{m.source_dependents:<11}"
+                      f"{funcs:<14}{priority:<10.1f}")
+        
         if self.unmatched_source:
-            lines.append("\n=== Missing from Target (need to port) ===")
-            for path in self.unmatched_source:
-                sf = self.source.files[path]
-                lines.append(f"  {sf.qualified_name:<30} ({sf.dependent_count} dependents)")
-
-        return "\n".join(lines) + "\n"
-
-
-# ── Helpers ─────────────────────────────────────────────────────────────────
-
-def _parse_language(lang: str) -> Language:
-    try:
-        return Language(lang)
-    except ValueError:
-        return Language.KOTLIN
-
-
-def _derive_python_module(rel_path: str) -> PackageDecl:
-    p = Path(rel_path)
-    parts = [s for s in p.parent.parts if s and s not in (".", "src", "lib")]
-    stem = p.stem
-    if stem and stem != "__init__":
-        parts.append(stem)
-    return PackageDecl(parts=parts, path=".".join(parts))
-
-
-def _walk_files(root: Path):
-    """Walk directory tree, skipping build artifacts."""
-    try:
-        entries = sorted(root.iterdir())
-    except PermissionError:
-        return
-    for entry in entries:
-        if entry.is_dir():
-            if entry.name not in _SKIP_DIRS and not entry.name.startswith("."):
-                yield from _walk_files(entry)
-        elif entry.is_file():
-            yield entry
+            print("\n=== Missing from Target (need to port) ===\n")
+            missing = [self.source.files[p] for p in self.unmatched_source]
+            missing.sort(key=lambda sf: sf.dependent_count, reverse=True)
+            
+            print(f"{'File':<30}{'Deps':<8}Path")
+            print("-" * 78)
+            
+            shown = 0
+            for sf in missing:
+                if shown >= 20:
+                    print(f"... and {len(missing) - 20} more missing files")
+                    break
+                print(f"{sf.qualified_name[:28]:<30}{sf.dependent_count:<8}{sf.relative_path}")
+                shown += 1
