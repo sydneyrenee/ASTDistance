@@ -863,22 +863,33 @@ public:
     static FunctionComparisonResult compare_function_sets(
             const std::vector<FunctionInfo>& source_functions,
             const std::vector<FunctionInfo>& target_functions) {
-        FunctionComparisonResult result;
-        result.source_total = static_cast<int>(source_functions.size());
-        result.target_total = static_cast<int>(target_functions.size());
+        // Filter out test functions from source before comparison.
+        // Rust inline tests (#[test], #[cfg(test)] mod) map to separate
+        // Kotlin test files, not the ported source file.
+        std::vector<const FunctionInfo*> src_prod, tgt_all;
+        for (const auto& f : source_functions) {
+            if (!f.is_test) src_prod.push_back(&f);
+        }
+        for (const auto& f : target_functions) {
+            tgt_all.push_back(&f);
+        }
 
-        for (const auto& func : source_functions) {
-            if (func.has_stub_markers) {
+        FunctionComparisonResult result;
+        result.source_total = static_cast<int>(src_prod.size());
+        result.target_total = static_cast<int>(tgt_all.size());
+
+        for (const auto* func : src_prod) {
+            if (func->has_stub_markers) {
                 result.has_source_stub = true;
             }
         }
-        for (const auto& func : target_functions) {
-            if (func.has_stub_markers) {
+        for (const auto* func : tgt_all) {
+            if (func->has_stub_markers) {
                 result.has_target_stub = true;
             }
         }
 
-        if (source_functions.empty() || target_functions.empty()) {
+        if (src_prod.empty() || tgt_all.empty()) {
             return result;
         }
 
@@ -889,20 +900,20 @@ public:
         };
 
         std::vector<FunctionMatchCandidate> candidates;
-        candidates.reserve(source_functions.size() * target_functions.size());
+        candidates.reserve(src_prod.size() * tgt_all.size());
 
-        for (int i = 0; i < static_cast<int>(source_functions.size()); ++i) {
-            const auto& source_func = source_functions[i];
-            for (int j = 0; j < static_cast<int>(target_functions.size()); ++j) {
-                const auto& target_func = target_functions[j];
+        for (int i = 0; i < static_cast<int>(src_prod.size()); ++i) {
+            const auto* source_func = src_prod[i];
+            for (int j = 0; j < static_cast<int>(tgt_all.size()); ++j) {
+                const auto* target_func = tgt_all[j];
 
                 float sim = 0.0f;
-                if (!source_func.has_stub_markers && !target_func.has_stub_markers) {
+                if (!source_func->has_stub_markers && !target_func->has_stub_markers) {
                     sim = ASTSimilarity::combined_similarity_with_content(
-                        source_func.body_tree.get(),
-                        target_func.body_tree.get(),
-                        source_func.identifiers,
-                        target_func.identifiers);
+                        source_func->body_tree.get(),
+                        target_func->body_tree.get(),
+                        source_func->identifiers,
+                        target_func->identifiers);
                 }
 
                 candidates.push_back({sim, i, j});
@@ -914,8 +925,8 @@ public:
                 return a.score > b.score;
             });
 
-        std::vector<bool> source_used(source_functions.size(), false);
-        std::vector<bool> target_used(target_functions.size(), false);
+        std::vector<bool> source_used(src_prod.size(), false);
+        std::vector<bool> target_used(tgt_all.size(), false);
 
         float total_score = 0.0f;
         for (const auto& candidate : candidates) {
@@ -944,6 +955,7 @@ public:
         int source_total = 0;
         int target_total = 0;
         int matched = 0;
+        int source_test_skipped = 0;  // test functions excluded from source count
         float ratio = 1.0f;
     };
 
@@ -952,6 +964,9 @@ public:
             const std::vector<FunctionInfo>& target_functions) {
         // How many source functions exist in target, by canonicalized name.
         // This is a parity signal: ports should preserve the function set within a file.
+        // Test functions (#[test], #[cfg(test)] mod) are excluded from the source
+        // count because Rust inline tests map to separate Kotlin test files, not
+        // the ported source file.
         FunctionNameCoverage cov;
         std::multiset<std::string> tgt_names;
         for (const auto& f : target_functions) {
@@ -962,6 +977,12 @@ public:
 
         for (const auto& f : source_functions) {
             if (f.name.empty() || f.name == "<anonymous>") continue;
+            // Skip Rust test functions — they belong in separate Kotlin test files,
+            // not in the ported source file.
+            if (f.is_test) {
+                cov.source_test_skipped++;
+                continue;
+            }
             cov.source_total++;
             std::string key = IdentifierStats::canonicalize(f.name);
             auto it = tgt_names.find(key);

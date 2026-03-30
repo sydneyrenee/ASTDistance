@@ -96,6 +96,25 @@ struct IdentifierStats {
             {"result", "result"},
             {"err", "error"},
             {"ok", "success"},
+            // Rust trait methods -> Kotlin equivalents
+            {"fmt", "tostring"},          // Display::fmt -> toString
+            {"eq", "equals"},             // PartialEq::eq -> equals
+            {"partialeq", "equals"},
+            {"cmp", "compareto"},         // Ord::cmp -> compareTo
+            {"partialcmp", "compareto"},  // PartialOrd::partial_cmp -> compareTo
+            {"hash", "hashcode"},         // Hash::hash -> hashCode
+            {"clone", "copy"},            // Clone::clone -> copy (data class)
+            {"default", "invoke"},        // Default::default -> companion invoke
+            {"fromstr", "parse"},         // FromStr -> parse
+            {"intoiter", "iterator"},     // IntoIterator::into_iter -> iterator
+            {"intoiterator", "iterator"},
+            {"next", "next"},             // Iterator::next (same name)
+            {"serialize", "serialize"},   // serde (same name)
+            {"deserialize", "deserialize"},
+            {"deref", "get"},             // Deref::deref -> get/value
+            {"drop", "close"},            // Drop::drop -> close/Closeable
+            {"freeze", "freeze"},         // project-specific (same name)
+            {"trace", "trace"},           // project-specific (same name)
             // Common prefixes
             {"fn", "fun"},
             {"impl", "class"},
@@ -279,6 +298,7 @@ struct FunctionInfo {
     TreePtr body_tree;
     IdentifierStats identifiers;
     bool has_stub_markers = false;
+    bool is_test = false;  // true if #[test] or inside #[cfg(test)] mod
 };
 
 /**
@@ -1065,6 +1085,80 @@ public:
             (lang == Language::PYTHON && type_s == "function_definition");
     }
 
+    /**
+     * Check if a Rust node has a #[test] attribute or a #[cfg(test)] attribute.
+     * Works for both function_item and mod_item nodes.
+     *
+     * In tree-sitter-rust, attributes appear as siblings BEFORE the function:
+     *   (attribute_item (attribute (path) ...))   // for outer #[...]
+     *   (function_item ...)
+     *
+     * Or for #[cfg(test)]:
+     *   (attribute_item
+     *     (attribute
+     *       (path)                               // "cfg"
+     *       (token_tree "(" "test" ")")))
+     */
+    bool has_test_attribute(TSNode node, const std::string& source) const {
+        // Look at preceding siblings for attribute_item nodes
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent)) return false;
+
+        uint32_t child_count = ts_node_child_count(parent);
+        // Find our index among siblings
+        uint32_t our_index = UINT32_MAX;
+        for (uint32_t i = 0; i < child_count; ++i) {
+            TSNode child = ts_node_child(parent, i);
+            if (ts_node_start_byte(child) == ts_node_start_byte(node) &&
+                ts_node_end_byte(child) == ts_node_end_byte(node)) {
+                our_index = i;
+                break;
+            }
+        }
+
+        if (our_index == UINT32_MAX || our_index == 0) return false;
+
+        // Scan backwards through preceding siblings for attribute_item
+        for (uint32_t i = our_index; i > 0; --i) {
+            TSNode sibling = ts_node_child(parent, i - 1);
+            std::string sib_type(ts_node_type(sibling));
+
+            if (sib_type != "attribute_item") break;  // stop at non-attribute
+
+            // Extract the attribute text and check for #[test] or #[cfg(test)]
+            uint32_t start = ts_node_start_byte(sibling);
+            uint32_t end = ts_node_end_byte(sibling);
+            if (end > start && end <= source.length()) {
+                std::string attr_text = source.substr(start, end - start);
+                // #[test]
+                if (attr_text.find("#[test]") != std::string::npos) return true;
+                // #[cfg(test)]
+                if (attr_text.find("cfg(test)") != std::string::npos) return true;
+                if (attr_text.find("cfg( test )") != std::string::npos) return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Check if a node is inside a #[cfg(test)] mod block.
+     * Walks up the tree looking for mod_item ancestors with #[cfg(test)].
+     */
+    bool is_inside_cfg_test_mod(TSNode node, const std::string& source) const {
+        TSNode current = ts_node_parent(node);
+        while (!ts_node_is_null(current)) {
+            std::string type_s(ts_node_type(current));
+            if (type_s == "mod_item") {
+                if (has_test_attribute(current, source)) {
+                    return true;
+                }
+            }
+            current = ts_node_parent(current);
+        }
+        return false;
+    }
+
     std::string extract_function_name(TSNode node, Language lang, const std::string& source) const {
         uint32_t child_count = ts_node_child_count(node);
         for (uint32_t i = 0; i < child_count; ++i) {
@@ -1234,6 +1328,12 @@ public:
             info.body_tree = convert_node(body_node, source, lang);
             info.identifiers = ids;
             info.has_stub_markers = has_stub_markers_in_node(body_node, source, lang);
+
+            // Tag Rust test functions: #[test] attribute or inside #[cfg(test)] mod
+            if (lang == Language::RUST) {
+                info.is_test = has_test_attribute(node, source) ||
+                               is_inside_cfg_test_mod(node, source);
+            }
 
             functions.push_back(info);
         }
