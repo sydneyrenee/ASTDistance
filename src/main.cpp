@@ -2188,7 +2188,16 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
         std::string kt_path = sf->relative_path;
         // Convert .rs to .kt and adjust path
         if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
-            kt_path = kt_path.substr(0, kt_path.size() - 3) + ".kt";
+            // Convert filename from snake_case to PascalCase for Kotlin
+            std::string stem = kt_path.substr(0, kt_path.size() - 3);
+            size_t last_slash = stem.rfind('/');
+            if (last_slash != std::string::npos) {
+                std::string dir = stem.substr(0, last_slash + 1);
+                std::string filename = stem.substr(last_slash + 1);
+                kt_path = dir + SourceFile::to_pascal_case(filename) + ".kt";
+            } else {
+                kt_path = SourceFile::to_pascal_case(stem) + ".kt";
+            }
         }
         // Remove src/ prefix if present
         if (kt_path.rfind("src/", 0) == 0) {
@@ -2551,7 +2560,16 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
         // Generate expected Kotlin path
         std::string kt_path = sf->relative_path;
         if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
-            kt_path = kt_path.substr(0, kt_path.size() - 3) + ".kt";
+            // Convert filename from snake_case to PascalCase for Kotlin
+            std::string stem = kt_path.substr(0, kt_path.size() - 3);
+            size_t last_slash = stem.rfind('/');
+            if (last_slash != std::string::npos) {
+                std::string dir = stem.substr(0, last_slash + 1);
+                std::string filename = stem.substr(last_slash + 1);
+                kt_path = dir + SourceFile::to_pascal_case(filename) + ".kt";
+            } else {
+                kt_path = SourceFile::to_pascal_case(stem) + ".kt";
+            }
         }
         if (kt_path.rfind("src/", 0) == 0) {
             kt_path = kt_path.substr(4);

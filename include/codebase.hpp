@@ -108,6 +108,33 @@ struct SourceFile {
 
         return result;
     }
+
+    /**
+     * Convert snake_case to PascalCase for Kotlin filename generation.
+     * Example: "value" -> "Value", "my_file_name" -> "MyFileName"
+     */
+    static std::string to_pascal_case(const std::string& name) {
+        std::string result;
+        bool capitalize_next = true;
+
+        for (size_t i = 0; i < name.size(); ++i) {
+            char c = name[i];
+
+            if (c == '_') {
+                capitalize_next = true;
+                continue;
+            }
+
+            if (capitalize_next) {
+                result += std::toupper(c);
+                capitalize_next = false;
+            } else {
+                result += c;
+            }
+        }
+
+        return result;
+    }
 };
 
 /**
