@@ -33,6 +33,7 @@ std::string SymbolExtractor::is_symbol_definition(const std::string& node_type) 
     if (node_type == "class_declaration") return "class";
     if (node_type == "object_declaration") return "object";
     if (node_type == "interface_declaration") return "interface";
+    if (node_type == "type_alias") return "typealias";
 
     // C++
     if (node_type == "class_specifier") return "class";
