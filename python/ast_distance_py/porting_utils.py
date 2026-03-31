@@ -19,7 +19,9 @@ IGNORED_KEYWORDS: Set[str] = {
     "sizeof", "alignof", "decltype", "static_assert", "constexpr", "template",
     "void", "int", "bool", "float", "double", "char", "short", "long", "unsigned",
     "auto", "const", "static", "virtual", "override", "final", "explicit",
-    "inline", "noexcept", "nullptr", "true", "false", "this", "new", "delete"
+    "inline", "noexcept", "nullptr", "true", "false", "this", "new", "delete",
+    # Kotlin keywords that look like function calls
+    "check", "require", "assert"
 }
 
 
@@ -232,6 +234,93 @@ class PortingAnalyzer:
         return stats
 
     @staticmethod
+    def is_kotlin_file(filepath: str) -> bool:
+        """Check if a file is a Kotlin source file."""
+        return filepath.endswith('.kt')
+
+    @staticmethod
+    def extract_kotlin_param_names(args_str: str) -> List[str]:
+        """Extract parameter names from a Kotlin function parameter list.
+
+        In Kotlin, parameters are declared as `name: Type` (name before colon),
+        unlike C++ where the type comes first. This extracts the identifier
+        immediately before each `:` separator, skipping annotations and modifiers.
+        """
+        params: List[str] = []
+
+        # Split by commas (respecting angle brackets for generics)
+        segments: List[str] = []
+        angle_depth = 0
+        current = ""
+        for c in args_str:
+            if c == '<':
+                angle_depth += 1
+                current += c
+            elif c == '>':
+                angle_depth -= 1
+                current += c
+            elif c == ',' and angle_depth == 0:
+                segments.append(current)
+                current = ""
+            else:
+                current += c
+        if current:
+            segments.append(current)
+
+        # For each segment, find `name:` pattern (Kotlin param syntax)
+        kotlin_param_re = re.compile(r'\b(\w+)\s*:')
+        for seg in segments:
+            # Strip default value (find '=' not inside angle brackets)
+            s = seg
+            adepth = 0
+            eq_pos = -1
+            for i, ch in enumerate(s):
+                if ch == '<':
+                    adepth += 1
+                elif ch == '>':
+                    adepth -= 1
+                elif ch == '=' and adepth == 0:
+                    eq_pos = i
+                    break
+            if eq_pos >= 0:
+                s = s[:eq_pos]
+
+            # Find the last `name:` pattern (to skip modifiers like vararg)
+            last_name = ""
+            for m in kotlin_param_re.finditer(s):
+                last_name = m.group(1)
+
+            if (last_name and
+                    last_name not in IGNORED_KEYWORDS and
+                    not last_name.startswith('_')):
+                params.append(last_name)
+
+        return params
+
+    @staticmethod
+    def extract_cpp_param_names(args_str: str) -> List[str]:
+        """Extract parameter names from a C/C++ function parameter list.
+
+        In C/C++, parameters are declared as `Type name` (name is last token),
+        so we extract the last identifier from each comma-separated segment.
+        """
+        params: List[str] = []
+
+        for param in args_str.split(','):
+            eq_pos = param.find('=')
+            if eq_pos != -1:
+                param = param[:eq_pos]
+
+            tokens = re.findall(r'\b(\w+)\b', param)
+            if tokens:
+                last_token = tokens[-1]
+                if (last_token not in IGNORED_KEYWORDS and
+                        not last_token.startswith('_')):
+                    params.append(last_token)
+
+        return params
+
+    @staticmethod
     def check_unused_params(filepath: str) -> List[LintError]:
         """Check for unused parameters in functions."""
         errors: List[LintError] = []
@@ -242,7 +331,14 @@ class PortingAnalyzer:
         except Exception:
             return errors
 
-        func_re = re.compile(r'(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:final\s*)?\{')
+        kotlin = PortingAnalyzer.is_kotlin_file(filepath)
+
+        # For Kotlin files, require 'fun' keyword before the function name.
+        # For C/C++ files, use the original heuristic pattern.
+        if kotlin:
+            func_re = re.compile(r'\bfun\s+(?:<[^>]*>\s+)?(\w+)\s*\(([^)]*)\)\s*(?::\s*\w+(?:<[^>]*>)?\s*)?\{')
+        else:
+            func_re = re.compile(r'(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:final\s*)?\{')
 
         for match in func_re.finditer(content):
             func_name = match.group(1)
@@ -270,22 +366,12 @@ class PortingAnalyzer:
             if not args_str or args_str.startswith("void"):
                 continue
 
-            params: List[str] = []
-
-            for param in args_str.split(','):
-                eq_pos = param.find('=')
-                if eq_pos != -1:
-                    param = param[:eq_pos]
-
-                tokens = re.findall(r'\b(\w+)\b', param)
-                if tokens:
-                    last_token = tokens[-1]
-                    if (last_token not in IGNORED_KEYWORDS and 
-                        not last_token.startswith('_')):
-                        params.append(last_token)
+            params = (PortingAnalyzer.extract_kotlin_param_names(args_str)
+                      if kotlin
+                      else PortingAnalyzer.extract_cpp_param_names(args_str))
 
             for p in params:
-                usage_re = re.compile(r'\b' + p + r'\b')
+                usage_re = re.compile(r'\b' + re.escape(p) + r'\b')
                 if not usage_re.search(body):
                     void_cast1 = "(void)" + p
                     void_cast2 = "(void) " + p

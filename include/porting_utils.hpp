@@ -113,8 +113,15 @@ public:
         "sizeof", "alignof", "decltype", "static_assert", "constexpr", "template",
         "void", "int", "bool", "float", "double", "char", "short", "long", "unsigned",
         "auto", "const", "static", "virtual", "override", "final", "explicit",
-        "inline", "noexcept", "nullptr", "true", "false", "this", "new", "delete"
+        "inline", "noexcept", "nullptr", "true", "false", "this", "new", "delete",
+        // Kotlin keywords that look like function calls
+        "check", "require", "assert"
     };
+
+    static bool is_kotlin_file(const std::string& filepath) {
+        return filepath.size() >= 3 &&
+               filepath.substr(filepath.size() - 3) == ".kt";
+    }
 
     /**
      * Scan a file for TODO comments.
@@ -318,9 +325,103 @@ public:
     }
 
     /**
-     * Check for unused parameters in functions.
-     * Simple heuristic-based checker.
+     * Extract parameter names from a Kotlin function parameter list.
+     *
+     * In Kotlin, parameters are declared as `name: Type` (name before colon),
+     * unlike C++ where the type comes first. This extracts the identifier
+     * immediately before each `:` separator, skipping annotations and modifiers.
      */
+    static std::vector<std::string> extract_kotlin_param_names(const std::string& args_str) {
+        std::vector<std::string> params;
+
+        // Split by commas (respecting angle brackets for generics)
+        std::vector<std::string> segments;
+        int angle_depth = 0;
+        std::string current;
+        for (char c : args_str) {
+            if (c == '<') { angle_depth++; current += c; }
+            else if (c == '>') { angle_depth--; current += c; }
+            else if (c == ',' && angle_depth == 0) {
+                segments.push_back(current);
+                current.clear();
+            } else {
+                current += c;
+            }
+        }
+        if (!current.empty()) segments.push_back(current);
+
+        // For each segment, find `name:` pattern (Kotlin param syntax)
+        std::regex kotlin_param_re(R"(\b(\w+)\s*:)");
+        for (const auto& seg : segments) {
+            // Strip default value
+            std::string s = seg;
+            // Find '=' not inside angle brackets
+            int adepth = 0;
+            size_t eq_pos = std::string::npos;
+            for (size_t i = 0; i < s.size(); i++) {
+                if (s[i] == '<') adepth++;
+                else if (s[i] == '>') adepth--;
+                else if (s[i] == '=' && adepth == 0) { eq_pos = i; break; }
+            }
+            if (eq_pos != std::string::npos) {
+                s = s.substr(0, eq_pos);
+            }
+
+            // Find the last `name:` pattern (to skip modifiers like vararg)
+            std::string last_name;
+            auto tok_begin = std::sregex_iterator(s.begin(), s.end(), kotlin_param_re);
+            auto tok_end = std::sregex_iterator();
+            for (auto tok_it = tok_begin; tok_it != tok_end; ++tok_it) {
+                last_name = (*tok_it)[1].str();
+            }
+
+            if (!last_name.empty() &&
+                !IGNORED_KEYWORDS.count(last_name) &&
+                last_name[0] != '_') {
+                params.push_back(last_name);
+            }
+        }
+
+        return params;
+    }
+
+    /**
+     * Extract parameter names from a C/C++ function parameter list.
+     *
+     * In C/C++, parameters are declared as `Type name` (name is last token),
+     * so we extract the last identifier from each comma-separated segment.
+     */
+    static std::vector<std::string> extract_cpp_param_names(const std::string& args_str) {
+        std::vector<std::string> params;
+        std::stringstream ss(args_str);
+        std::string param;
+
+        while (std::getline(ss, param, ',')) {
+            // Extract parameter name (last token before = if present)
+            size_t eq_pos = param.find('=');
+            if (eq_pos != std::string::npos) {
+                param = param.substr(0, eq_pos);
+            }
+
+            // Tokenize and get last identifier
+            std::regex token_re(R"(\b(\w+)\b)");
+            std::string last_token;
+            auto tok_begin = std::sregex_iterator(param.begin(), param.end(), token_re);
+            auto tok_end = std::sregex_iterator();
+            for (auto tok_it = tok_begin; tok_it != tok_end; ++tok_it) {
+                last_token = (*tok_it)[1].str();
+            }
+
+            if (!last_token.empty() &&
+                !IGNORED_KEYWORDS.count(last_token) &&
+                last_token[0] != '_') {  // Allow _unused pattern
+                params.push_back(last_token);
+            }
+        }
+
+        return params;
+    }
+
     static std::vector<LintError> check_unused_params(const std::string& filepath) {
         std::vector<LintError> errors;
 
@@ -331,8 +432,13 @@ public:
         buffer << file.rdbuf();
         std::string content = buffer.str();
 
-        // Simple function pattern: name(params) { or name(params) const {
-        std::regex func_re(R"((\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:final\s*)?\{)");
+        bool kotlin = is_kotlin_file(filepath);
+
+        // For Kotlin files, require 'fun' keyword before the function name.
+        // For C/C++ files, use the original heuristic pattern.
+        std::regex func_re = kotlin
+            ? std::regex(R"(\bfun\s+(?:<[^>]*>\s+)?(\w+)\s*\(([^)]*)\)\s*(?::\s*\w+(?:<[^>]*>)?\s*)?\{)")
+            : std::regex(R"((\w+)\s*\(([^)]*)\)\s*(?:const\s*)?(?:noexcept\s*)?(?:override\s*)?(?:final\s*)?\{)");
 
         auto begin = std::sregex_iterator(content.begin(), content.end(), func_re);
         auto end = std::sregex_iterator();
@@ -363,32 +469,9 @@ public:
             // Parse parameters
             if (args_str.empty() || args_str.find("void") == 0) continue;
 
-            std::vector<std::string> params;
-            std::stringstream ss(args_str);
-            std::string param;
-
-            while (std::getline(ss, param, ',')) {
-                // Extract parameter name (last token before = if present)
-                size_t eq_pos = param.find('=');
-                if (eq_pos != std::string::npos) {
-                    param = param.substr(0, eq_pos);
-                }
-
-                // Tokenize and get last identifier
-                std::regex token_re(R"(\b(\w+)\b)");
-                std::string last_token;
-                auto tok_begin = std::sregex_iterator(param.begin(), param.end(), token_re);
-                auto tok_end = std::sregex_iterator();
-                for (auto tok_it = tok_begin; tok_it != tok_end; ++tok_it) {
-                    last_token = (*tok_it)[1].str();
-                }
-
-                if (!last_token.empty() &&
-                    !IGNORED_KEYWORDS.count(last_token) &&
-                    last_token[0] != '_') {  // Allow _unused pattern
-                    params.push_back(last_token);
-                }
-            }
+            std::vector<std::string> params = kotlin
+                ? extract_kotlin_param_names(args_str)
+                : extract_cpp_param_names(args_str);
 
             // Check usage in body
             for (const auto& p : params) {
