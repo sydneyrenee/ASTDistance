@@ -2452,10 +2452,16 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
             return;
         }
 
-        // Normalize ASTs: Flatten namespaces/packages to reduce structural noise
-        // Node type 82 is PACKAGE (includes C++ namespaces)
-        src_tree->flatten_node_type(82);
-        tgt_tree->flatten_node_type(82);
+        // Normalize ASTs: Flatten namespaces/packages to reduce structural noise.
+        // Node type 82 is PACKAGE (includes C++ namespaces).
+        //
+        // For very small "module marker" files (e.g. Rust `mod foo;` roots),
+        // flattening PACKAGE nodes removes the key structural signal needed for
+        // the module-marker similarity heuristic, so only apply it to larger files.
+        if (std::max(src_tree->size(), tgt_tree->size()) > 250) {
+            src_tree->flatten_node_type(82);
+            tgt_tree->flatten_node_type(82);
+        }
 
         auto src_ids = parser.extract_identifiers_from_file(source_path.string(), src_lang);
         auto tgt_ids = parser.extract_identifiers_from_file(target_path.string(), tgt_lang);
