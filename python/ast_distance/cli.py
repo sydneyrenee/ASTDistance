@@ -70,7 +70,21 @@ def _target_path_from_source(rel_path: str, src_lang: str, tgt_lang: str) -> str
         ("python", "cpp"): ".cpp",
     }
     new_ext = ext_map.get((src_lang, tgt_lang), p.suffix)
-    result = str(p.with_suffix(new_ext))
+
+    # Kotlin filename convention for ports: snake_case Rust filenames become PascalCase Kotlin files.
+    # Example: `typing/ty.rs` -> `typing/Ty.kt`, `my_file.rs` -> `MyFile.kt`.
+    if src_lang == "rust" and tgt_lang == "kotlin":
+        stem = p.stem
+        out_name = "".join(
+            (ch.upper() if i == 0 or stem[i - 1] == "_" else ch)
+            for i, ch in enumerate(stem)
+            if ch != "_"
+        )
+        p = p.with_name(out_name + new_ext)
+        result = str(p)
+    else:
+        result = str(p.with_suffix(new_ext))
+
     if result.startswith("src/"):
         result = result[4:]
     return result
@@ -481,15 +495,18 @@ def cmd_compare(file1: str, lang1: str, file2: str, lang2: str) -> None:
 
     file1_stubs = parser.has_stub_bodies_in_files([file1], l1)
     file2_stubs = parser.has_stub_bodies_in_files([file2], l2)
-    if file1_stubs or file2_stubs:
+    # IMPORTANT: stubs in the *target* indicate incomplete transliteration and should gate completion.
+    # Stubs in the *source* are treated as baseline and should not force similarity to zero.
+    if file2_stubs:
         content_score = 0.0
         print("\n*** STUB DETECTED ***")
         if file1_stubs:
             print(f"  {file1} has TODO/stub/placeholder in function bodies")
-        if file2_stubs:
-            print(f"  {file2} has TODO/stub/placeholder in function bodies")
+        print(f"  {file2} has TODO/stub/placeholder in function bodies")
         print("  Content-Aware Score forced to 0.0000")
     else:
+        if file1_stubs:
+            print(f"\nNote: {file1} contains TODO/stub/placeholder markers in function bodies (source baseline).")
         print(f"\nContent-Aware Score:  {content_score:.4f}")
 
     num_types = int(NodeType.NUM_TYPES)

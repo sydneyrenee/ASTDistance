@@ -1,5 +1,7 @@
 """Codebase management — transliterated from codebase.hpp."""
 
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from .imports import PackageDecl, Import, ImportExtractor
@@ -635,7 +637,10 @@ class CodebaseComparator:
         for i, source_func in enumerate(source_functions):
             for j, target_func in enumerate(target_functions):
                 sim = 0.0
-                if not source_func.has_stub_markers and not target_func.has_stub_markers:
+                # Guardrail: treat stub markers as a failure only when they appear in the
+                # target function but not in the source function. Rust source may contain
+                # legitimate TODO/FIXME comments without implying an incomplete port.
+                if not (target_func.has_stub_markers and not source_func.has_stub_markers):
                     sim = ASTSimilarity.combined_similarity_with_content(
                         source_func.body_tree,
                         target_func.body_tree,
@@ -757,6 +762,16 @@ class CodebaseComparator:
         result = self.matches[:]
         result.sort(key=lambda m: m.source_dependents * (1.0 - m.similarity), reverse=True)
         return result
+
+    def format_report(self) -> str:
+        """Return the same output as `print_report`, as a string.
+
+        ProjectHub and other callers use this to embed the report in higher-level summaries.
+        """
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.print_report()
+        return buf.getvalue()
 
     def print_report(self):
         """Print comparison report."""

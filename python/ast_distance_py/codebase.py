@@ -1,5 +1,7 @@
 """Codebase management — transliterated from codebase.hpp."""
 
+import io
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 from .imports import PackageDecl, Import, ImportExtractor
@@ -757,6 +759,16 @@ class CodebaseComparator:
         result = self.matches[:]
         result.sort(key=lambda m: m.source_dependents * (1.0 - m.similarity), reverse=True)
         return result
+
+    def format_report(self) -> str:
+        """Return the same output as `print_report`, as a string.
+
+        ProjectHub and other callers use this to embed the report in higher-level summaries.
+        """
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.print_report()
+        return buf.getvalue()
 
     def print_report(self):
         """Print comparison report."""

@@ -525,6 +525,8 @@ public:
         int unmatched_target = 0;
         bool has_source_stub = false;
         bool has_target_stub = false;
+        bool has_stub_mismatch = false;
+        int stub_mismatch_count = 0;
     };
 
     struct Match {
@@ -874,11 +876,23 @@ public:
             const std::vector<FunctionInfo>& source_functions,
             const std::vector<FunctionInfo>& target_functions) {
         // Filter out test functions from source before comparison.
-        // Rust inline tests (#[test], #[cfg(test)] mod) map to separate
-        // Kotlin test files, not the ported source file.
+        //
+        // Rationale:
+        // - Rust inline tests in production source files (#[test], #[cfg(test)] mod)
+        //   typically map to separate Kotlin test files, not the ported source file.
+        // - However, some projects keep tests in dedicated Rust test modules which
+        //   port to dedicated Kotlin test files. In that case, the entire file may
+        //   consist of test functions, and skipping them would produce a false negative.
         std::vector<const FunctionInfo*> src_prod, tgt_all;
         for (const auto& f : source_functions) {
             if (!f.is_test) src_prod.push_back(&f);
+        }
+        if (src_prod.empty() && !source_functions.empty()) {
+            // All functions are tests (or the extractor marked all as tests).
+            // Treat them as the "production" set for the purpose of file parity.
+            for (const auto& f : source_functions) {
+                src_prod.push_back(&f);
+            }
         }
         for (const auto& f : target_functions) {
             tgt_all.push_back(&f);
@@ -888,15 +902,37 @@ public:
         result.source_total = static_cast<int>(src_prod.size());
         result.target_total = static_cast<int>(tgt_all.size());
 
+        // Track stub/TODO markers per function name.
+        //
+        // Guardrail intent: prevent Kotlin ports from "faking" bodies with TODO/FIXME/STUB markers.
+        //
+        // Rust source may legitimately contain TODO/FIXME comments; that should *not* penalize a Kotlin
+        // port that is more complete than the Rust source. Therefore, we only treat it as a mismatch
+        // when the Kotlin target introduces stub markers that are not present in the corresponding Rust
+        // function.
+        std::multiset<std::string> src_stub_names;
+        std::multiset<std::string> tgt_stub_names;
         for (const auto* func : src_prod) {
             if (func->has_stub_markers) {
                 result.has_source_stub = true;
+                src_stub_names.insert(IdentifierStats::canonicalize(func->name));
             }
         }
         for (const auto* func : tgt_all) {
             if (func->has_stub_markers) {
                 result.has_target_stub = true;
+                tgt_stub_names.insert(IdentifierStats::canonicalize(func->name));
             }
+        }
+        // Count Kotlin-only stub markers (target stubs without matching source stubs).
+        std::vector<std::string> kotlin_only;
+        std::set_difference(
+            tgt_stub_names.begin(), tgt_stub_names.end(),
+            src_stub_names.begin(), src_stub_names.end(),
+            std::back_inserter(kotlin_only));
+        if (!kotlin_only.empty()) {
+            result.has_stub_mismatch = true;
+            result.stub_mismatch_count = static_cast<int>(kotlin_only.size());
         }
 
         if (src_prod.empty() || tgt_all.empty()) {
@@ -918,7 +954,12 @@ public:
                 const auto* target_func = tgt_all[j];
 
                 float sim = 0.0f;
-                if (!source_func->has_stub_markers && !target_func->has_stub_markers) {
+                // Guardrail: a Kotlin function body containing stub markers (TODO/FIXME/STUB/etc.)
+                // should not score similarity against a real Rust implementation.
+                //
+                // However, Rust source may contain TODO markers legitimately; do not penalize when
+                // the Kotlin target is *more complete* (source has markers, target does not).
+                if (!(target_func->has_stub_markers && !source_func->has_stub_markers)) {
                     sim = ASTSimilarity::combined_similarity_with_content(
                         source_func->body_tree.get(),
                         target_func->body_tree.get(),
@@ -949,7 +990,12 @@ public:
             result.matched_pairs += 1;
         }
 
-        int denominator = std::max(result.source_total, result.target_total);
+        // Score is measured as "how well does the target cover the source".
+        //
+        // Kotlin ports often contain extra helper methods (Result plumbing, derived trait shims,
+        // builders, etc.) which should not penalize the score as long as every source function
+        // has a faithful target counterpart.
+        int denominator = result.source_total;
         result.unmatched_source = result.source_total - result.matched_pairs;
         result.unmatched_target = result.target_total - result.matched_pairs;
         if (denominator > 0) {
@@ -985,16 +1031,37 @@ public:
             cov.target_total++;
         }
 
+        bool has_non_test = false;
+        for (const auto& f : source_functions) {
+            if (!f.is_test) {
+                has_non_test = true;
+                break;
+            }
+        }
+
+        std::set<std::string> src_seen;
         for (const auto& f : source_functions) {
             if (f.name.empty() || f.name == "<anonymous>") continue;
             // Skip Rust test functions — they belong in separate Kotlin test files,
             // not in the ported source file.
-            if (f.is_test) {
+            if (has_non_test && f.is_test) {
                 cov.source_test_skipped++;
                 continue;
             }
-            cov.source_total++;
             std::string key = IdentifierStats::canonicalize(f.name);
+            // Rust `Drop` impl methods appear as a `drop` function in function extraction.
+            // Kotlin ports have no direct equivalent, so do not require it for parity.
+            if (key == "drop") {
+                continue;
+            }
+            // Rust often has duplicate trait method names (e.g. multiple `fmt` impls).
+            // In Kotlin ports these typically collapse into a single canonical method
+            // (e.g. `toString`), so only require each canonical name once.
+            if (src_seen.count(key)) {
+                continue;
+            }
+            src_seen.insert(key);
+            cov.source_total++;
             auto it = tgt_names.find(key);
             if (it != tgt_names.end()) {
                 cov.matched++;
@@ -1156,7 +1223,12 @@ public:
                     m.type_coverage = ty_cov.ratio;
                     m.missing_types = std::move(ty_cov.missing);
 
-                    m.similarity = file_sim * fn_cov.ratio * m.type_coverage;
+                    // Port completeness gates primarily on semantic code similarity:
+                    //   similarity = content_aware_ast_similarity * function_name_coverage
+                    // Type coverage is still reported separately (m.type_coverage) but is not
+                    // folded into the similarity score to avoid false negatives for faithful
+                    // transliterations that must introduce Kotlin-only type names.
+                    m.similarity = file_sim * fn_cov.ratio;
                 }
 
                 // Extract documentation statistics

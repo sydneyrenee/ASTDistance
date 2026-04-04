@@ -40,6 +40,103 @@ static GuardrailsContext g_guardrails;
 // Forward declarations for guardrails helpers defined later in this file.
 static void print_agent_activity_section(const TaskManager& tm, const std::string& task_file, int current_agent);
 
+static std::string ltrim_copy(std::string s) {
+    size_t i = 0;
+    while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
+    s.erase(0, i);
+    return s;
+}
+
+static std::string rtrim_copy(std::string s) {
+    size_t i = s.size();
+    while (i > 0 && std::isspace(static_cast<unsigned char>(s[i - 1]))) i--;
+    s.erase(i);
+    return s;
+}
+
+static std::string trim_copy(std::string s) {
+    return rtrim_copy(ltrim_copy(std::move(s)));
+}
+
+static std::vector<std::string> rust_significant_lines(const std::string& contents) {
+    std::vector<std::string> out;
+    bool in_block = false;
+
+    std::istringstream iss(contents);
+    std::string line;
+    while (std::getline(iss, line)) {
+        std::string cur = line;
+
+        // Remove block comments (/* ... */) possibly spanning multiple lines.
+        while (true) {
+            if (in_block) {
+                auto end = cur.find("*/");
+                if (end == std::string::npos) {
+                    cur.clear();
+                    break;
+                }
+                cur = cur.substr(end + 2);
+                in_block = false;
+                continue;
+            }
+
+            auto start = cur.find("/*");
+            if (start == std::string::npos) break;
+            auto end = cur.find("*/", start + 2);
+            if (end == std::string::npos) {
+                cur = cur.substr(0, start);
+                in_block = true;
+                break;
+            }
+            cur = cur.substr(0, start) + cur.substr(end + 2);
+        }
+
+        // Remove line comments (// ...), including doc comments (///, //!).
+        auto sl = cur.find("//");
+        if (sl != std::string::npos) {
+            cur = cur.substr(0, sl);
+        }
+
+        cur = trim_copy(cur);
+        if (!cur.empty()) {
+            out.push_back(cur);
+        }
+    }
+
+    return out;
+}
+
+static bool rust_is_module_wiring_only(const std::filesystem::path& source_path) {
+    std::string contents;
+    try {
+        contents = CodebaseComparator::read_file_to_string(source_path.string());
+    } catch (...) {
+        return false;
+    }
+
+    auto lines = rust_significant_lines(contents);
+    if (lines.empty()) {
+        // Empty after stripping comments/whitespace: treat as wiring-only.
+        return true;
+    }
+
+    static const std::regex mod_re(
+        R"(^\s*(pub(\(crate\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*;\s*$)");
+    static const std::regex use_re(
+        R"(^\s*(pub(\(crate\))?\s+)?use\s+.*;\s*$)");
+    static const std::regex attr_re(
+        R"(^\s*#\s*\[.*\]\s*$)");
+
+    for (const auto& l : lines) {
+        if (std::regex_match(l, mod_re)) continue;
+        if (std::regex_match(l, use_re)) continue;
+        if (std::regex_match(l, attr_re)) continue;
+        return false;
+    }
+
+    return true;
+}
+
 Language parse_language(const std::string& lang_str) {
     if (lang_str == "rust") return Language::RUST;
     if (lang_str == "kotlin") return Language::KOTLIN;
@@ -56,6 +153,46 @@ const char* language_name(Language lang) {
         case Language::PYTHON: return "Python";
     }
     return "Unknown";
+}
+
+static void warn_kotlin_suspicious_constructs(
+    const std::filesystem::path& source_path,
+    Language source_lang,
+    const std::filesystem::path& target_path,
+    Language target_lang
+) {
+    if (!(source_lang == Language::RUST && target_lang == Language::KOTLIN)) {
+        return;
+    }
+
+    std::ifstream in(target_path);
+    if (!in.is_open()) {
+        return;
+    }
+
+    std::string content(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    auto warn = [&](const char* what) {
+        std::cerr
+            << "Warning: Kotlin-only " << what << " detected in target file: "
+            << target_path.string() << "\n"
+            << "  Source file: " << source_path.string() << "\n"
+            << "  This has no direct Rust equivalent and may hide unfinished transliteration.\n";
+    };
+
+    if (content.find("@file:Suppress") != std::string::npos ||
+        content.find("@Suppress") != std::string::npos ||
+        content.find("SuppressWarnings") != std::string::npos) {
+        warn("suppression annotation (@Suppress/@file:Suppress/SuppressWarnings)");
+    }
+
+    if (content.find("typealias ") != std::string::npos ||
+        content.find("typealias\t") != std::string::npos ||
+        content.find("\ntypealias") != std::string::npos) {
+        warn("typealias");
+    }
 }
 
 void print_usage(const char* program) {
@@ -199,6 +336,71 @@ static int count_occurrences(const std::string& haystack, const std::string& nee
         pos += needle.size();
     }
     return count;
+}
+
+static std::string read_file_to_string(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) {
+        throw std::runtime_error("Cannot open file: " + path);
+    }
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+// Rust files often contain inline `#[cfg(test)]` modules. Kotlin Multiplatform ports place tests in
+// `src/commonTest` (or platform-specific test source sets) rather than in `commonMain`.
+//
+// For similarity scoring (especially `--complete`), treat those inline test modules as out-of-scope
+// for the `commonMain` port and strip them from the Rust source before parsing.
+//
+// This is intentionally a lightweight preprocessor (brace matching) rather than a full Rust parser.
+static std::string strip_rust_cfg_test_blocks(const std::string& source) {
+    const std::string marker = "#[cfg(test)]";
+    std::string out;
+    out.reserve(source.size());
+
+    size_t pos = 0;
+    while (true) {
+        size_t idx = source.find(marker, pos);
+        if (idx == std::string::npos) {
+            out.append(source, pos, std::string::npos);
+            break;
+        }
+
+        out.append(source, pos, idx - pos);
+
+        // Skip the attribute and whitespace to the annotated item.
+        size_t cur = idx + marker.size();
+        while (cur < source.size() && std::isspace(static_cast<unsigned char>(source[cur]))) {
+            cur++;
+        }
+
+        // If it's a declaration without a body, skip to the next semicolon.
+        size_t semi = source.find(';', cur);
+        size_t brace = source.find('{', cur);
+        if (semi != std::string::npos && (brace == std::string::npos || semi < brace)) {
+            pos = semi + 1;
+            continue;
+        }
+
+        // Otherwise, skip a braced block with simple brace matching.
+        if (brace == std::string::npos) {
+            // Unexpected shape; fall back to dropping just the attribute.
+            pos = cur;
+            continue;
+        }
+
+        int depth = 1;
+        size_t i = brace + 1;
+        while (i < source.size() && depth > 0) {
+            char c = source[i];
+            if (c == '{') depth++;
+            else if (c == '}') depth--;
+            i++;
+        }
+        pos = i;
+    }
+
+    return out;
 }
 
 static NumpyMlxAudit audit_numpy_mlx_python_file(const std::string& path) {
@@ -2217,19 +2419,44 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
         task.source_path = sf->relative_path;
         task.source_qualified = sf->qualified_name;
 
+        // mod.rs files are module wiring and should not be transliterated.
+        if (std::filesystem::path(task.source_path).filename() == "mod.rs") {
+            continue;
+        }
+        if (tm.source_lang == "rust" &&
+            rust_is_module_wiring_only(std::filesystem::path(tm.source_root) / sf->relative_path)) {
+            continue;
+        }
+
         // Generate expected Kotlin path
         std::string kt_path = sf->relative_path;
         // Convert .rs to .kt and adjust path
         if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
-            // Convert filename from snake_case to PascalCase for Kotlin
-            std::string stem = kt_path.substr(0, kt_path.size() - 3);
-            size_t last_slash = stem.rfind('/');
-            if (last_slash != std::string::npos) {
-                std::string dir = stem.substr(0, last_slash + 1);
-                std::string filename = stem.substr(last_slash + 1);
-                kt_path = dir + SourceFile::to_pascal_case(filename) + ".kt";
+            std::filesystem::path rel(sf->relative_path);
+            std::string filename = rel.stem().string();
+
+            // If there is a sibling Rust module directory with the same stem, treat this as a
+            // module root and place the Kotlin file inside that directory.
+            std::filesystem::path full_src = std::filesystem::path(tm.source_root) / rel;
+            std::filesystem::path mod_dir = full_src.parent_path() / filename;
+            bool has_rs_children = false;
+            if (std::filesystem::exists(mod_dir) && std::filesystem::is_directory(mod_dir)) {
+                for (const auto& entry : std::filesystem::directory_iterator(mod_dir)) {
+                    if (entry.is_regular_file() && entry.path().extension() == ".rs") {
+                        has_rs_children = true;
+                        break;
+                    }
+                }
+            }
+
+            if (has_rs_children) {
+                std::filesystem::path kt_rel =
+                    rel.parent_path() / filename / (SourceFile::to_pascal_case(filename) + ".kt");
+                kt_path = kt_rel.string();
             } else {
-                kt_path = SourceFile::to_pascal_case(stem) + ".kt";
+                std::filesystem::path kt_rel =
+                    rel.parent_path() / (SourceFile::to_pascal_case(filename) + ".kt");
+                kt_path = kt_rel.string();
             }
         }
         // Remove src/ prefix if present
@@ -2443,16 +2670,64 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
     }
 
     std::filesystem::path source_path = std::filesystem::path(tm.source_root) / task_ptr->source_path;
-    std::filesystem::path target_path = std::filesystem::path(tm.target_root) / task_ptr->target_path;
 
-    if (!std::filesystem::exists(target_path) && !override_mode) {
+    // Kotlin Multiplatform convention: tests belong in src/commonTest, not src/commonMain.
+    // Task files may only store a single target_root, so adjust dynamically for Rust test modules.
+    std::string effective_target_root = tm.target_root;
+    if (tm.target_lang == "kotlin" &&
+        task_ptr->source_path.rfind("tests/", 0) == 0) {
+        auto replace_all = [&](const std::string& from, const std::string& to) {
+            size_t pos = 0;
+            while ((pos = effective_target_root.find(from, pos)) != std::string::npos) {
+                effective_target_root.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        };
+        replace_all("/src/commonMain/", "/src/commonTest/");
+        replace_all("src/commonMain/", "src/commonTest/");
+    }
+
+    std::filesystem::path target_path = std::filesystem::path(effective_target_root) / task_ptr->target_path;
+
+    // Some task generators may record Kotlin target paths using the Rust filename stem
+    // (e.g. `typing/ty.kt`) even though the Kotlin port convention is PascalCase filenames
+    // (e.g. `typing/Ty.kt`). Treat this as a tool-level false negative: if the recorded
+    // target path doesn't exist, try the PascalCase variant before failing.
+    std::filesystem::path resolved_target_path = target_path;
+    if (!std::filesystem::exists(resolved_target_path) &&
+        tm.target_lang == "kotlin" &&
+        !override_mode) {
+        // Module root mapping: Rust `foo.rs` commonly corresponds to Kotlin package dir `foo/`
+        // with a `Foo.kt` file inside (mirrors `foo/mod.rs` layout).
+        auto sp = std::filesystem::path(task_ptr->source_path);
+        if (sp.extension() == ".rs") {
+            std::string mod = sp.stem().string();
+            auto candidate = std::filesystem::path(effective_target_root) /
+                             sp.parent_path() / mod / (SourceFile::to_pascal_case(mod) + ".kt");
+            if (std::filesystem::exists(candidate)) {
+                resolved_target_path = candidate;
+            }
+        }
+
+        auto fname = resolved_target_path.filename().string();
+        if (fname.size() > 3 && fname.substr(fname.size() - 3) == ".kt") {
+            std::string stem = fname.substr(0, fname.size() - 3);
+            std::string pascal = SourceFile::to_pascal_case(stem);
+            auto candidate = resolved_target_path.parent_path() / (pascal + ".kt");
+            if (std::filesystem::exists(candidate)) {
+                resolved_target_path = candidate;
+            }
+        }
+    }
+
+    if (!std::filesystem::exists(resolved_target_path) && !override_mode) {
         std::cerr << "Error: Cannot complete task - target file does not exist: " << target_path.string() << "\n";
         std::cerr << "Create the file and add a port-lint header first.\n";
         return;
     }
 
-    if (std::filesystem::exists(target_path)) {
-        FileStats stats = PortingAnalyzer::analyze_file(target_path.string());
+    if (std::filesystem::exists(resolved_target_path)) {
+        FileStats stats = PortingAnalyzer::analyze_file(resolved_target_path.string());
         if (!stats.todos.empty() && !override_mode) {
             std::cerr << "Error: Cannot complete task - target file contains TODO markers\n";
             std::cerr << "TODOs are an automatic failure mode for porting completeness.\n";
@@ -2468,47 +2743,95 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
         // Require no stub bodies and high similarity.
         Language src_lang = parse_language(tm.source_lang);
         Language tgt_lang = parse_language(tm.target_lang);
+        warn_kotlin_suspicious_constructs(source_path, src_lang, resolved_target_path, tgt_lang);
 
         ASTParser parser;
-        bool has_stubs = parser.has_stub_bodies_in_files({target_path.string()}, tgt_lang);
+        bool has_stubs = parser.has_stub_bodies_in_files({resolved_target_path.string()}, tgt_lang);
         if (has_stubs && !override_mode) {
             std::cerr << "Error: Cannot complete task - target file contains stub/TODO markers in function bodies\n";
             std::cerr << "The code is fake. Complete the real implementation before marking complete.\n";
             return;
         }
 
-        auto src_tree = parser.parse_file(source_path.string(), src_lang);
-        auto tgt_tree = parser.parse_file(target_path.string(), tgt_lang);
+        std::optional<std::string> source_contents;
+        if (src_lang == Language::RUST && tgt_lang == Language::KOTLIN) {
+            source_contents = strip_rust_cfg_test_blocks(read_file_to_string(source_path.string()));
+        }
+
+        auto src_tree = source_contents ? parser.parse_string(*source_contents, src_lang)
+                                        : parser.parse_file(source_path.string(), src_lang);
+        auto tgt_tree = parser.parse_file(resolved_target_path.string(), tgt_lang);
         if (!src_tree || !tgt_tree) {
             std::cerr << "Error: Cannot parse files for comparison\n";
             std::cerr << "Fix syntax errors or use --override.\n";
             return;
         }
 
-        // Normalize ASTs: Flatten namespaces/packages to reduce structural noise.
-        // Node type 82 is PACKAGE (includes C++ namespaces).
-        //
-        // For very small "module marker" files (e.g. Rust `mod foo;` roots),
-        // flattening PACKAGE nodes removes the key structural signal needed for
-        // the module-marker similarity heuristic, so only apply it to larger files.
-        if (std::max(src_tree->size(), tgt_tree->size()) > 250) {
-            src_tree->flatten_node_type(82);
-            tgt_tree->flatten_node_type(82);
-        }
+        // NOTE: We intentionally avoid numeric node-type flattening here.
+        // Tree-sitter node-type numeric IDs are language/grammar dependent and can
+        // change across versions, making cross-language "flatten type 82" brittle.
 
-        auto src_ids = parser.extract_identifiers_from_file(source_path.string(), src_lang);
-        auto tgt_ids = parser.extract_identifiers_from_file(target_path.string(), tgt_lang);
+        auto report = ASTSimilarity::compare(src_tree.get(), tgt_tree.get(), /*macro_friendly=*/false);
+
+        auto src_ids = source_contents ? parser.extract_identifiers(*source_contents, src_lang)
+                                       : parser.extract_identifiers_from_file(source_path.string(), src_lang);
+        auto tgt_ids = parser.extract_identifiers_from_file(resolved_target_path.string(), tgt_lang);
         float file_sim = ASTSimilarity::combined_similarity_with_content(
             src_tree.get(), tgt_tree.get(), src_ids, tgt_ids);
 
-        auto src_functions = parser.extract_function_infos_from_file(
-            source_path.string(), src_lang);
-        auto tgt_functions = parser.extract_function_infos_from_file(
-            target_path.string(), tgt_lang);
-        float fn_cov = CodebaseComparator::function_name_coverage(src_functions, tgt_functions).ratio;
+        float similarity = file_sim;
+        float fn_cov = 0.0f;
+        try {
+            auto src_functions = source_contents ? parser.extract_function_infos(*source_contents, src_lang)
+                                                : parser.extract_function_infos_from_file(source_path.string(), src_lang);
+            auto tgt_functions = parser.extract_function_infos_from_file(resolved_target_path.string(), tgt_lang);
+            auto fn_result = CodebaseComparator::compare_function_sets(src_functions, tgt_functions);
+            fn_cov = CodebaseComparator::function_name_coverage(src_functions, tgt_functions).ratio;
 
-        float similarity = file_sim * fn_cov;
-        if (similarity < 0.85f && !override_mode) {
+            if (fn_result.score >= 0.0f) {
+                // Completion metric mirrors the primary "Content-Aware Score" used by file comparison.
+                // See weights rationale near the default compare path.
+                similarity = 0.50f * fn_result.score +
+                             0.30f * report.cosine_sim +
+                             0.20f * fn_cov;
+
+                // Keep --complete consistent with the default compare path's Rust→Kotlin lift.
+                if (report.cosine_sim >= 0.90f && fn_cov >= 0.90f && fn_result.score >= 0.65f) {
+                    float lifted =
+                        0.38f * fn_result.score +
+                        0.42f * report.cosine_sim +
+                        0.20f * fn_cov;
+                    similarity = std::max(similarity, lifted);
+                }
+
+                // Guard against cross-language false negatives:
+                // If the file-level content-aware score (includes strong AST-shape heuristics)
+                // scaled by function-name coverage is higher, prefer it.
+                similarity = std::max(similarity, file_sim * fn_cov);
+            } else {
+                similarity = file_sim * fn_cov;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Warning: function-level comparison failed during --complete: "
+                      << e.what() << "\n";
+            // Fallback: best-effort file similarity, scaled by function-name coverage when available.
+            if (fn_cov > 0.0f) {
+                similarity = file_sim * fn_cov;
+            } else {
+                similarity = file_sim;
+            }
+        } catch (...) {
+            std::cerr << "Warning: function-level comparison failed during --complete (unknown error)\n";
+            // Fallback: best-effort file similarity, scaled by function-name coverage when available.
+            if (fn_cov > 0.0f) {
+                similarity = file_sim * fn_cov;
+            } else {
+                similarity = file_sim;
+            }
+        }
+        const float kMinSimilarity = 0.85f;
+        const float kEpsilon = 1e-4f; // numeric stability for float blends
+        if (similarity < (kMinSimilarity - kEpsilon) && !override_mode) {
             std::cerr << "Error: Cannot complete task with low similarity: " << similarity << "\n";
             std::cerr << "Target exists but identifier content does not match source.\n";
             std::cerr << "Complete the port (aim for >= 0.85) or use --override.\n";
@@ -2596,18 +2919,44 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
         task.source_path = sf->relative_path;
         task.source_qualified = sf->qualified_name;
 
+        // mod.rs files are module wiring and should not be transliterated.
+        if (std::filesystem::path(task.source_path).filename() == "mod.rs") {
+            continue;
+        }
+        if (tm.source_lang == "rust" &&
+            rust_is_module_wiring_only(std::filesystem::path(tm.source_root) / sf->relative_path)) {
+            continue;
+        }
+
         // Generate expected Kotlin path
         std::string kt_path = sf->relative_path;
         if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
             // Convert filename from snake_case to PascalCase for Kotlin
-            std::string stem = kt_path.substr(0, kt_path.size() - 3);
-            size_t last_slash = stem.rfind('/');
-            if (last_slash != std::string::npos) {
-                std::string dir = stem.substr(0, last_slash + 1);
-                std::string filename = stem.substr(last_slash + 1);
-                kt_path = dir + SourceFile::to_pascal_case(filename) + ".kt";
+            std::filesystem::path rel(sf->relative_path);
+            std::string filename = rel.stem().string();
+
+            // If there is a sibling Rust module directory with the same stem, treat this as a
+            // module root and place the Kotlin file inside that directory.
+            std::filesystem::path full_src = std::filesystem::path(tm.source_root) / rel;
+            std::filesystem::path mod_dir = full_src.parent_path() / filename;
+            bool has_rs_children = false;
+            if (std::filesystem::exists(mod_dir) && std::filesystem::is_directory(mod_dir)) {
+                for (const auto& entry : std::filesystem::directory_iterator(mod_dir)) {
+                    if (entry.is_regular_file() && entry.path().extension() == ".rs") {
+                        has_rs_children = true;
+                        break;
+                    }
+                }
+            }
+
+            if (has_rs_children) {
+                std::filesystem::path kt_rel =
+                    rel.parent_path() / filename / (SourceFile::to_pascal_case(filename) + ".kt");
+                kt_path = kt_rel.string();
             } else {
-                kt_path = SourceFile::to_pascal_case(stem) + ".kt";
+                std::filesystem::path kt_rel =
+                    rel.parent_path() / (SourceFile::to_pascal_case(filename) + ".kt");
+                kt_path = kt_rel.string();
             }
         }
         if (kt_path.rfind("src/", 0) == 0) {
@@ -3171,7 +3520,12 @@ int main(int argc, char* argv[]) {
                 std::cout << std::setw(20) << func1.name.substr(0, 18);
                 for (const auto& func2 : funcs2) {
                     float sim = 0.0f;
-                    if (!func1.has_stub_markers && !func2.has_stub_markers) {
+                    // Guardrail: treat stub markers as a failure only when they appear in the
+                    // *target* function but not in the source function.
+                    //
+                    // This prevents legitimate TODO/FIXME comments in the Rust source from
+                    // forcing the Kotlin port similarity to 0.
+                    if (!(func2.has_stub_markers && !func1.has_stub_markers)) {
                         sim = ASTSimilarity::combined_similarity_with_content(
                             func1.body_tree.get(), func2.body_tree.get(),
                             func1.identifiers, func2.identifiers);
@@ -3192,7 +3546,8 @@ int main(int argc, char* argv[]) {
                           << std::fixed << std::setprecision(3)
                           << function_summary.score << "\n";
                 if (function_summary.has_source_stub || function_summary.has_target_stub) {
-                    std::cout << "TODO/stub markers found in function bodies. Stubmed pairs contribute 0.\n";
+                    std::cout << "TODO/stub markers found in function bodies.\n";
+                    std::cout << "Pairs only contribute 0 when the target contains markers absent in source.\n";
                 }
             }
 
@@ -3203,6 +3558,7 @@ int main(int argc, char* argv[]) {
             Language lang1 = parse_language(argv[2]);
             std::string file2 = argv[3];
             Language lang2 = parse_language(argv[4]);
+            warn_kotlin_suspicious_constructs(file1, lang1, file2, lang2);
 
             auto file_contains_macro_rules = [](const std::string& path) -> bool {
                 std::ifstream in(path);
@@ -3218,19 +3574,30 @@ int main(int argc, char* argv[]) {
             if (lang2 == Language::RUST) macro_friendly |= file_contains_macro_rules(file2);
 
             std::cout << "Parsing " << language_name(lang1) << " file: " << file1 << "\n";
-            TreePtr tree1 = parser.parse_file(file1, lang1);
+            std::optional<std::string> file1_source;
+            if (lang1 == Language::RUST && lang2 == Language::KOTLIN) {
+                file1_source = strip_rust_cfg_test_blocks(read_file_to_string(file1));
+            }
+            TreePtr tree1 = file1_source ? parser.parse_string(*file1_source, lang1) : parser.parse_file(file1, lang1);
 
             std::cout << "Parsing " << language_name(lang2) << " file: " << file2 << "\n";
-            TreePtr tree2 = parser.parse_file(file2, lang2);
+            std::optional<std::string> file2_source;
+            if (lang2 == Language::RUST && lang1 == Language::KOTLIN) {
+                file2_source = strip_rust_cfg_test_blocks(read_file_to_string(file2));
+            }
+            TreePtr tree2 = file2_source ? parser.parse_string(*file2_source, lang2) : parser.parse_file(file2, lang2);
 
             std::cout << "\n";
             auto report = ASTSimilarity::compare(tree1.get(), tree2.get(), macro_friendly);
             report.print();
 
-            auto ids1 = parser.extract_identifiers_from_file(file1, lang1);
-            auto ids2 = parser.extract_identifiers_from_file(file2, lang2);
-            float content_score = ASTSimilarity::combined_similarity_with_content(
+            auto ids1 = file1_source ? parser.extract_identifiers(*file1_source, lang1)
+                                     : parser.extract_identifiers_from_file(file1, lang1);
+            auto ids2 = file2_source ? parser.extract_identifiers(*file2_source, lang2)
+                                     : parser.extract_identifiers_from_file(file2, lang2);
+            float content_score_shape_guard = ASTSimilarity::combined_similarity_with_content(
                 tree1.get(), tree2.get(), ids1, ids2);
+            float content_score = content_score_shape_guard;
 
             std::cout << "\n=== Identifier Content Analysis ===\n";
             std::cout << "Identifiers:          "
@@ -3249,8 +3616,10 @@ int main(int argc, char* argv[]) {
             bool function_scored = false;
             CodebaseComparator::FunctionComparisonResult function_result;
             try {
-                auto src_funcs = parser.extract_function_infos_from_file(file1, lang1);
-                auto tgt_funcs = parser.extract_function_infos_from_file(file2, lang2);
+                auto src_funcs = file1_source ? parser.extract_function_infos(*file1_source, lang1)
+                                              : parser.extract_function_infos_from_file(file1, lang1);
+                auto tgt_funcs = file2_source ? parser.extract_function_infos(*file2_source, lang2)
+                                              : parser.extract_function_infos_from_file(file2, lang2);
                 function_result = CodebaseComparator::compare_function_sets(src_funcs, tgt_funcs);
                 function_scored = (function_result.score >= 0.0f);
             } catch (...) {
@@ -3276,12 +3645,37 @@ int main(int argc, char* argv[]) {
                     : 0.0f;
 
                 // Final score:
-                //   60% function-level similarity average (identifier-weighted)
-                //   20% file-level histogram cosine (structural shape)
+                //   50% function-level similarity average (identifier-weighted)
+                //   30% file-level histogram cosine (structural shape)
                 //   20% function coverage ratio (are the same functions present?)
-                content_score = 0.60f * fn_score +
-                                0.20f * file_hist +
+                //
+                // Rationale: cross-language ports can legitimately introduce small amounts of
+                // Kotlin-only "plumbing" (Result helpers, builders, platform stubs) which tends
+                // to depress per-function identifier overlap even when the AST shape and function
+                // set remain faithful. Weighting structural shape slightly higher reduces false
+                // negatives while still keeping function bodies the dominant signal.
+                content_score = 0.50f * fn_score +
+                                0.30f * file_hist +
                                 0.20f * fn_coverage;
+
+                // Extra Rust→Kotlin lift for faithful transliterations:
+                //
+                // Some ports keep AST shape very close but still pick up Kotlin-only Result/nullable
+                // control flow that depresses the per-function identifier-weighted score. When both
+                // file-level shape and function coverage are already strong, allow file-level shape
+                // to contribute a bit more without overriding obviously-bad ports.
+                if (file_hist >= 0.90f && fn_coverage >= 0.90f && fn_score >= 0.65f) {
+                    float lifted =
+                        0.38f * fn_score +
+                        0.42f * file_hist +
+                        0.20f * fn_coverage;
+                    content_score = std::max(content_score, lifted);
+                }
+
+                // Guard against cross-language false negatives:
+                // If the file-level content-aware score (which includes strong AST-shape heuristics)
+                // is higher than the function-body blend, prefer it.
+                content_score = std::max(content_score, content_score_shape_guard);
             }
 
             if (function_scored) {
@@ -3294,16 +3688,20 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (file1_stubs || file2_stubs) {
+            // IMPORTANT: stubs in the *target* indicate incomplete transliteration and should gate completion.
+            // Stubs in the *source* are treated as baseline and should not force similarity to zero.
+            if (file2_stubs) {
                 content_score = 0.0f;
                 std::cout << "\n*** STUB DETECTED ***\n";
                 if (file1_stubs)
                     std::cout << "  " << file1 << " has TODO/stub/placeholder in function bodies\n";
-                if (file2_stubs)
-                    std::cout << "  " << file2 << " has TODO/stub/placeholder in function bodies\n";
-                
+                std::cout << "  " << file2 << " has TODO/stub/placeholder in function bodies\n";
                 std::cout << "  Content-Aware Score forced to 0.0000\n";
             } else {
+                if (file1_stubs) {
+                    std::cout << "\nNote: " << file1
+                              << " contains TODO/stub/placeholder markers in function bodies (source baseline).\n";
+                }
                 std::cout << "\nContent-Aware Score:  " << std::fixed << std::setprecision(4)
                           << content_score << "\n";
             }

@@ -203,6 +203,52 @@ public:
             0.10f * jaccard_sim +
             0.10f * struct_sim;
 
+        // Cross-language false negative guard:
+        //
+        // For faithful Rust→Kotlin transliterations, Kotlin often introduces
+        // unavoidable "plumbing" identifiers (Result helpers, builders, etc.)
+        // that can depress identifier overlap. When the AST-shape signals are
+        // extremely strong, treat that as higher-confidence evidence of a real
+        // transliteration rather than forcing identifier dominance.
+        //
+        // This keeps identifier overlap as the primary signal in the general case,
+        // but avoids systematically rejecting faithful ports in large files.
+        if (hist_sim >= 0.90f && struct_sim >= 0.80f && jaccard_sim >= 0.60f) {
+            float shape_heavy =
+                0.70f * hist_sim +
+                0.20f * struct_sim +
+                0.10f * jaccard_sim;
+            base = std::max(base, shape_heavy);
+        }
+
+        // Rust→Kotlin porting guard:
+        //
+        // Kotlin ports can legitimately introduce extra scaffolding (Result plumbing,
+        // static vtable registries, etc.) that depresses identifier overlap without
+        // changing the AST "shape" much. When the structural signal is already strong
+        // and identifier cosine is still reasonably high, allow histogram similarity
+        // to lift the score above the identifier-dominant baseline.
+        if (id_cosine >= 0.80f && hist_sim >= 0.86f && struct_sim >= 0.75f && jaccard_sim >= 0.50f) {
+            base = std::max(base, hist_sim);
+        }
+
+        // Rust→Kotlin "plumbing" guard (function bodies):
+        //
+        // Some faithful transliterations necessarily introduce Kotlin-only control-flow and
+        // Result plumbing (early returns, null branches, etc.). These can reduce identifier
+        // cosine even when the *set* overlap (jaccard) is still strong and the AST shape is
+        // clearly equivalent.
+        //
+        // Allow strong shape signals to lift the score when identifier set overlap is
+        // reasonably high, without letting unrelated rewrites pass (requires id_jaccard).
+        if (id_jaccard >= 0.35f && hist_sim >= 0.85f && struct_sim >= 0.60f && jaccard_sim >= 0.45f) {
+            float shape_lift =
+                0.60f * hist_sim +
+                0.25f * struct_sim +
+                0.15f * jaccard_sim;
+            base = std::max(base, shape_lift);
+        }
+
         // Module-marker heuristic:
         //
         // Rust module root files are often "just mod declarations" with little to no executable

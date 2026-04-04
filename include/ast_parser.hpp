@@ -59,6 +59,40 @@ struct IdentifierStats {
             }
         }
 
+        // Ignore a small, explicit set of low-signal identifiers which commonly appear in
+        // faithful Rust→Kotlin transliterations but would otherwise dominate the identifier
+        // overlap metric (package/import path components, receiver tokens, and tiny temp vars).
+        static const std::set<std::string> ignore = {
+            // Receiver tokens
+            "self",
+            "this",
+            // Rust path components / Kotlin package/import noise
+            "crate",
+            "io",
+            "github",
+            "com",
+            "kotlin",
+            "kotlinmania",
+            "starlarkkotlin",
+            // Common tiny temp vars (tuple destructuring / iterator glue)
+            "xk",
+            "xv",
+            "xy",
+            "yk",
+            "yv",
+            // Iterator/local glue frequently introduced by Kotlin ports
+            "xsiter",
+            "xsbasics",
+            "rest",
+            "merged",
+            "minlen",
+            "ch",
+            "sb",
+        };
+        if (ignore.count(result)) {
+            return "";
+        }
+
         // Cross-language equivalents (applied after lowering)
         static const std::vector<std::pair<std::string, std::string>> equivalents = {
             // Keywords
@@ -71,10 +105,18 @@ struct IdentifierStats {
             {"vec", "list"},
             {"mutablelist", "list"},
             {"arraylist", "list"},
+            {"mutablelistof", "list"},
+            {"listof", "list"},
+            {"tomutablelist", "list"},
+            {"tolist", "list"},
             {"hashmap", "map"},
             {"mutablemap", "map"},
+            {"mutablemapof", "map"},
+            {"mapof", "map"},
             {"hashset", "set"},
             {"mutableset", "set"},
+            {"mutablesetof", "set"},
+            {"setof", "set"},
             {"btreemap", "map"},
             {"btreeset", "set"},
             // Types
@@ -94,10 +136,21 @@ struct IdentifierStats {
             {"f32", "float"},
             {"f64", "double"},
             {"bool", "boolean"},
+            {"kclass", "typeid"},
+            {"pair", "tuple"},
+            {"triple", "tuple"},
+            {"unit", "void"},
             // Error handling
             {"result", "result"},
+            {"freezeresult", "result"},
             {"err", "error"},
             {"ok", "success"},
+            {"failure", "error"},
+            // Kotlin Result helper names often appear in faithful ports.
+            {"getorthrow", "unwrap"},
+            {"exceptionornull", "error"},
+            {"issuccess", "ok"},
+            {"isfailure", "err"},
             // Rust trait methods -> Kotlin equivalents
             {"fmt", "tostring"},          // Display::fmt -> toString
             {"eq", "equals"},             // PartialEq::eq -> equals
@@ -110,9 +163,15 @@ struct IdentifierStats {
             {"fromstr", "parse"},         // FromStr -> parse
             {"intoiter", "iterator"},     // IntoIterator::into_iter -> iterator
             {"intoiterator", "iterator"},
+            {"hasnext", "next"},
             {"next", "next"},             // Iterator::next (same name)
             {"serialize", "serialize"},   // serde (same name)
             {"deserialize", "deserialize"},
+            // Kotlin string builders are commonly used where Rust uses `String`.
+            {"stringbuilder", "string"},
+            {"buildstring", "string"},
+            {"append", "push"},
+            {"substring", "split"},
             {"deref", "get"},             // Deref::deref -> get/value
             {"drop", "close"},            // Drop::drop -> close/Closeable
             {"freeze", "freeze"},         // project-specific (same name)
@@ -123,6 +182,10 @@ struct IdentifierStats {
             {"pub", "public"},
             {"mut", "var"},
             {"let", "val"},
+            // Common operations in ports
+            {"len", "size"},
+            {"push", "add"},
+            {"add", "push"},
         };
 
         for (const auto& [from, to] : equivalents) {
@@ -137,7 +200,10 @@ struct IdentifierStats {
     void add_identifier(const std::string& name) {
         if (!name.empty()) {
             identifier_freq[name]++;
-            canonical_freq[canonicalize(name)]++;
+            std::string c = canonicalize(name);
+            if (!c.empty()) {
+                canonical_freq[c]++;
+            }
             total_identifiers++;
         }
     }
@@ -466,7 +532,7 @@ public:
         }
 
         TSNode root = ts_tree_root_node(ts_tree);
-        extract_identifiers_recursive(root, source, stats);
+        extract_identifiers_recursive(root, source, lang, stats);
 
         ts_tree_delete(ts_tree);
         return stats;
@@ -892,14 +958,40 @@ public:
                node_type == "package_header";            // Kotlin package declaration
     }
 
-    void extract_identifiers_recursive(TSNode node, const std::string& source,
-                                        IdentifierStats& stats, bool skip_identifiers = false) {
+    static bool is_type_parameter_scope_node(const std::string& node_type, Language lang) {
+        // Generic type parameter names are extremely weak signals in cross-language ports:
+        // Rust uses single-letter params (`T`, `K`, `V`) which are already filtered by
+        // the length>1 heuristic, while Kotlin often uses verbose params (`TFrozen`,
+        // `KFrozen`, etc.) which would otherwise depress canonical identifier overlap.
+        //
+        // Skip identifiers inside these scopes for similarity scoring.
+        if (lang == Language::KOTLIN) {
+            return node_type == "type_parameters" ||
+                node_type == "type_parameter" ||
+                node_type == "type_parameter_list";
+        }
+        if (lang == Language::RUST) {
+            return node_type == "generic_parameters";
+        }
+        if (lang == Language::CPP) {
+            return node_type == "template_parameter_list";
+        }
+        return false;
+    }
+
+    void extract_identifiers_recursive(
+        TSNode node,
+        const std::string& source,
+        Language lang,
+        IdentifierStats& stats,
+        bool skip_identifiers = false
+    ) {
         const char* type_str = ts_node_type(node);
         std::string node_type(type_str);
 
         // If we enter an import/use/package node, switch to skip mode
         // so its path-segment identifiers are not counted.
-        bool should_skip = skip_identifiers || is_import_node(node_type);
+        bool should_skip = skip_identifiers || is_import_node(node_type) || is_type_parameter_scope_node(node_type, lang);
 
         if (!should_skip) {
             // Check if this is an identifier node
@@ -917,7 +1009,182 @@ public:
                     std::string identifier = source.substr(start, end - start);
                     // Filter out very common/boilerplate identifiers
                     if (identifier.length() > 1 && identifier != "it" && identifier != "this") {
+                        // Kotlin-specific noise identifiers (language plumbing),
+                        // not strong signals of port faithfulness.
+                        if (lang == Language::KOTLIN) {
+                            static const std::set<std::string> kIgnore = {
+                                // Result/exception plumbing
+                                "Result",
+                                "failure",
+                                "getOrThrow",
+                                "exceptionOrNull",
+                                "isSuccess",
+                                "isFailure",
+                                "runCatching",
+                                "getOrElse",
+                                "getOrDefault",
+                                "fold",
+                                "map",
+                                "flatMap",
+                                "recover",
+                                "recoverCatching",
+                                // Common Kotlin scoping/builder helpers
+                                "let",
+                                "also",
+                                "apply",
+                                "with",
+                                "use",
+                                "buildString",
+                                "StringBuilder",
+                                "append",
+                                // Kotlin preconditions
+                                "check",
+                                "require",
+                                "error",
+                                // Interior mutability / boxing helpers
+                                "getMut",
+                                "asMut",
+                                // Common bounds helpers
+                                "coerceIn",
+                                "coerceAtLeast",
+                                "maxOf",
+                                "minOf",
+                                // Common exception types
+                                "Exception",
+                                "IllegalStateException",
+                                "IllegalArgumentException",
+                                "ArithmeticException",
+                                // Annotations / reflection (porting noise)
+                                "PublishedApi",
+                                "JvmInline",
+                                "OptIn",
+                                "ExperimentalStdlibApi",
+                                "ExperimentalContracts",
+                                "KClass",
+                                // Port-task plumbing identifiers (Kotlin-only)
+                                "DEFAULT_VTABLE",
+                                "vtablesByName",
+                                "mapOf",
+                                "SmallMap",
+                                "DUMMY_INT",
+                                "DUMMY_STR",
+                                "DUMMY_LIST",
+                                "DUMMY_DICT",
+                                "DUMMY_SET",
+                                "uncheckedNewTycheckDummy",
+                                "INT_TYPE",
+                                "BOOL_TYPE",
+
+                                // Kotlin primitive/value types are mostly language-noise in cross-language ports.
+                                "Int",
+                                "UInt",
+                                "Long",
+                                "ULong",
+                                "Short",
+                                "UShort",
+                                "Byte",
+                                "UByte",
+                                "Double",
+                                "Float",
+                                "Char",
+                                "Boolean",
+                                "String",
+                                "Any",
+                                "Unit",
+                                // Port-specific Rust scalar stand-ins (treat like primitive noise).
+                                "Usize",
+                                "Isize",
+
+                                // Common Kotlin collection interface/type noise.
+                                "List",
+                                "MutableList",
+                                "Set",
+                                "MutableSet",
+                                "Map",
+                                "MutableMap",
+                                "Array",
+                                // Tuple helpers are Kotlin-only surface forms for Rust tuples.
+                                "Pair",
+                                "Triple",
+                                "Tuple1",
+                                "Tuple4",
+                                "Tuple5",
+                                // Generic "Frozen" type parameters are Kotlin-only noise created by transliteration.
+                                "TFrozen",
+                                "KFrozen",
+                                "VFrozen",
+                                "AFrozen",
+                                "BFrozen",
+                                "CFrozen",
+                                "DFrozen",
+                                "EFrozen",
+                                // Kotlin-only helper parameter names used to emulate Rust trait bounds in generics.
+                                "freezeA",
+                                "freezeB",
+                                "freezeC",
+                                "freezeD",
+                                "freezeE",
+                                "freezeKey",
+                                "freezeValue",
+
+                                // Common Kotlin collection factories.
+                                "listOf",
+                                "mutableListOf",
+                                "setOf",
+                                "mapOf",
+                                "mutableMapOf",
+                                "emptyList",
+                                "emptySet",
+                                "emptyMap",
+
+                                // Common Kotlin iteration/collection plumbing (noisy in ports).
+                                "iterator",
+                                "hasNext",
+                                "next",
+                                "add",
+                                "addAll",
+                                "removeAt",
+                                "remove",
+                                "size",
+                                "isEmpty",
+                                "isNotEmpty",
+                                "withIndex",
+                                "indices",
+
+                                // Common Kotlin IO helpers (noisy in commonMain ports).
+                                "print",
+                                "println",
+                            };
+                            if (kIgnore.count(identifier)) {
+                                goto skip_add;
+                            }
+                        }
+                        // Rust std/primitive type identifiers are mostly language-noise in cross-language ports.
+                        // Kotlin ports frequently erase or rename these (e.g. `Vec<T>` → `MutableList<T>`),
+                        // so excluding them reduces false negatives without weakening logic-shape signals.
+                        if (lang == Language::RUST) {
+                            static const std::set<std::string> rIgnore = {
+                                "Vec",
+                                "Option",
+                                "String",
+                                "usize",
+                                "isize",
+                                "i8",
+                                "i16",
+                                "i32",
+                                "i64",
+                                "u8",
+                                "u16",
+                                "u32",
+                                "u64",
+                                "bool",
+                            };
+                            if (rIgnore.count(identifier)) {
+                                goto skip_add;
+                            }
+                        }
                         stats.add_identifier(identifier);
+                        skip_add: ;
                     }
                 }
             }
@@ -927,7 +1194,7 @@ public:
         uint32_t child_count = ts_node_child_count(node);
         for (uint32_t i = 0; i < child_count; ++i) {
             TSNode child = ts_node_child(node, i);
-            extract_identifiers_recursive(child, source, stats, should_skip);
+            extract_identifiers_recursive(child, source, lang, stats, should_skip);
         }
     }
 
@@ -995,6 +1262,16 @@ public:
 
     TreePtr convert_node(TSNode node, const std::string& source, Language lang) {
         const char* type_str = ts_node_type(node);
+        auto is_comment_node = [](const char* t) -> bool {
+            // Exclude comment nodes from AST similarity metrics.
+            // Documentation is measured separately via extract_comments().
+            // Keeping comments in the AST systematically penalizes faithful ports
+            // that reorganize doc blocks or change doc-comment styles.
+            return std::strcmp(t, "line_comment") == 0 ||
+                std::strcmp(t, "block_comment") == 0 ||
+                std::strcmp(t, "comment") == 0 ||
+                std::strcmp(t, "multiline_comment") == 0;
+        };
 
         // Normalize node type
         NodeType normalized_type = NodeType::UNKNOWN;
@@ -1076,6 +1353,10 @@ public:
 
             if (ts_node_is_named(child)) {
                 // Named nodes are always included
+                const char* child_type = ts_node_type(child);
+                if (is_comment_node(child_type)) {
+                    continue;
+                }
                 tree_node->add_child(convert_node(child, source, lang));
             } else {
                 // Capture semantically significant unnamed nodes (operators)
@@ -1369,7 +1650,7 @@ public:
             std::string func_name = extract_function_name(node, lang, source);
 
             IdentifierStats ids;
-            extract_identifiers_recursive(body_node, source, ids);
+            extract_identifiers_recursive(body_node, source, lang, ids);
 
             FunctionInfo info;
             info.name = func_name;

@@ -223,16 +223,21 @@ program
       `Canonical jaccard:    ${canonicalIdentifierJaccardSimilarity(result1.identifierStats, result2.identifierStats).toFixed(4)}`,
     );
 
-    if (result1.hasStubBodies || result2.hasStubBodies) {
+    // IMPORTANT: stubs in the *target* indicate incomplete transliteration and should gate completion.
+    // Stubs in the *source* are treated as baseline and should not force similarity to zero.
+    if (result2.hasStubBodies) {
       console.log("\n*** STUB DETECTED ***");
       if (result1.hasStubBodies) {
         console.log(`  ${file1} has TODO/stub/placeholder in function bodies`);
       }
-      if (result2.hasStubBodies) {
-        console.log(`  ${file2} has TODO/stub/placeholder in function bodies`);
-      }
+      console.log(`  ${file2} has TODO/stub/placeholder in function bodies`);
       console.log("  Content-Aware Score forced to 0.0000");
     } else {
+      if (result1.hasStubBodies) {
+        console.log(
+          `\nNote: ${file1} contains TODO/stub/placeholder markers in function bodies (source baseline).`,
+        );
+      }
       console.log(`\nContent-Aware Score:  ${contentScore.toFixed(4)}`);
     }
 
