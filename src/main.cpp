@@ -10,8 +10,10 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <chrono>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -36,6 +38,40 @@ struct GuardrailsContext {
 };
 
 static GuardrailsContext g_guardrails;
+
+static std::optional<std::chrono::seconds> file_age_seconds(const std::string& path) {
+    try {
+        if (!std::filesystem::exists(path)) return std::nullopt;
+        auto ftime = std::filesystem::last_write_time(path);
+        auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            ftime - decltype(ftime)::clock::now() + std::chrono::system_clock::now());
+        auto age = std::chrono::system_clock::now() - sctp;
+        return std::chrono::duration_cast<std::chrono::seconds>(age);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+static void cull_stale_task_file_if_needed(const std::string& task_file, const std::string& mode, int agent) {
+    static constexpr auto kStaleTtl = std::chrono::minutes(20);
+
+    if (agent > 0) return;
+    if (task_file.empty()) return;
+    if (mode == "--init-tasks") return;
+
+    auto age = file_age_seconds(task_file);
+    if (!age.has_value()) return;
+    if (*age <= std::chrono::duration_cast<std::chrono::seconds>(kStaleTtl)) return;
+
+    try {
+        std::filesystem::remove(task_file);
+        std::filesystem::remove(task_file + ".lock");
+        std::cerr << "Info: stale task file removed (" << task_file << ", age " << age->count()
+                  << "s > " << std::chrono::duration_cast<std::chrono::seconds>(kStaleTtl).count() << "s).\n";
+    } catch (...) {
+        // Best-effort.
+    }
+}
 
 // Forward declarations for guardrails helpers defined later in this file.
 static void print_agent_activity_section(const TaskManager& tm, const std::string& task_file, int current_agent);
@@ -1323,17 +1359,20 @@ void generate_reports(const Codebase& source, const Codebase& target,
         std::ofstream report("high_priority_ports.md");
         report << "# High Priority Ports - Action Plan\n\n";
         
-        report << "## Top 20 Files by Impact (Priority Score = Deps × (1 - Similarity))\n\n";
-        report << "| Rank | Source | Target | Similarity | Deps | Priority |\n";
-        report << "|------|--------|--------|------------|------|----------|\n";
-        
+        report << "## Top 20 Files by Impact\n\n";
+        report << "Priority = (missing functions + missing types) × (10 + log1p(deps) × 2)"
+                  " + log1p(deps) × (1 − similarity) × 5\n\n";
+        report << "| Rank | Source | Target | Similarity | Deps | SymDeficit | Priority |\n";
+        report << "|------|--------|--------|------------|------|-----------|----------|\n";
+
         int rank = 1;
         for (const auto& m : ranked) {
             if (rank <= 20) {
-                float priority = m.source_dependents * (1.0f - m.similarity);
+                float priority = m.priority_score();
                 report << "| " << rank++ << " | `" << m.source_qualified << "` | `"
                        << m.target_qualified << "` | " << std::fixed << std::setprecision(2)
                        << m.similarity << " | " << m.source_dependents << " | "
+                       << m.symbol_deficit() << " | "
                        << std::fixed << std::setprecision(1) << priority << " |\n";
             }
         }
@@ -1404,7 +1443,21 @@ void generate_reports(const Codebase& source, const Codebase& target,
                        << ((0.85f - m.similarity) * 100.0f) << "% improvement)\n";
                 report << "- **Dependencies:** " << m.source_dependents << "\n";
                 report << "- **Priority Score:** " << std::fixed << std::setprecision(1)
-                       << (m.source_dependents * (1.0f - m.similarity)) << "\n";
+                       << m.priority_score() << "\n";
+                if (m.symbol_deficit() > 0) {
+                    report << "- **Symbol Deficit:** " << m.symbol_deficit()
+                           << " (functions: " << m.function_deficit()
+                           << ", types: " << m.type_deficit() << ")\n";
+                }
+                if (m.source_test_function_count > 0) {
+                    int missing_tests = m.source_test_function_count
+                                      - m.matched_test_function_count;
+                    if (missing_tests > 0) {
+                        report << "- **Missing Tests:** " << missing_tests << " of "
+                               << m.source_test_function_count << " `#[test]` functions"
+                               << " have no Kotlin counterpart\n";
+                    }
+                }
                 if (m.todo_count > 0) report << "- **TODOs:** " << m.todo_count << "\n";
                 report << "- **Action:** ";
                 if (m.similarity < 0.60) report << "Deep review - likely missing major functionality\n";
@@ -1748,11 +1801,22 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 
 		    int incomplete = 0;
 		    int func_gap_files = 0;
+		    int total_func_deficit = 0;
+		    int total_type_deficit = 0;
+		    int test_gap_files = 0;
+		    int total_test_deficit = 0;
 		    for (const auto& m : ranked) {
 	        if (m.similarity < 0.6) incomplete++;
-	        if (m.source_function_count > 0 &&
-	            m.matched_function_count < m.source_function_count) {
+	        if (m.function_deficit() > 0) {
 	            func_gap_files++;
+	            total_func_deficit += m.function_deficit();
+	        }
+	        total_type_deficit += m.type_deficit();
+	        int missing_tests = std::max(0,
+	            m.source_test_function_count - m.matched_test_function_count);
+	        if (missing_tests > 0) {
+	            test_gap_files++;
+	            total_test_deficit += missing_tests;
 	        }
 	    }
 
@@ -1774,7 +1838,12 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	    std::cout << "- Missing files: " << comp.unmatched_source.size() << "\n";
 	    std::cout << "- Incomplete ports (similarity < 60%): " << incomplete << "\n";
 	    std::cout << "- Stub files: " << stub_count << "\n";
-	    std::cout << "- Files missing functions: " << func_gap_files << "\n";
+	    std::cout << "- Files missing functions: " << func_gap_files
+	              << " (total deficit: " << total_func_deficit << " functions)\n";
+	    std::cout << "- Type definitions missing: " << total_type_deficit << "\n";
+	    std::cout << "- Files missing tests: " << test_gap_files
+	              << " (total deficit: " << total_test_deficit
+	              << " unported `#[test]` functions)\n";
 	    if (total_src_doc_lines > 0) {
 	        int pct = static_cast<int>(doc_coverage_pct + 0.5f);
 	        std::cout << "- Documentation coverage: " << total_tgt_doc_lines << " / "
@@ -1787,8 +1856,12 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 		        std::cout << "create missing files (highest deps first)\n";
 		    } else if (stub_count > 0) {
 		        std::cout << "replace stub files with real implementations\n";
-		    } else if (func_gap_files > 0) {
-		        std::cout << "port missing functions to reach per-file parity\n";
+		    } else if (func_gap_files > 0 || test_gap_files > 0) {
+		        std::cout << "port missing functions/tests to reach per-file parity"
+		                  << " (" << total_func_deficit << " functions, "
+		                  << total_test_deficit << " tests)\n";
+		    } else if (total_type_deficit > 0) {
+		        std::cout << "port missing type definitions\n";
 		    } else if (incomplete > 0) {
 		        std::cout << "improve incomplete ports (similarity < 60%)\n";
 		    } else if (docs_missing) {
@@ -1803,16 +1876,20 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 		              << std::setw(11) << "Similarity"
 		              << std::setw(11) << "LineRatio"
 		              << std::setw(14) << "FunctionParity"
+		              << std::setw(10) << "Tests"
 		              << std::setw(6) << "TODOs"
 		              << std::setw(6) << "Lint"
 		              << "Status\n";
-		    std::cout << std::string(90, '-') << "\n";
+		    std::cout << std::string(100, '-') << "\n";
 
 	    int shown = 0;
 	    for (const auto& m : ranked) {
-	        bool func_gap = (m.source_function_count > 0 &&
-	                         m.matched_function_count < m.source_function_count);
-	        if (m.todo_count == 0 && m.lint_count == 0 && !m.is_stub && !func_gap && m.similarity >= 0.6) {
+	        bool func_gap = (m.function_deficit() > 0);
+	        int missing_tests = std::max(0,
+	            m.source_test_function_count - m.matched_test_function_count);
+	        bool test_gap = (missing_tests > 0);
+	        if (m.todo_count == 0 && m.lint_count == 0 && !m.is_stub
+	            && !func_gap && !test_gap && m.similarity >= 0.6) {
 	            continue;  // Skip files without issues
 	        }
 	        if (shown++ >= 20) {
@@ -1824,6 +1901,7 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	        if (m.is_stub) status = "STUB";
 	        else if (m.similarity < 0.4) status = "LOW_SIM";
 	        else if (func_gap) status = "MISSING_FUNCS";
+	        else if (test_gap) status = "MISSING_TESTS";
 	        else if (m.lint_count > 0) status = "LINT";
 	        else if (m.todo_count > 0) status = "TODO";
 
@@ -1838,10 +1916,17 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	                    std::to_string(m.source_function_count);
 	        }
 
+	        std::string tests = "-";
+	        if (m.source_test_function_count > 0) {
+	            tests = std::to_string(m.matched_test_function_count) + "/" +
+	                    std::to_string(m.source_test_function_count);
+	        }
+
 		        std::cout << std::setw(30) << std::left << m.target_qualified.substr(0, 28)
 		                  << std::setw(11) << std::fixed << std::setprecision(2) << m.similarity
 		                  << std::setw(11) << std::fixed << std::setprecision(2) << ratio
 		                  << std::setw(14) << funcs
+		                  << std::setw(10) << tests
 		                  << std::setw(6) << m.todo_count
 		                  << std::setw(6) << m.lint_count
 		                  << status << "\n";
@@ -1942,8 +2027,10 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
                   << std::setw(12) << "Tgt Docs"
                   << std::setw(10) << "Gap %"
                   << std::setw(10) << "DocSim"
+                  << std::setw(10) << "DocAmt"
+                  << std::setw(10) << "DocEq"
                   << "\n";
-        std::cout << std::string(74, '-') << "\n";
+        std::cout << std::string(94, '-') << "\n";
 
         int shown_docs = 0;
         for (const auto& [gap, m] : doc_gaps) {
@@ -1952,13 +2039,15 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
                 break;
             }
 
-            std::string gap_str = std::to_string(static_cast<int>(gap * 100)) + "%";
-            std::cout << std::setw(30) << std::left << m->source_qualified.substr(0, 28)
-                      << std::setw(12) << m->source_doc_lines
-                      << std::setw(12) << m->target_doc_lines
-	                      << std::setw(10) << gap_str
-	                      << std::setw(10) << std::fixed << std::setprecision(2) << m->doc_similarity
-	                      << "\n";
+	            std::string gap_str = std::to_string(static_cast<int>(gap * 100)) + "%";
+	            std::cout << std::setw(30) << std::left << m->source_qualified.substr(0, 28)
+	                      << std::setw(12) << m->source_doc_lines
+	                      << std::setw(12) << m->target_doc_lines
+		                      << std::setw(10) << gap_str
+		                      << std::setw(10) << std::fixed << std::setprecision(2) << m->doc_similarity
+		                      << std::setw(10) << std::fixed << std::setprecision(2) << m->doc_coverage
+		                      << std::setw(10) << std::fixed << std::setprecision(2) << m->doc_weighted
+		                      << "\n";
 	        }
 	    }
 
@@ -2674,17 +2763,31 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
     // Kotlin Multiplatform convention: tests belong in src/commonTest, not src/commonMain.
     // Task files may only store a single target_root, so adjust dynamically for Rust test modules.
     std::string effective_target_root = tm.target_root;
-    if (tm.target_lang == "kotlin" &&
-        task_ptr->source_path.rfind("tests/", 0) == 0) {
-        auto replace_all = [&](const std::string& from, const std::string& to) {
-            size_t pos = 0;
-            while ((pos = effective_target_root.find(from, pos)) != std::string::npos) {
-                effective_target_root.replace(pos, from.size(), to);
-                pos += to.size();
-            }
-        };
-        replace_all("/src/commonMain/", "/src/commonTest/");
-        replace_all("src/commonMain/", "src/commonTest/");
+    bool is_test_task = false;
+    if (tm.target_lang == "kotlin") {
+        const std::string& p = task_ptr->source_path;
+
+        // Rust tests may live in:
+        // - `tests/...`
+        // - `src/tests/...`
+        // - `src/**/tests.rs` (module-level tests)
+        // - `src/tests.rs`
+        if (p == "tests.rs") is_test_task = true;
+        if (!is_test_task && p.size() >= 9 && p.compare(p.size() - 9, 9, "/tests.rs") == 0) is_test_task = true;
+        if (!is_test_task && p.find("/tests/") != std::string::npos) is_test_task = true;
+        if (!is_test_task && p.rfind("tests/", 0) == 0) is_test_task = true;
+
+        if (is_test_task) {
+            auto replace_all = [&](const std::string& from, const std::string& to) {
+                size_t pos = 0;
+                while ((pos = effective_target_root.find(from, pos)) != std::string::npos) {
+                    effective_target_root.replace(pos, from.size(), to);
+                    pos += to.size();
+                }
+            };
+            replace_all("/src/commonMain/", "/src/commonTest/");
+            replace_all("src/commonMain/", "src/commonTest/");
+        }
     }
 
     std::filesystem::path target_path = std::filesystem::path(effective_target_root) / task_ptr->target_path;
@@ -2781,12 +2884,15 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
 
         float similarity = file_sim;
         float fn_cov = 0.0f;
+        float fn_score = -1.0f;
         try {
             auto src_functions = source_contents ? parser.extract_function_infos(*source_contents, src_lang)
                                                 : parser.extract_function_infos_from_file(source_path.string(), src_lang);
             auto tgt_functions = parser.extract_function_infos_from_file(resolved_target_path.string(), tgt_lang);
             auto fn_result = CodebaseComparator::compare_function_sets(src_functions, tgt_functions);
-            fn_cov = CodebaseComparator::function_name_coverage(src_functions, tgt_functions).ratio;
+            fn_score = fn_result.score;
+            fn_cov = CodebaseComparator::function_name_coverage_with_lang(
+                src_functions, tgt_functions, src_lang, tgt_lang).ratio;
 
             if (fn_result.score >= 0.0f) {
                 // Completion metric mirrors the primary "Content-Aware Score" used by file comparison.
@@ -2808,6 +2914,18 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
                 // If the file-level content-aware score (includes strong AST-shape heuristics)
                 // scaled by function-name coverage is higher, prefer it.
                 similarity = std::max(similarity, file_sim * fn_cov);
+
+                // Additional Rust→Kotlin false-negative guard:
+                // For some small wrapper-heavy ports (traits/impl blocks), the strict
+                // content-aware file score can be depressed even when the overall AST
+                // shape and function-name parity are very strong. In those cases,
+                // allow the histogram-based cosine similarity (AST shape) scaled by
+                // function-name coverage to complete the task.
+                if (src_lang == Language::RUST && tgt_lang == Language::KOTLIN) {
+                    if (!fn_result.has_stub_mismatch && report.cosine_sim >= 0.90f && fn_cov >= 0.90f) {
+                        similarity = std::max(similarity, report.cosine_sim * fn_cov);
+                    }
+                }
             } else {
                 similarity = file_sim * fn_cov;
             }
@@ -2829,12 +2947,22 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
                 similarity = file_sim;
             }
         }
-        const float kMinSimilarity = 0.85f;
+        float kMinSimilarity = is_test_task ? 0.75f : 0.85f;
+        // Rust→Kotlin completion false-negative guard:
+        // If function-by-function similarity is strong and names fully cover, allow a small
+        // relaxation to avoid blocking on wrapper/boilerplate AST-shape mismatches.
+        if (!is_test_task &&
+            src_lang == Language::RUST &&
+            tgt_lang == Language::KOTLIN &&
+            fn_cov >= 0.99f &&
+            fn_score >= 0.75f) {
+            kMinSimilarity = 0.84f;
+        }
         const float kEpsilon = 1e-4f; // numeric stability for float blends
         if (similarity < (kMinSimilarity - kEpsilon) && !override_mode) {
             std::cerr << "Error: Cannot complete task with low similarity: " << similarity << "\n";
             std::cerr << "Target exists but identifier content does not match source.\n";
-            std::cerr << "Complete the port (aim for >= 0.85) or use --override.\n";
+            std::cerr << "Complete the port (aim for >= " << kMinSimilarity << ") or use --override.\n";
             return;
         }
     }
@@ -2863,9 +2991,11 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
 
     Codebase target(tm.target_root, tm.target_lang);
     target.scan();
+    target.extract_porting_data();  // TODOs, lint, line counts (task inclusion needs this)
 
     CodebaseComparator comp(source, target);
     comp.find_matches();
+    comp.compute_similarities();
 
     // Build set of currently assigned task qualified names
     std::set<std::string> assigned_tasks;
@@ -2892,15 +3022,22 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
     // Rebuild task list from missing files
     tm.tasks.clear();
 
-    std::vector<const SourceFile*> missing;
+    std::set<std::string> pending_keys;
     for (const auto& path : comp.unmatched_source) {
-        missing.push_back(&source.files.at(path));
+        pending_keys.insert(path);
     }
-    // Also include incomplete files
     for (const auto& m : comp.matches) {
-        if (m.similarity < 0.85) {
-            missing.push_back(&source.files.at(m.source_path));
+        bool func_gap = (m.source_function_count > 0 &&
+                         m.matched_function_count < m.source_function_count);
+        if (m.similarity < 0.85f || m.todo_count > 0 || m.lint_count > 0 || m.is_stub || func_gap) {
+            pending_keys.insert(m.source_path);
         }
+    }
+
+    std::vector<const SourceFile*> missing;
+    missing.reserve(pending_keys.size());
+    for (const auto& key : pending_keys) {
+        missing.push_back(&source.files.at(key));
     }
 
     std::sort(missing.begin(), missing.end(),
@@ -2992,6 +3129,44 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
                 task.source_path = sf.relative_path;
                 task.source_qualified = sf.qualified_name;
                 task.dependent_count = sf.dependent_count;
+                task.dependency_count = sf.dependency_count;
+
+                // Restore expected target path so future --complete/--release checks can resolve it.
+                std::string kt_path = sf.relative_path;
+                if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
+                    std::filesystem::path rel(sf.relative_path);
+                    std::string filename = rel.stem().string();
+
+                    std::filesystem::path full_src = std::filesystem::path(tm.source_root) / rel;
+                    std::filesystem::path mod_dir = full_src.parent_path() / filename;
+                    bool has_rs_children = false;
+                    if (std::filesystem::exists(mod_dir) && std::filesystem::is_directory(mod_dir)) {
+                        for (const auto& entry : std::filesystem::directory_iterator(mod_dir)) {
+                            if (entry.is_regular_file() && entry.path().extension() == ".rs") {
+                                has_rs_children = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (has_rs_children) {
+                        std::filesystem::path kt_rel =
+                            rel.parent_path() / filename / (SourceFile::to_pascal_case(filename) + ".kt");
+                        kt_path = kt_rel.string();
+                    } else {
+                        std::filesystem::path kt_rel =
+                            rel.parent_path() / (SourceFile::to_pascal_case(filename) + ".kt");
+                        kt_path = kt_rel.string();
+                    }
+                }
+                if (kt_path.rfind("src/", 0) == 0) {
+                    kt_path = kt_path.substr(4);
+                }
+                task.target_path = kt_path;
+
+                for (const auto& dep : sf.imports) {
+                    task.dependencies.push_back(dep.module_path);
+                }
                 task.status = TaskStatus::COMPLETED;
                 task.completed_at = completed_at_map[qualified];
                 tm.tasks.push_back(task);
@@ -3115,7 +3290,8 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
             source_path.string(), src_lang);
         auto tgt_functions = parser.extract_function_infos_from_file(
             target_path.string(), tgt_lang);
-        float fn_cov = CodebaseComparator::function_name_coverage(src_functions, tgt_functions).ratio;
+        float fn_cov = CodebaseComparator::function_name_coverage_with_lang(
+            src_functions, tgt_functions, src_lang, tgt_lang).ratio;
 
         similarity = file_sim * fn_cov;
 
@@ -3279,6 +3455,8 @@ int main(int argc, char* argv[]) {
     } else if (std::filesystem::exists("tasks.json")) {
         guard.task_file = "tasks.json";
     }
+
+    cull_stale_task_file_if_needed(guard.task_file, mode, agent);
 
     if (!guard.task_file.empty()) {
         TaskManager tm(guard.task_file);
@@ -3639,9 +3817,12 @@ int main(int argc, char* argv[]) {
                 // File-level histogram cosine is the most stable cross-language metric.
                 float fn_score = function_result.score;
                 float file_hist = report.cosine_sim;  // histogram cosine at file level
-                int max_funcs = std::max(function_result.source_total, function_result.target_total);
-                float fn_coverage = (max_funcs > 0)
-                    ? static_cast<float>(function_result.matched_pairs) / max_funcs
+                // Coverage should measure "does the Kotlin target cover the Rust source function set?".
+                // Kotlin ports often introduce extra helper functions (derived trait shims, Result plumbing),
+                // which should not reduce coverage as long as every source function has a faithful target.
+                float fn_coverage = (function_result.source_total > 0)
+                    ? static_cast<float>(function_result.matched_pairs) /
+                          static_cast<float>(function_result.source_total)
                     : 0.0f;
 
                 // Final score:
@@ -3761,10 +3942,26 @@ int main(int argc, char* argv[]) {
             // Bag-of-words text similarity for documentation
             float doc_cosine = comments1.doc_cosine_similarity(comments2);
             float doc_jaccard = comments1.doc_jaccard_similarity(comments2);
+
+            // Doc amount grading:
+            // - coverage: target/source doc lines, capped at 1.0 (extra docs are not penalized)
+            // - balance:  min/max doc lines (informational; does penalize extras)
+            float doc_line_cov = comments1.doc_line_coverage_capped(comments2);
+            float doc_line_bal = comments1.doc_line_balance(comments2);
+
+            // Equal-weight doc grade: similarity + amount.
+            float doc_weighted = 0.5f * doc_cosine + 0.5f * doc_line_cov;
+
             std::cout << "Doc text cosine:      " << std::fixed << std::setprecision(2)
                       << (doc_cosine * 100.0f) << "%\n";
             std::cout << "Doc text jaccard:     " << std::fixed << std::setprecision(2)
                       << (doc_jaccard * 100.0f) << "%\n";
+            std::cout << "Doc line coverage:    " << std::fixed << std::setprecision(2)
+                      << (doc_line_cov * 100.0f) << "%\n";
+            std::cout << "Doc line balance:     " << std::fixed << std::setprecision(2)
+                      << (doc_line_bal * 100.0f) << "%\n";
+            std::cout << "Doc weighted (eq):    " << std::fixed << std::setprecision(2)
+                      << (doc_weighted * 100.0f) << "%\n";
             std::cout << "Unique doc words:     " << comments1.word_freq.size()
                       << " vs " << comments2.word_freq.size() << "\n";
 
