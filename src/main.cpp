@@ -1249,7 +1249,7 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "These files are well-ported and likely complete:\n\n";
         int shown = 0;
         for (const auto& m : ranked) {
-            if (m.similarity >= 0.85 && shown++ < 15) {
+            if (!m.is_stub && m.similarity >= 0.85 && shown++ < 15) {
                 report << "- `" << m.target_qualified << "` (" << std::fixed << std::setprecision(2)
                        << m.similarity << ", " << m.source_dependents << " deps)\n";
             }

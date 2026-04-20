@@ -1543,8 +1543,9 @@ public:
 	                            std::to_string(m.source_type_count);
 	                }
 	                float priority = m.priority_score();
-		                std::cout << std::setw(30) << std::left << m.source_qualified.substr(0, 28)
-		                          << std::setw(30) << m.target_qualified.substr(0, 28)
+		                std::string stub_flag = m.is_stub ? " [STUB]" : "";
+	                std::cout << std::setw(30) << std::left << m.source_qualified.substr(0, 28)
+		                          << std::setw(30) << (m.target_qualified.substr(0, 28) + stub_flag)
 		                          << std::setw(10) << std::fixed << std::setprecision(2) << m.similarity
 		                          << std::setw(11) << m.source_dependents
 		                          << std::setw(14) << funcs
