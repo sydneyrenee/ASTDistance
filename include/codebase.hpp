@@ -112,6 +112,22 @@ struct SourceFile {
         return result;
     }
 
+    static std::string to_kebab_case(const std::string& name) {
+        std::string result;
+        for (size_t i = 0; i < name.length(); ++i) {
+            char c = name[i];
+            if (c == '_') {
+                result += '-';
+            } else if (std::isupper(c) && i > 0 && name[i-1] != '-' && name[i-1] != '_') {
+                result += '-';
+                result += std::tolower(c);
+            } else {
+                result += std::tolower(c);
+            }
+        }
+        return result;
+    }
+
     /**
      * Convert snake_case to PascalCase for Kotlin filename generation.
      * Example: "value" -> "Value", "my_file_name" -> "MyFileName"
@@ -188,6 +204,8 @@ public:
                        path.ends_with(".cc") || path.ends_with(".h");
             } else if (language == "python") {
                 return path.ends_with(".py");
+            } else if (language == "typescript") {
+                return path.ends_with(".ts") || path.ends_with(".tsx");
             }
             return false;
         };
@@ -240,11 +258,13 @@ public:
                 std::string path = entry.path().string();
                 if (!has_valid_ext(path)) continue;
 
-                // Skip build artifacts (but NOT test files - they need parity too)
+                // Skip build artifacts and dependencies
                 if (path.find("/target/") != std::string::npos ||
                     path.find("/build/") != std::string::npos ||
                     path.find("/build_") != std::string::npos ||
-                    path.find("/_deps/") != std::string::npos) {
+                    path.find("/_deps/") != std::string::npos ||
+                    path.find("/node_modules/") != std::string::npos ||
+                    path.find("/vendor/") != std::string::npos) {
                     continue;
                 }
 
@@ -981,6 +1001,7 @@ public:
         if (lang == "kotlin") return Language::KOTLIN;
         if (lang == "cpp") return Language::CPP;
         if (lang == "python") return Language::PYTHON;
+        if (lang == "typescript") return Language::TYPESCRIPT;
         return Language::KOTLIN;  // default
     }
 
@@ -1396,10 +1417,16 @@ public:
         TSParser* symbol_tgt = ts_parser_new();
         if (source.language == "rust") {
             ts_parser_set_language(symbol_src, tree_sitter_rust());
+        } else if (source.language == "typescript") {
+            ts_parser_set_language(symbol_src, tree_sitter_typescript());
         } else {
             ts_parser_set_language(symbol_src, tree_sitter_cpp());
         }
-        ts_parser_set_language(symbol_tgt, tree_sitter_kotlin());
+        if (target.language == "typescript") {
+            ts_parser_set_language(symbol_tgt, tree_sitter_typescript());
+        } else {
+            ts_parser_set_language(symbol_tgt, tree_sitter_kotlin());
+        }
 
         for (auto& m : matches) {
             try {

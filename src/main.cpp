@@ -178,7 +178,8 @@ Language parse_language(const std::string& lang_str) {
     if (lang_str == "kotlin") return Language::KOTLIN;
     if (lang_str == "cpp") return Language::CPP;
     if (lang_str == "python") return Language::PYTHON;
-    throw std::runtime_error("Unknown language: " + lang_str + " (use rust, kotlin, cpp, or python)");
+    if (lang_str == "typescript" || lang_str == "ts") return Language::TYPESCRIPT;
+    throw std::runtime_error("Unknown language: " + lang_str + " (use rust, kotlin, cpp, python, or typescript)");
 }
 
 const char* language_name(Language lang) {
@@ -187,6 +188,7 @@ const char* language_name(Language lang) {
         case Language::KOTLIN: return "Kotlin";
         case Language::CPP: return "C++";
         case Language::PYTHON: return "Python";
+        case Language::TYPESCRIPT: return "TypeScript";
     }
     return "Unknown";
 }
@@ -240,11 +242,11 @@ void print_usage(const char* program) {
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare functions between files with similarity matrix\n\n";
-    std::cerr << "  " << program << " --dump <file> <rust|kotlin|cpp|python>\n";
+    std::cerr << "  " << program << " --dump <file> <rust|kotlin|cpp|python|typescript>\n";
     std::cerr << "      Dump AST structure of a file\n\n";
-    std::cerr << "  " << program << " --scan <directory> <rust|kotlin|cpp|python>\n";
+    std::cerr << "  " << program << " --scan <directory> <rust|kotlin|cpp|python|typescript>\n";
     std::cerr << "      Scan directory and show file list with import counts\n\n";
-    std::cerr << "  " << program << " --deps <directory> <rust|kotlin|cpp|python>\n";
+    std::cerr << "  " << program << " --deps <directory> <rust|kotlin|cpp|python|typescript>\n";
     std::cerr << "      Build and show dependency graph\n\n";
     std::cerr << "  " << program << " --rank <src_dir> <src_lang> <tgt_dir> <tgt_lang>\n";
     std::cerr << "      Rank files by porting priority (dependents + similarity)\n\n";
@@ -309,7 +311,7 @@ void print_usage(const char* program) {
     std::cerr << "      Mark a task as completed\n\n";
     std::cerr << "  " << program << " --release <task_file> <source_qualified>\n";
     std::cerr << "      Release an assigned task back to pending\n\n";
-    std::cerr << "  Languages: rust, kotlin, cpp, python\n\n";
+    std::cerr << "  Languages: rust, kotlin, cpp, python, typescript\n\n";
     std::cerr << "Port-Lint Headers:\n";
     std::cerr << "  Add a header comment to each ported file to enable accurate source tracking.\n";
     std::cerr << "  This allows --deep analysis to match files by explicit declaration rather\n";
@@ -2548,10 +2550,14 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
             continue;
         }
 
-        // Generate expected Kotlin path
+        // Generate expected target path
         std::string kt_path = sf->relative_path;
-        // Convert .rs to .kt and adjust path
-        if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
+        if (tm.target_lang == "typescript") {
+            std::filesystem::path rel(sf->relative_path);
+            std::string filename = rel.stem().string();
+            std::filesystem::path expected_rel = rel.parent_path() / (SourceFile::to_kebab_case(filename) + ".ts");
+            kt_path = expected_rel.string();
+        } else if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
             std::filesystem::path rel(sf->relative_path);
             std::string filename = rel.stem().string();
 
@@ -2582,6 +2588,8 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
         // Remove src/ prefix if present
         if (kt_path.rfind("src/", 0) == 0) {
             kt_path = kt_path.substr(4);
+        } else if (kt_path.rfind("include/", 0) == 0) {
+            kt_path = kt_path.substr(8);
         }
         task.target_path = kt_path;
         task.dependent_count = sf->dependent_count;
@@ -3096,9 +3104,14 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
             continue;
         }
 
-        // Generate expected Kotlin path
+        // Generate expected target path
         std::string kt_path = sf->relative_path;
-        if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
+        if (tm.target_lang == "typescript") {
+            std::filesystem::path rel(sf->relative_path);
+            std::string filename = rel.stem().string();
+            std::filesystem::path expected_rel = rel.parent_path() / (SourceFile::to_kebab_case(filename) + ".ts");
+            kt_path = expected_rel.string();
+        } else if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
             // Convert filename from snake_case to PascalCase for Kotlin
             std::filesystem::path rel(sf->relative_path);
             std::string filename = rel.stem().string();
@@ -3129,6 +3142,8 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
         }
         if (kt_path.rfind("src/", 0) == 0) {
             kt_path = kt_path.substr(4);
+        } else if (kt_path.rfind("include/", 0) == 0) {
+            kt_path = kt_path.substr(8);
         }
         task.target_path = kt_path;
         task.dependent_count = sf->dependent_count;
@@ -3164,7 +3179,12 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
 
                 // Restore expected target path so future --complete/--release checks can resolve it.
                 std::string kt_path = sf.relative_path;
-                if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
+                if (tm.target_lang == "typescript") {
+                    std::filesystem::path rel(sf.relative_path);
+                    std::string filename = rel.stem().string();
+                    std::filesystem::path expected_rel = rel.parent_path() / (SourceFile::to_kebab_case(filename) + ".ts");
+                    kt_path = expected_rel.string();
+                } else if (kt_path.size() > 3 && kt_path.substr(kt_path.size() - 3) == ".rs") {
                     std::filesystem::path rel(sf.relative_path);
                     std::string filename = rel.stem().string();
 
@@ -3192,6 +3212,8 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
                 }
                 if (kt_path.rfind("src/", 0) == 0) {
                     kt_path = kt_path.substr(4);
+                } else if (kt_path.rfind("include/", 0) == 0) {
+                    kt_path = kt_path.substr(8);
                 }
                 task.target_path = kt_path;
 
@@ -3583,7 +3605,23 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "--symbol-parity" && argc >= 4) {
             SymbolParityOptions options;
-            for (int i = 4; i < argc; ++i) {
+            std::string src_root = argv[2];
+            std::string tgt_root = argv[3];
+            int arg_start = 4;
+
+            // Optional: --symbol-parity <src_root> <src_lang> <tgt_root> <tgt_lang>
+            if (argc >= 6 && argv[4][0] != '-') {
+                options.source_lang = parse_language(argv[3]);
+                tgt_root = argv[4];
+                options.target_lang = parse_language(argv[5]);
+                arg_start = 6;
+            } else {
+                // Auto-detect based on file extensions in roots or defaults
+                options.source_lang = Language::RUST;
+                options.target_lang = Language::KOTLIN;
+            }
+
+            for (int i = arg_start; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--json") {
                     options.json = true;
@@ -3599,7 +3637,7 @@ int main(int argc, char* argv[]) {
                     options.filter_file = argv[++i];
                 }
             }
-            cmd_symbol_parity(argv[2], argv[3], options);
+            cmd_symbol_parity(src_root, tgt_root, options);
 
         } else if (mode == "--import-map" && argc >= 3) {
             ImportMapOptions options;
@@ -3655,6 +3693,16 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "--release" && argc >= 4) {
             cmd_release(argv[2], argv[3], agent, override_mode);
+
+        } else if (mode == "--dump-node" && argc >= 4) {
+            ASTParser parser;
+            std::string filepath = argv[2];
+            Language lang = parse_language(argv[3]);
+            TreePtr tree = parser.parse_file(filepath, lang);
+            if (tree) {
+                dump_tree(tree.get(), 0);
+            }
+            return 0;
 
         } else if (mode == "--dump" && argc >= 4) {
             ASTParser parser;

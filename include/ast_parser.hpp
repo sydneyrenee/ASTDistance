@@ -19,6 +19,7 @@ extern "C" {
     const TSLanguage* tree_sitter_kotlin();
     const TSLanguage* tree_sitter_cpp();
     const TSLanguage* tree_sitter_python();
+    const TSLanguage* tree_sitter_typescript();
 }
 
 namespace ast_distance {
@@ -27,7 +28,8 @@ enum class Language {
     RUST,
     KOTLIN,
     CPP,
-    PYTHON
+    PYTHON,
+    TYPESCRIPT
 };
 
 /**
@@ -503,6 +505,7 @@ public:
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
             case Language::PYTHON: ts_lang = tree_sitter_python(); break;
+            case Language::TYPESCRIPT: ts_lang = tree_sitter_typescript(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -538,6 +541,7 @@ public:
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
             case Language::PYTHON: ts_lang = tree_sitter_python(); break;
+            case Language::TYPESCRIPT: ts_lang = tree_sitter_typescript(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -593,6 +597,7 @@ public:
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
             case Language::PYTHON: ts_lang = tree_sitter_python(); break;
+            case Language::TYPESCRIPT: ts_lang = tree_sitter_typescript(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -665,6 +670,7 @@ public:
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
             case Language::PYTHON: ts_lang = tree_sitter_python(); break;
+            case Language::TYPESCRIPT: ts_lang = tree_sitter_typescript(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) {
@@ -852,6 +858,7 @@ public:
             case Language::KOTLIN: ts_lang = tree_sitter_kotlin(); break;
             case Language::CPP: ts_lang = tree_sitter_cpp(); break;
             case Language::PYTHON: ts_lang = tree_sitter_python(); break;
+            case Language::TYPESCRIPT: ts_lang = tree_sitter_typescript(); break;
         }
 
         if (!ts_parser_set_language(parser_, ts_lang)) return false;
@@ -985,6 +992,10 @@ public:
         } else if (lang == Language::PYTHON) {
             is_comment = (type_s == "comment");
             is_line_comment = is_comment;
+        } else if (lang == Language::TYPESCRIPT) {
+            is_line_comment = (type_s == "comment");
+            is_block_comment = (type_s == "comment");
+            is_comment = (type_s == "comment");
         }
 
         if (is_comment) {
@@ -1030,6 +1041,8 @@ public:
                 // Python has no standardized doc-comment syntax.
                 // Docstrings are AST string nodes, not comment nodes.
                 is_doc_comment = false;
+            } else if (lang == Language::TYPESCRIPT) {
+                is_doc_comment = (text.find("/**") == 0);
             }
 
             if (is_doc_comment) {
@@ -1071,6 +1084,7 @@ public:
                node_type == "import_statement" ||        // Python
                node_type == "preproc_include" ||         // C++
                node_type == "using_declaration" ||       // C++
+               node_type == "import_declaration" ||      // TypeScript
                node_type == "package_header";            // Kotlin package declaration
     }
 
@@ -1091,6 +1105,9 @@ public:
         }
         if (lang == Language::CPP) {
             return node_type == "template_parameter_list";
+        }
+        if (lang == Language::TYPESCRIPT) {
+            return node_type == "type_parameters";
         }
         return false;
     }
@@ -1490,6 +1507,7 @@ public:
             case Language::KOTLIN: normalized_type = kotlin_node_to_type(type_str); break;
             case Language::CPP: normalized_type = cpp_node_to_type(type_str); break;
             case Language::PYTHON: normalized_type = python_node_to_type(type_str); break;
+            case Language::TYPESCRIPT: normalized_type = typescript_node_to_type(type_str); break;
         }
 
         // Special-case: Rust `impl Trait for Type { ... }` blocks.
@@ -1666,7 +1684,10 @@ public:
             (lang == Language::KOTLIN && type_s == "function_declaration") ||
             (lang == Language::CPP &&
              (type_s == "function_definition" || type_s == "function_declarator")) ||
-            (lang == Language::PYTHON && type_s == "function_definition");
+            (lang == Language::PYTHON && type_s == "function_definition") ||
+            (lang == Language::TYPESCRIPT &&
+             (type_s == "function_declaration" || type_s == "method_definition" ||
+              type_s == "function_expression" || type_s == "arrow_function"));
     }
 
     /**
@@ -1787,11 +1808,37 @@ public:
                 (lang == Language::KOTLIN && ct == "simple_identifier") ||
                 (lang == Language::CPP &&
                     (ct == "identifier" || ct == "field_identifier")) ||
-                (lang == Language::PYTHON && ct == "identifier")) {
+                (lang == Language::PYTHON && ct == "identifier") ||
+                (lang == Language::TYPESCRIPT &&
+                    (ct == "identifier" || ct == "property_identifier"))) {
                 uint32_t start = ts_node_start_byte(child);
                 uint32_t end = ts_node_end_byte(child);
                 if (end > start && end <= source.length()) {
-                    return source.substr(start, end - start);
+                    std::string name = source.substr(start, end - start);
+                    // Canonicalize TypeScript constructor to Python __init__ for parity
+                    if (lang == Language::TYPESCRIPT && name == "constructor") {
+                        return "__init__";
+                    }
+                    return name;
+                }
+            }
+        }
+
+        // Special-case: TypeScript arrow functions and function expressions
+        // often get their names from the parent (e.g., const name = () => { ... })
+        if (lang == Language::TYPESCRIPT) {
+            TSNode parent = ts_node_parent(node);
+            if (!ts_node_is_null(parent)) {
+                std::string pt(ts_node_type(parent));
+                if (pt == "variable_declarator" || pt == "property_definition") {
+                    TSNode name_node = ts_node_child_by_field_name(parent, "name", 4);
+                    if (!ts_node_is_null(name_node)) {
+                        uint32_t start = ts_node_start_byte(name_node);
+                        uint32_t end = ts_node_end_byte(name_node);
+                        if (end > start && end <= source.length()) {
+                            return source.substr(start, end - start);
+                        }
+                    }
                 }
             }
         }
@@ -1824,6 +1871,7 @@ public:
             "expression_body",
             "body",
             "block",
+            "statement_block",
             "compound_statement"
         };
 
@@ -1912,7 +1960,7 @@ public:
                         }
                     }
                 }
-            } else if (lang == Language::KOTLIN) {
+            } else if (lang == Language::KOTLIN || lang == Language::TYPESCRIPT) {
                 if (current_type == "simple_identifier" ||
                     current_type == "type_identifier" ||
                     current_type == "identifier") {
@@ -1920,8 +1968,39 @@ public:
                     uint32_t end = ts_node_end_byte(current);
                     if (end > start && end <= source.length()) {
                         std::string text = source.substr(start, end - start);
-                        if (text == "TODO" || text == "NotImplementedError") {
+                        if (text == "TODO" || text == "NotImplementedError" ||
+                            (lang == Language::TYPESCRIPT && text == "undefined")) {
                             return true;
+                        }
+                    }
+                }
+
+                // TypeScript: throw new Error("unimplemented")
+                if (lang == Language::TYPESCRIPT && current_type == "throw_statement") {
+                    uint32_t start = ts_node_start_byte(current);
+                    uint32_t end = ts_node_end_byte(current);
+                    if (end > start && end <= source.length()) {
+                        std::string text = source.substr(start, end - start);
+                        if (text.find("not implemented") != std::string::npos ||
+                            text.find("unimplemented") != std::string::npos ||
+                            text.find("TODO") != std::string::npos) {
+                            return true;
+                        }
+                    }
+                }
+
+                // TypeScript: console.warn("TODO"...)
+                if (lang == Language::TYPESCRIPT && current_type == "call_expression") {
+                    uint32_t start = ts_node_start_byte(current);
+                    uint32_t end = ts_node_end_byte(current);
+                    if (end > start && end <= source.length()) {
+                        std::string text = source.substr(start, end - start);
+                        if (text.find("console.warn") != std::string::npos ||
+                            text.find("console.error") != std::string::npos) {
+                            if (text.find("TODO") != std::string::npos ||
+                                text.find("unimplemented") != std::string::npos) {
+                                return true;
+                            }
                         }
                     }
                 }
