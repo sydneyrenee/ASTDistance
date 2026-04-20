@@ -898,7 +898,9 @@ public:
     bool has_stub_bodies_in_files(const std::vector<std::string>& filepaths, Language lang) {
         for (const auto& filepath : filepaths) {
             std::ifstream file(filepath);
-            if (!file.is_open()) continue;
+            // Fail-safe: an unreadable file cannot be verified as complete.
+            // Treat it as a stub rather than silently passing it.
+            if (!file.is_open()) return true;
             std::stringstream buf;
             buf << file.rdbuf();
             if (has_stub_bodies(buf.str(), lang)) return true;

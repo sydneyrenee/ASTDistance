@@ -1192,17 +1192,21 @@ void generate_reports(const Codebase& source, const Codebase& target,
     int matched = comp.matches.size();
     float completion_pct = (static_cast<float>(matched) / static_cast<float>(total_source)) * 100.0f;
     
-    // Count quality distribution
+    // Count quality distribution. Stubs are always critical regardless of
+    // whatever similarity score they carry, and are excluded from the average.
     int excellent = 0, good = 0, critical = 0;
     float avg_similarity = 0.0f;
+    int avg_count = 0;
     for (const auto& m : comp.matches) {
+        if (m.is_stub) { critical++; continue; }
         avg_similarity += m.similarity;
+        avg_count++;
         if (m.similarity >= 0.85) excellent++;
         else if (m.similarity >= 0.60) good++;
         else critical++;
     }
-    if (!comp.matches.empty()) {
-        avg_similarity /= comp.matches.size();
+    if (avg_count > 0) {
+        avg_similarity /= avg_count;
     }
     
     // Get current date/time as string
@@ -2068,6 +2072,7 @@ void cmd_missing(const std::string& src_dir, const std::string& src_lang,
 
     CodebaseComparator comp(source, target);
     comp.find_matches();
+    comp.compute_similarities();
 
     std::cout << "=== Missing from " << tgt_lang << " (ranked by dependents) ===\n\n";
     std::cout << std::setw(40) << std::left << "Source File"
@@ -2091,7 +2096,33 @@ void cmd_missing(const std::string& src_dir, const std::string& src_lang,
                   << sf->relative_path << "\n";
     }
 
-    std::cout << "\nTotal: " << missing.size() << " files missing\n";
+    // Matched-but-stub files are not missing in the structural sense but are
+    // incomplete ports. Show them separately so they don't hide in the matched set.
+    std::vector<const CodebaseComparator::Match*> stub_matches;
+    for (const auto& m : comp.matches) {
+        if (m.is_stub) stub_matches.push_back(&m);
+    }
+    if (!stub_matches.empty()) {
+        std::sort(stub_matches.begin(), stub_matches.end(),
+            [&](const CodebaseComparator::Match* a, const CodebaseComparator::Match* b) {
+                return source.files.at(a->source_path).dependent_count >
+                       source.files.at(b->source_path).dependent_count;
+            });
+        std::cout << "\n=== Matched but STUB (port exists, needs real implementation) ===\n\n";
+        std::cout << std::setw(40) << std::left << "Source File"
+                  << std::setw(10) << "Deps"
+                  << "Target\n";
+        std::cout << std::string(80, '-') << "\n";
+        for (const auto* m : stub_matches) {
+            const auto& sf = source.files.at(m->source_path);
+            std::cout << std::setw(40) << std::left << sf.qualified_name.substr(0, 38)
+                      << std::setw(10) << sf.dependent_count
+                      << m->target_path << "\n";
+        }
+        std::cout << "\nTotal stubs: " << stub_matches.size() << "\n";
+    }
+
+    std::cout << "\nTotal missing: " << missing.size() << "\n";
 }
 
 void cmd_todos(const std::string& directory, bool verbose = true) {
