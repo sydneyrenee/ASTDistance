@@ -819,8 +819,33 @@ public:
      * Check if a source file has stub/TODO markers inside function bodies.
      * Returns true if any function body contains these markers.
      * File-level comments are ignored — only code that's pretending to be real.
+     *
+     * Kotlin files with a port-lint header pointing to a module-root file are
+     * always stubs. mod.rs is Rust's module declaration syntax; lib.rs/main.rs
+     * are crate roots; __init__.py is a Python package marker. None have a
+     * Kotlin equivalent. Porting them produces files that carry the source
+     * language's namespace structure into Kotlin where it doesn't belong.
+     * JS/TS index files are intentionally NOT in this list — they contain real
+     * implementation code and must be ported normally.
      */
     bool has_stub_bodies(const std::string& source, Language lang) {
+        if (lang == Language::KOTLIN) {
+            const size_t scan_len = std::min<size_t>(source.size(), 256);
+            const std::string header = source.substr(0, scan_len);
+            const std::string port_lint = "// port-lint: source";
+            auto pos = header.find(port_lint);
+            if (pos != std::string::npos) {
+                auto eol = header.find('\n', pos);
+                std::string line = header.substr(pos, eol == std::string::npos ? std::string::npos : eol - pos);
+                static const std::vector<std::string> module_roots = {
+                    "/mod.rs", "/lib.rs", "/main.rs", "/__init__.py",
+                };
+                for (const auto& root : module_roots) {
+                    if (line.find(root) != std::string::npos) return true;
+                }
+            }
+        }
+
         const TSLanguage* ts_lang;
         switch (lang) {
             case Language::RUST: ts_lang = tree_sitter_rust(); break;

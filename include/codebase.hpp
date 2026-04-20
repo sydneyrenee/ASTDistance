@@ -945,9 +945,24 @@ public:
             matched_targets.insert(tgt_path);
         }
 
-        // Find unmatched
+        // Find unmatched. Skip module-root files that are purely declarative
+        // namespace/export wiring with no Kotlin equivalent:
+        //   Rust:   mod.rs (module declaration), lib.rs / main.rs (crate roots)
+        //   Python: __init__.py (package marker)
+        // JS/TS index files are intentionally NOT excluded: index.ts files
+        // contain real implementation code and must be ported.
+        auto is_module_root_path = [](const std::string& p) -> bool {
+            auto ends_with = [&](const std::string& suffix) {
+                return p.size() >= suffix.size() &&
+                       p.compare(p.size() - suffix.size(), suffix.size(), suffix) == 0;
+            };
+            return ends_with("/mod.rs")      || ends_with("\\mod.rs")  ||
+                   ends_with("/lib.rs")      || ends_with("\\lib.rs")  ||
+                   ends_with("/main.rs")     || ends_with("\\main.rs") ||
+                   ends_with("/__init__.py") || ends_with("\\__init__.py");
+        };
         for (const auto& [src_path, _] : source.files) {
-            if (!matched_sources.count(src_path)) {
+            if (!matched_sources.count(src_path) && !is_module_root_path(src_path)) {
                 unmatched_source.push_back(src_path);
             }
         }
