@@ -527,8 +527,14 @@ def cmd_compare(file1: str, lang1: str, file2: str, lang2: str) -> None:
 
     doc_cosine = comments1.doc_cosine_similarity(comments2)
     doc_jaccard = comments1.doc_jaccard_similarity(comments2)
+    doc_line_cov = comments1.doc_line_coverage_capped(comments2)
+    doc_line_bal = comments1.doc_line_balance(comments2)
+    doc_weighted = 0.5 * doc_cosine + 0.5 * doc_line_cov
     print(f"Doc text cosine:  {doc_cosine * 100:.0f}%")
     print(f"Doc text jaccard: {doc_jaccard * 100:.0f}%")
+    print(f"Doc line coverage: {doc_line_cov * 100:.0f}%")
+    print(f"Doc line balance:  {doc_line_bal * 100:.0f}%")
+    print(f"Doc weighted (eq): {doc_weighted * 100:.0f}%")
 
 
 def cmd_dump(filepath: str, lang_str: str) -> None:
@@ -868,10 +874,13 @@ def cmd_deep(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> dict:
     print(f"Files with >20% doc gap: {len(doc_gaps)}\n")
 
     if doc_gaps:
-        print(f"{'File':<30} {'Src Docs':>10} {'Tgt Docs':>10} {'Gap %':>8} {'DocSim':>8}")
-        print("-" * 74)
+        print(f"{'File':<30} {'Src Docs':>10} {'Tgt Docs':>10} {'Gap %':>8} {'DocSim':>8} {'DocAmt':>8} {'DocEq':>8}")
+        print("-" * 98)
         for gap, m in doc_gaps[:25]:
-            print(f"{m.source_qualified[:28]:<30} {m.source_doc_lines:>10} {m.target_doc_lines:>10} {int(gap * 100):>7}% {m.doc_similarity:>7.2f}")
+            print(
+                f"{m.source_qualified[:28]:<30} {m.source_doc_lines:>10} {m.target_doc_lines:>10} "
+                f"{int(gap * 100):>7}% {m.doc_similarity:>7.2f} {m.doc_coverage:>7.2f} {m.doc_weighted:>7.2f}"
+            )
         if len(doc_gaps) > 25:
             print(f"... and {len(doc_gaps) - 25} more files with doc gaps")
     else:

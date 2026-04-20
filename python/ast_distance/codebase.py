@@ -400,6 +400,8 @@ class CodebaseComparator:
             self.source_doc_comments: int = 0
             self.target_doc_comments: int = 0
             self.doc_similarity: float = 0.0
+            self.doc_coverage: float = 1.0
+            self.doc_weighted: float = 0.0
 
         def doc_gap_ratio(self) -> float:
             if self.source_doc_lines == 0:
@@ -753,6 +755,8 @@ class CodebaseComparator:
                 m.source_doc_comments = src_docs.doc_comment_count
                 m.target_doc_comments = tgt_docs.doc_comment_count
                 m.doc_similarity = src_docs.doc_cosine_similarity(tgt_docs)
+                m.doc_coverage = src_docs.doc_line_coverage_capped(tgt_docs)
+                m.doc_weighted = 0.5 * m.doc_similarity + 0.5 * m.doc_coverage
                 
             except Exception:
                 m.similarity = -1.0

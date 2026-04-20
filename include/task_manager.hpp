@@ -406,9 +406,20 @@ public:
 
         std::cout << "Target File:\n";
         std::cout << "  Path:      " << effective_target_root() << "/" << task.target_path << "\n";
+        std::string port_lint_path = task.source_path;
+        auto ends_with = [](const std::string& s, const std::string& suffix) -> bool {
+            return s.size() >= suffix.size() &&
+                   s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        if (ends_with(source_root, "/src") || ends_with(source_root, "/src/") ||
+            ends_with(source_root, "\\src") || ends_with(source_root, "\\src\\")) {
+            if (port_lint_path.rfind("src/", 0) != 0 && port_lint_path.rfind("src\\", 0) != 0) {
+                port_lint_path = "src/" + port_lint_path;
+            }
+        }
         std::cout << "  Add header: " << port_lint_comment_prefix(target_lang)
                   << " port-lint: " << (is_test_task() ? "tests " : "source ")
-                  << task.source_path << "\n\n";
+                  << port_lint_path << "\n\n";
 
         std::cout << "Priority: " << task.dependent_count << " (higher = more critical)\n\n";
 

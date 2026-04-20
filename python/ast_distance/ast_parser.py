@@ -361,6 +361,22 @@ class CommentStats:
             return 0.0
         return self.total_doc_lines / self.total_comment_lines
 
+    def doc_line_coverage_capped(self, other: CommentStats) -> float:
+        """Asymmetric doc amount coverage (target/source doc lines, capped at 1.0).
+
+        If `other` has more docs than `self`, treat as full coverage (1.0) rather than a penalty.
+        """
+        if self.total_doc_lines <= 0:
+            return 1.0
+        return min(1.0, other.total_doc_lines / self.total_doc_lines)
+
+    def doc_line_balance(self, other: CommentStats) -> float:
+        """Symmetric doc amount balance (min/max of doc lines)."""
+        max_lines = max(self.total_doc_lines, other.total_doc_lines)
+        if max_lines <= 0:
+            return 1.0
+        return min(self.total_doc_lines, other.total_doc_lines) / max_lines
+
     def doc_cosine_similarity(self, other: CommentStats) -> float:
         """Compute cosine similarity of doc word frequencies.
         
