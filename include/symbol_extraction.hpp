@@ -142,7 +142,7 @@ struct SymbolParityOptions {
     Language source_lang = Language::RUST;
     Language target_lang = Language::KOTLIN;
     bool json = false;
-    bool verbose = false;
+    bool verbose = true;
     bool missing_only = false;     // Show only missing symbols
     bool include_stubs = false;    // Include target stubs in "extra" count
     std::string filter_kind;

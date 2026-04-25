@@ -617,6 +617,7 @@ public:
         int target_function_count = 0;
         int matched_function_count = 0;
         float function_coverage = 1.0f;  // matched / source
+        std::vector<std::string> missing_functions;  // source-defined functions missing from target file
 
         // Test-function parity (subset of the function counts above). Tracked
         // separately so reports can call out missing tests explicitly.
@@ -1160,6 +1161,7 @@ public:
         int source_test_count = 0;       // how many source functions were #[test]
         int matched_test_count = 0;      // how many of those matched in target
         float ratio = 1.0f;
+        std::vector<std::string> missing;
     };
 
     static FunctionNameCoverage function_name_coverage(
@@ -1202,6 +1204,7 @@ public:
             if (f.is_test) cov.source_test_count++;
 
             auto range = tgt_by_name.equal_range(key);
+            bool matched = false;
             if (range.first != range.second) {
                 // Prefer a target whose test-annotation state matches the source.
                 // For a #[test] source, only a @Test-annotated Kotlin function
@@ -1218,7 +1221,11 @@ public:
                     cov.matched++;
                     if (f.is_test) cov.matched_test_count++;
                     tgt_by_name.erase(best);
+                    matched = true;
                 }
+            }
+            if (!matched) {
+                cov.missing.push_back(f.name);
             }
         }
 
@@ -1509,6 +1516,7 @@ public:
                     m.target_function_count = fn_cov.target_total;
                     m.matched_function_count = fn_cov.matched;
                     m.function_coverage = fn_cov.ratio;
+                    m.missing_functions = std::move(fn_cov.missing);
                     m.source_test_function_count = fn_cov.source_test_count;
                     m.matched_test_function_count = fn_cov.matched_test_count;
 
@@ -1584,69 +1592,97 @@ public:
                   << unmatched_target.size() << " target\n\n";
 
         if (!matches.empty()) {
-		            std::cout << "=== Matched Files (by porting priority) ===\n\n";
-		            std::cout << std::setw(30) << std::left << "Source"
-		                      << std::setw(30) << "Target"
-		                      << std::setw(10) << "Similarity"
-		                      << std::setw(11) << "Dependents"
-		                      << std::setw(14) << "FunctionParity"
-		                      << std::setw(12) << "TypeParity"
-		                      << std::setw(10) << "Priority\n";
-		            std::cout << std::string(122, '-') << "\n";
+            std::cout << "=== Matched Files (by porting priority) ===\n\n";
+            std::cout << std::setw(30) << std::left << "Source"
+                      << std::setw(30) << "Target"
+                      << std::setw(10) << "Similarity"
+                      << std::setw(11) << "Dependents"
+                      << std::setw(14) << "FunctionParity"
+                      << std::setw(12) << "TypeParity"
+                      << std::setw(10) << "Priority\n";
+            std::cout << std::string(122, '-') << "\n";
 
-	            auto ranked = ranked_for_porting();
-	            for (const auto& m : ranked) {
-	                std::string funcs = "-";
-	                if (m.source_function_count > 0) {
-	                    funcs = std::to_string(m.matched_function_count) + "/" +
-	                            std::to_string(m.source_function_count);
-	                }
-	                std::string types = "-";
-	                if (m.source_type_count > 0) {
-	                    types = std::to_string(m.matched_type_count) + "/" +
-	                            std::to_string(m.source_type_count);
-	                }
-	                float priority = m.priority_score();
-		                std::string stub_flag = m.is_stub ? " [STUB]" : "";
-	                std::cout << std::setw(30) << std::left << m.source_qualified.substr(0, 28)
-		                          << std::setw(30) << (m.target_qualified.substr(0, 28) + stub_flag)
-		                          << std::setw(10) << std::fixed << std::setprecision(2) << m.similarity
-		                          << std::setw(11) << m.source_dependents
-		                          << std::setw(14) << funcs
-		                          << std::setw(12) << types
-		                          << std::setw(10) << std::fixed << std::setprecision(1) << priority
-		                          << "\n";
-		            }
-		        }
+            auto ranked = ranked_for_porting();
+            for (const auto& m : ranked) {
+                std::string funcs = "0/0";
+                if (m.source_function_count > 0 || m.target_function_count > 0) {
+                    funcs = std::to_string(m.matched_function_count) + "/" +
+                            std::to_string(m.source_function_count);
+                }
+                std::string types = "0/0";
+                if (m.source_type_count > 0 || m.target_type_count > 0) {
+                    types = std::to_string(m.matched_type_count) + "/" +
+                            std::to_string(m.source_type_count);
+                }
+                float priority = m.priority_score();
+                std::string stub_flag = m.is_stub ? " [STUB]" : "";
+                std::cout << std::setw(30) << std::left << m.source_qualified.substr(0, 28)
+                          << std::setw(30) << (m.target_qualified.substr(0, 28) + stub_flag)
+                          << std::setw(10) << std::fixed << std::setprecision(2) << m.similarity
+                          << std::setw(11) << m.source_dependents
+                          << std::setw(14) << funcs
+                          << std::setw(12) << types
+                          << std::setw(10) << std::fixed << std::setprecision(1) << priority
+                          << "\n";
+            }
 
-	        if (!unmatched_source.empty()) {
-	            std::cout << "\n=== Missing from Target (need to port) ===\n\n";
-	            std::vector<const SourceFile*> missing;
-	            missing.reserve(unmatched_source.size());
-	            for (const auto& path : unmatched_source) {
-	                missing.push_back(&source.files.at(path));
-	            }
-	            std::sort(missing.begin(), missing.end(),
-	                      [](const SourceFile* a, const SourceFile* b) {
-	                          return a->dependent_count > b->dependent_count;
-	                      });
+            auto join_names = [](const std::vector<std::string>& names) {
+                if (names.empty()) return std::string("none");
+                std::ostringstream out;
+                for (size_t i = 0; i < names.size(); ++i) {
+                    if (i > 0) out << ", ";
+                    out << names[i];
+                }
+                return out.str();
+            };
 
-	            std::cout << std::setw(30) << std::left << "File"
-	                      << std::setw(8) << "Deps"
-	                      << "Path\n";
-	            std::cout << std::string(78, '-') << "\n";
-	            int shown = 0;
-	            for (const auto* sf : missing) {
-	                if (shown++ >= 20) {
-	                    std::cout << "... and " << (missing.size() - 20) << " more missing files\n";
-	                    break;
-	                }
-	                std::cout << std::setw(30) << std::left << sf->qualified_name.substr(0, 28)
-	                          << std::setw(8) << sf->dependent_count
-	                          << sf->relative_path << "\n";
-	            }
-	        }
-	    }
-	};
+            std::cout << "\n=== Function and Symbol Details ===\n\n";
+            for (const auto& m : ranked) {
+                std::cout << m.source_qualified << " -> " << m.target_qualified;
+                if (m.is_stub) std::cout << " [STUB]";
+                std::cout << "\n";
+                std::cout << "  similarity: " << std::fixed << std::setprecision(2) << m.similarity
+                          << ", priority: " << std::fixed << std::setprecision(1) << m.priority_score()
+                          << ", dependents: " << m.source_dependents << "\n";
+                std::cout << "  functions: " << m.matched_function_count << "/"
+                          << m.source_function_count << " matched"
+                          << " (target total: " << m.target_function_count << ")\n";
+                std::cout << "  missing functions: " << join_names(m.missing_functions) << "\n";
+                std::cout << "  types: " << m.matched_type_count << "/"
+                          << m.source_type_count << " matched"
+                          << " (target total: " << m.target_type_count << ")\n";
+                std::cout << "  missing types: " << join_names(m.missing_types) << "\n";
+                if (m.source_test_function_count > 0) {
+                    std::cout << "  tests: " << m.matched_test_function_count << "/"
+                              << m.source_test_function_count << " matched\n";
+                }
+                std::cout << "\n";
+            }
+        }
+
+        if (!unmatched_source.empty()) {
+            std::cout << "\n=== Missing from Target (need to port) ===\n\n";
+            std::vector<const SourceFile*> missing;
+            missing.reserve(unmatched_source.size());
+            for (const auto& path : unmatched_source) {
+                missing.push_back(&source.files.at(path));
+            }
+            std::sort(missing.begin(), missing.end(),
+                      [](const SourceFile* a, const SourceFile* b) {
+                          return a->dependent_count > b->dependent_count;
+                      });
+
+            std::cout << std::setw(30) << std::left << "File"
+                      << std::setw(8) << "Deps"
+                      << "Path\n";
+            std::cout << std::string(78, '-') << "\n";
+            for (const auto* sf : missing) {
+                std::cout << std::setw(30) << std::left << sf->qualified_name.substr(0, 28)
+                          << std::setw(8) << sf->dependent_count
+                          << sf->relative_path << "\n";
+            }
+        }
+    }
+};
 
 } // namespace ast_distance

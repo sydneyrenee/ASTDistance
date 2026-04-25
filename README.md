@@ -17,6 +17,7 @@ Inspired by the [ASTERIA paper](https://arxiv.org/abs/2108.06082) which uses Tre
   - Dependency graph building
   - File matching by port-lint headers or name similarity
   - Porting priority ranking
+  - Detailed function/type symbol parity in default reports
   - Documentation gap detection
 - **Quality checks**:
   - TODO scanning with context
@@ -42,6 +43,13 @@ cmake --build .
 ```bash
 ./ast_distance --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang>
 ```
+
+Default codebase reports are intentionally detailed: terminal output and generated
+markdown reports include per-file function parity, type parity, and the complete
+missing-symbol names needed for porting work.
+
+See [TRANSLITERATION_DISTANCE.md](TRANSLITERATION_DISTANCE.md) for the planned
+parser-guided translated-buffer distance model.
 
 ### Show missing files
 ```bash

@@ -1241,6 +1241,68 @@ void cmd_rank(const std::string& src_dir, const std::string& src_lang,
     comp.print_report();
 }
 
+static std::string markdown_code_span(const std::string& text) {
+    std::string escaped;
+    escaped.reserve(text.size());
+    for (char c : text) {
+        if (c == '`') {
+            escaped.push_back('\'');
+        } else if (c == '|') {
+            escaped += "\\|";
+        } else {
+            escaped.push_back(c);
+        }
+    }
+    return "`" + escaped + "`";
+}
+
+static std::string markdown_symbol_list(const std::vector<std::string>& names) {
+    if (names.empty()) return "_none_";
+    std::ostringstream out;
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << markdown_code_span(names[i]);
+    }
+    return out.str();
+}
+
+static std::string parity_cell(int matched, int source_total, int target_total) {
+    std::ostringstream out;
+    out << matched << "/" << source_total << " matched";
+    if (target_total != source_total) {
+        out << " (target " << target_total << ")";
+    }
+    return out.str();
+}
+
+static void write_match_detail_block(std::ostream& report,
+                                     const CodebaseComparator::Match& m,
+                                     int rank) {
+    report << "### " << rank << ". " << m.source_qualified << "\n\n";
+    report << "- **Target:** `" << m.target_qualified << "`";
+    if (m.is_stub) report << " `[STUB]`";
+    report << "\n";
+    report << "- **Similarity:** " << std::fixed << std::setprecision(2) << m.similarity << "\n";
+    report << "- **Dependents:** " << m.source_dependents << "\n";
+    report << "- **Priority Score:** " << std::fixed << std::setprecision(1)
+           << m.priority_score() << "\n";
+    report << "- **Functions:** "
+           << parity_cell(m.matched_function_count, m.source_function_count, m.target_function_count)
+           << "\n";
+    report << "- **Missing functions:** " << markdown_symbol_list(m.missing_functions) << "\n";
+    report << "- **Types:** "
+           << parity_cell(m.matched_type_count, m.source_type_count, m.target_type_count)
+           << "\n";
+    report << "- **Missing types:** " << markdown_symbol_list(m.missing_types) << "\n";
+    if (m.source_test_function_count > 0) {
+        report << "- **Tests:** " << m.matched_test_function_count << "/"
+               << m.source_test_function_count << " matched\n";
+    }
+    if (m.todo_count > 0) report << "- **TODOs:** " << m.todo_count << "\n";
+    if (m.lint_count > 0) report << "- **Lint issues:** " << m.lint_count << "\n";
+    report << "\n";
+}
+
 void generate_reports(const Codebase& source, const Codebase& target,
                       const CodebaseComparator& comp,
                       const std::vector<CodebaseComparator::Match>& ranked,
@@ -1280,6 +1342,7 @@ void generate_reports(const Codebase& source, const Codebase& target,
     if (avg_count > 0) {
         avg_similarity /= avg_count;
     }
+    float matched_denominator = matched > 0 ? static_cast<float>(matched) : 1.0f;
     
     // Get current date/time as string
     std::time_t now = std::time(nullptr);
@@ -1311,21 +1374,47 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "**Average Similarity:** " << std::fixed << std::setprecision(2) << avg_similarity << "\n\n";
         report << "**Quality Distribution:**\n";
         report << "- Excellent (≥0.85): " << excellent << " files (" 
-               << std::fixed << std::setprecision(1) << (static_cast<float>(excellent) / matched * 100.0f) << "% of matched)\n";
+               << std::fixed << std::setprecision(1) << (static_cast<float>(excellent) / matched_denominator * 100.0f) << "% of matched)\n";
         report << "- Good (0.60-0.84): " << good << " files ("
-               << std::fixed << std::setprecision(1) << (static_cast<float>(good) / matched * 100.0f) << "% of matched)\n";
+               << std::fixed << std::setprecision(1) << (static_cast<float>(good) / matched_denominator * 100.0f) << "% of matched)\n";
         report << "- Critical (<0.60): " << critical << " files ("
-               << std::fixed << std::setprecision(1) << (static_cast<float>(critical) / matched * 100.0f) << "% of matched)\n\n";
+               << std::fixed << std::setprecision(1) << (static_cast<float>(critical) / matched_denominator * 100.0f) << "% of matched)\n\n";
+
+        report << "## Function and Symbol Details\n\n";
+        report << "Every matched file is listed with function and type parity. Missing symbol names are not capped.\n\n";
+        report << "| Rank | Source | Target | Similarity | Functions | Missing functions | Types | Missing types | Tests | Symbol deficit | Priority |\n";
+        report << "|------|--------|--------|------------|-----------|-------------------|-------|---------------|-------|----------------|----------|\n";
+        int detail_rank = 1;
+        for (const auto& m : ranked) {
+            std::string tests = "-";
+            if (m.source_test_function_count > 0) {
+                tests = std::to_string(m.matched_test_function_count) + "/" +
+                        std::to_string(m.source_test_function_count);
+            }
+            report << "| " << detail_rank++ << " | `" << m.source_qualified << "` | `"
+                   << m.target_qualified << (m.is_stub ? " [STUB]" : "") << "` | "
+                   << std::fixed << std::setprecision(2) << m.similarity << " | "
+                   << parity_cell(m.matched_function_count, m.source_function_count, m.target_function_count)
+                   << " | " << markdown_symbol_list(m.missing_functions) << " | "
+                   << parity_cell(m.matched_type_count, m.source_type_count, m.target_type_count)
+                   << " | " << markdown_symbol_list(m.missing_types) << " | "
+                   << tests << " | " << m.symbol_deficit() << " | "
+                   << std::fixed << std::setprecision(1) << m.priority_score() << " |\n";
+        }
+        report << "\n";
         
         report << "### Excellent Ports (Similarity ≥ 0.85)\n\n";
-        report << "These files are well-ported and likely complete:\n\n";
+        report << "These files are well-ported and likely complete. This section is complete, not capped.\n\n";
         int shown = 0;
         for (const auto& m : ranked) {
-            if (!m.is_stub && m.similarity >= 0.85 && shown++ < 15) {
+            if (!m.is_stub && m.similarity >= 0.85) {
+                shown++;
                 report << "- `" << m.target_qualified << "` (" << std::fixed << std::setprecision(2)
-                       << m.similarity << ", " << m.source_dependents << " deps)\n";
+                       << m.similarity << ", " << m.source_dependents << " deps, "
+                       << m.symbol_deficit() << " missing symbols)\n";
             }
         }
+        if (shown == 0) report << "_None detected._\n";
         report << "\n";
         
         report << "### Critical Ports (Similarity < 0.60)\n\n";
@@ -1349,20 +1438,11 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	        for (const auto& m : ranked) {
 	            if (m.source_type_count == 0) continue;
 	            if (m.type_coverage >= 1.0f) continue;
-	            if (shown_incorrect++ >= 25) break;
+	            shown_incorrect++;
 	            report << "| `" << m.source_qualified << "` | `" << m.target_qualified << "` | "
 	                   << (m.source_type_count - m.matched_type_count) << "/" << m.source_type_count << " | ";
 	            if (!m.missing_types.empty()) {
-	                // Show up to 3 missing type names
-	                int shown_names = 0;
-	                for (const auto& name : m.missing_types) {
-	                    if (shown_names++ >= 3) break;
-	                    if (shown_names > 1) report << ", ";
-	                    report << "`" << name << "`";
-	                }
-	                if (static_cast<int>(m.missing_types.size()) > 3) {
-	                    report << " …";
-	                }
+	                report << markdown_symbol_list(m.missing_types);
 	            } else {
 	                report << "-";
 	            }
@@ -1381,12 +1461,9 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	            report << "|------|------------|------|------|\n";
 	            int shown_missing = 0;
 	            for (const auto* sf : missing) {
-	                if (shown_missing++ >= 20) break;
+	                shown_missing++;
 	                report << "| " << shown_missing << " | `" << sf->qualified_name << "` | "
 	                       << sf->dependent_count << " | `" << sf->relative_path << "` |\n";
-	            }
-	            if (missing.size() > 20) {
-	                report << "\n... and " << (missing.size() - 20) << " more missing files.\n";
 	            }
 	            report << "\n";
 	        }
@@ -1410,19 +1487,16 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	            report << "N/A)\n\n";
 	        }
 	        
-	        report << "Top documentation gaps (>20%):\n\n";
+	        report << "Documentation gaps (>20%), complete list:\n\n";
 	        if (doc_gaps.empty()) {
 	            report << "No significant documentation gaps found.\n\n";
 	        } else {
 	            int shown_docs = 0;
 	            for (const auto& [gap, m] : doc_gaps) {
-	                if (shown_docs++ >= 15) break;
+	                shown_docs++;
 	                report << "- `" << m->source_qualified << "` - " 
 	                       << std::fixed << std::setprecision(0) << (gap * 100) << "% gap ("
 	                       << m->source_doc_lines << " → " << m->target_doc_lines << " lines)\n";
-	            }
-	            if (doc_gaps.size() > 15) {
-	                report << "\n... and " << (doc_gaps.size() - 15) << " more files with doc gaps.\n";
 	            }
 	            report << "\n";
 	        }
@@ -1435,22 +1509,26 @@ void generate_reports(const Codebase& source, const Codebase& target,
         std::ofstream report("high_priority_ports.md");
         report << "# High Priority Ports - Action Plan\n\n";
         
-        report << "## Top 20 Files by Impact\n\n";
+        report << "## Files by Impact\n\n";
         report << "Priority = (missing functions + missing types) × (10 + log1p(deps) × 2)"
                   " + log1p(deps) × (1 − similarity) × 5\n\n";
-        report << "| Rank | Source | Target | Similarity | Deps | SymDeficit | Priority |\n";
-        report << "|------|--------|--------|------------|------|-----------|----------|\n";
+        report << "This list is complete and includes function/type detail for every matched file.\n\n";
+        report << "| Rank | Source | Target | Similarity | Deps | Functions | Missing functions | Types | Missing types | SymDeficit | Priority |\n";
+        report << "|------|--------|--------|------------|------|-----------|-------------------|-------|---------------|-----------|----------|\n";
 
         int rank = 1;
         for (const auto& m : ranked) {
-            if (rank <= 20) {
-                float priority = m.priority_score();
-                report << "| " << rank++ << " | `" << m.source_qualified << "` | `"
-                       << m.target_qualified << "` | " << std::fixed << std::setprecision(2)
-                       << m.similarity << " | " << m.source_dependents << " | "
-                       << m.symbol_deficit() << " | "
-                       << std::fixed << std::setprecision(1) << priority << " |\n";
-            }
+            float priority = m.priority_score();
+            report << "| " << rank++ << " | `" << m.source_qualified << "` | `"
+                   << m.target_qualified << (m.is_stub ? " [STUB]" : "") << "` | "
+                   << std::fixed << std::setprecision(2) << m.similarity << " | "
+                   << m.source_dependents << " | "
+                   << parity_cell(m.matched_function_count, m.source_function_count, m.target_function_count)
+                   << " | " << markdown_symbol_list(m.missing_functions) << " | "
+                   << parity_cell(m.matched_type_count, m.source_type_count, m.target_type_count)
+                   << " | " << markdown_symbol_list(m.missing_types) << " | "
+                   << m.symbol_deficit() << " | "
+                   << std::fixed << std::setprecision(1) << priority << " |\n";
         }
         report << "\n";
         
@@ -1465,6 +1543,14 @@ void generate_reports(const Codebase& source, const Codebase& target,
                 report << "- **" << m.source_qualified << "** → `" << m.target_qualified << "`\n";
                 report << "  - Similarity: " << std::fixed << std::setprecision(2) << m.similarity << "\n";
                 report << "  - Dependencies: " << m.source_dependents << "\n";
+                report << "  - Functions: "
+                       << parity_cell(m.matched_function_count, m.source_function_count, m.target_function_count)
+                       << "\n";
+                report << "  - Missing functions: " << markdown_symbol_list(m.missing_functions) << "\n";
+                report << "  - Types: "
+                       << parity_cell(m.matched_type_count, m.source_type_count, m.target_type_count)
+                       << "\n";
+                report << "  - Missing types: " << markdown_symbol_list(m.missing_types) << "\n";
                 if (m.todo_count > 0) report << "  - TODOs: " << m.todo_count << "\n";
                 if (m.lint_count > 0) report << "  - Lint issues: " << m.lint_count << "\n";
                 report << "\n";
@@ -1474,7 +1560,7 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	            report << "No critical issues with dependencies.\n\n";
 	        }
 
-	        report << "## Missing Files (Top by Dependents)\n\n";
+	        report << "## Missing Files (by Dependents)\n\n";
 	        if (missing.empty()) {
 	            report << "No missing files detected.\n\n";
 	        } else {
@@ -1482,12 +1568,9 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	            report << "|------|------------|------|------|\n";
 	            int shown_missing = 0;
 	            for (const auto* sf : missing) {
-	                if (shown_missing++ >= 20) break;
+	                shown_missing++;
 	                report << "| " << shown_missing << " | `" << sf->qualified_name << "` | "
 	                       << sf->dependent_count << " | `" << sf->relative_path << "` |\n";
-	            }
-	            if (missing.size() > 20) {
-	                report << "\n... and " << (missing.size() - 20) << " more missing files.\n";
 	            }
 	            report << "\n";
 	        }
@@ -1512,7 +1595,8 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "## Priority 1: Fix Incomplete High-Dependency Files\n\n";
         int p1_count = 0;
         for (const auto& m : ranked) {
-            if (m.similarity < 0.85 && m.source_dependents >= 10 && p1_count++ < 10) {
+            if (m.similarity < 0.85 && m.source_dependents >= 10) {
+                p1_count++;
                 report << "### " << p1_count << ". " << m.source_qualified << "\n";
                 report << "- **Similarity:** " << std::fixed << std::setprecision(2) 
                        << m.similarity << " (needs " << std::fixed << std::setprecision(0)
@@ -1520,6 +1604,14 @@ void generate_reports(const Codebase& source, const Codebase& target,
                 report << "- **Dependencies:** " << m.source_dependents << "\n";
                 report << "- **Priority Score:** " << std::fixed << std::setprecision(1)
                        << m.priority_score() << "\n";
+                report << "- **Functions:** "
+                       << parity_cell(m.matched_function_count, m.source_function_count, m.target_function_count)
+                       << "\n";
+                report << "- **Missing functions:** " << markdown_symbol_list(m.missing_functions) << "\n";
+                report << "- **Types:** "
+                       << parity_cell(m.matched_type_count, m.source_type_count, m.target_type_count)
+                       << "\n";
+                report << "- **Missing types:** " << markdown_symbol_list(m.missing_types) << "\n";
                 if (m.symbol_deficit() > 0) {
                     report << "- **Symbol Deficit:** " << m.symbol_deficit()
                            << " (functions: " << m.function_deficit()
@@ -1542,12 +1634,15 @@ void generate_reports(const Codebase& source, const Codebase& target,
                 report << "\n";
             }
         }
+        if (p1_count == 0) {
+            report << "No incomplete high-dependency files detected.\n\n";
+        }
         
 	        report << "## Priority 2: Port Missing High-Value Files\n\n";
 	        report << "Critical missing files (>10 dependencies):\n\n";
 	        int p2_count = 0;
 	        for (const auto* sf : missing) {
-	            if (sf->dependent_count >= 10 && p2_count < 10) {
+	            if (sf->dependent_count >= 10) {
 	                p2_count++;
 	                report << p2_count << ". **" << sf->qualified_name << "** (" 
 	                       << sf->dependent_count << " deps)\n";
@@ -1558,6 +1653,13 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	        if (p2_count == 0) {
 	            report << "No missing high-value files detected.\n\n";
 	        }
+
+        report << "## Detailed Work Items\n\n";
+        report << "Every matched file is listed below with function and type symbol parity.\n\n";
+        int detail_block_rank = 1;
+        for (const auto& m : ranked) {
+            write_match_detail_block(report, m, detail_block_rank++);
+        }
         
         report << "## Success Criteria\n\n";
         report << "For each file to be considered \"complete\":\n";
@@ -1958,25 +2060,22 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 		              << "Status\n";
 		    std::cout << std::string(100, '-') << "\n";
 
-	    int shown = 0;
 	    for (const auto& m : ranked) {
 	        bool func_gap = (m.function_deficit() > 0);
+	        bool type_gap = (m.type_deficit() > 0);
 	        int missing_tests = std::max(0,
 	            m.source_test_function_count - m.matched_test_function_count);
 	        bool test_gap = (missing_tests > 0);
 	        if (m.todo_count == 0 && m.lint_count == 0 && !m.is_stub
-	            && !func_gap && !test_gap && m.similarity >= 0.6) {
+	            && !func_gap && !type_gap && !test_gap && m.similarity >= 0.6) {
 	            continue;  // Skip files without issues
 	        }
-	        if (shown++ >= 20) {
-	            std::cout << "... and " << (ranked.size() - 20) << " more files\n";
-	            break;
-        }
 
 	        std::string status;
 	        if (m.is_stub) status = "STUB";
 	        else if (m.similarity < 0.4) status = "LOW_SIM";
 	        else if (func_gap) status = "MISSING_FUNCS";
+	        else if (type_gap) status = "MISSING_TYPES";
 	        else if (test_gap) status = "MISSING_TESTS";
 	        else if (m.lint_count > 0) status = "LINT";
 	        else if (m.todo_count > 0) status = "TODO";
@@ -2006,6 +2105,12 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 		                  << std::setw(6) << m.todo_count
 		                  << std::setw(6) << m.lint_count
 		                  << status << "\n";
+	        if (!m.missing_functions.empty()) {
+	            std::cout << "  missing functions: " << markdown_symbol_list(m.missing_functions) << "\n";
+	        }
+	        if (!m.missing_types.empty()) {
+	            std::cout << "  missing types: " << markdown_symbol_list(m.missing_types) << "\n";
+	        }
 	    }
 
 	    // Porting recommendations
@@ -2015,10 +2120,9 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	    std::cout << "Missing files: " << comp.unmatched_source.size() << "\n\n";
 
 	    if (incomplete > 0) {
-	        std::cout << "Top priority to complete:\n";
-	        int shown_priority = 0;
+	        std::cout << "Incomplete ports to complete:\n";
 	        for (const auto& m : ranked) {
-	            if (m.similarity < 0.6 && shown_priority++ < 10) {
+	            if (m.similarity < 0.6) {
 	                std::string funcs = "-";
 	                if (m.source_function_count > 0) {
 	                    funcs = std::to_string(m.matched_function_count) + "/" +
@@ -2031,6 +2135,14 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	                if (m.is_stub) std::cout << " [STUB]";
 	                if (m.todo_count > 0) std::cout << " [" << m.todo_count << " TODOs]";
 	                std::cout << "\n";
+	                if (!m.missing_functions.empty()) {
+	                    std::cout << "    missing functions: "
+	                              << markdown_symbol_list(m.missing_functions) << "\n";
+	                }
+	                if (!m.missing_types.empty()) {
+	                    std::cout << "    missing types: "
+	                              << markdown_symbol_list(m.missing_types) << "\n";
+	                }
 	            }
 	        }
 	    }
@@ -2038,7 +2150,7 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	    // Prepare missing files vector for report generation
 	    std::vector<const SourceFile*> missing;
 	    if (!comp.unmatched_source.empty()) {
-	        std::cout << "\n=== Missing Files (Top by Dependents) ===\n\n";
+	        std::cout << "\n=== Missing Files (by Dependents) ===\n\n";
 	        // Sort unmatched by dependents
 	        for (const auto& path : comp.unmatched_source) {
 	            missing.push_back(&source.files.at(path));
@@ -2053,12 +2165,7 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 		                  << "Path\n";
 		        std::cout << std::string(81, '-') << "\n";
 
-	        int shown_missing = 0;
 	        for (const auto* sf : missing) {
-	            if (shown_missing++ >= 20) {
-	                std::cout << "... and " << (missing.size() - 20) << " more missing files\n";
-	                break;
-	            }
 		            std::cout << std::setw(30) << std::left << sf->qualified_name.substr(0, 28)
 		                      << std::setw(11) << sf->dependent_count
 		                      << sf->relative_path << "\n";
@@ -2108,13 +2215,7 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
                   << "\n";
         std::cout << std::string(94, '-') << "\n";
 
-        int shown_docs = 0;
         for (const auto& [gap, m] : doc_gaps) {
-            if (shown_docs++ >= 25) {
-                std::cout << "... and " << (doc_gaps.size() - 25) << " more files with doc gaps\n";
-                break;
-            }
-
 	            std::string gap_str = std::to_string(static_cast<int>(gap * 100)) + "%";
 	            std::cout << std::setw(30) << std::left << m->source_qualified.substr(0, 28)
 	                      << std::setw(12) << m->source_doc_lines
