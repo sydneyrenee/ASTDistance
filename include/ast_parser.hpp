@@ -445,6 +445,10 @@ struct FunctionInfo {
     IdentifierStats identifiers;
     bool has_stub_markers = false;
     bool is_test = false;  // true if #[test] or inside #[cfg(test)] mod
+    int start_line = 0;    // 1-based declaration start line
+    int end_line = 0;      // 1-based declaration end line
+    int line_count = 0;    // declaration line span, inclusive
+    int body_line_count = 0;
 };
 
 /**
@@ -2060,6 +2064,22 @@ public:
             info.body_tree = convert_node(body_node, source, lang);
             info.identifiers = ids;
             info.has_stub_markers = has_stub_markers_in_node(body_node, source, lang);
+            TSPoint start = ts_node_start_point(node);
+            TSPoint end = ts_node_end_point(node);
+            info.start_line = static_cast<int>(start.row) + 1;
+            info.end_line = static_cast<int>(end.row) + 1;
+            info.line_count = info.end_line >= info.start_line
+                ? (info.end_line - info.start_line + 1)
+                : 0;
+            if (!ts_node_is_null(body_node)) {
+                TSPoint body_start = ts_node_start_point(body_node);
+                TSPoint body_end = ts_node_end_point(body_node);
+                int body_start_line = static_cast<int>(body_start.row) + 1;
+                int body_end_line = static_cast<int>(body_end.row) + 1;
+                info.body_line_count = body_end_line >= body_start_line
+                    ? (body_end_line - body_start_line + 1)
+                    : 0;
+            }
 
             // Tag Rust test functions: #[test] attribute or inside #[cfg(test)] mod
             if (lang == Language::RUST) {

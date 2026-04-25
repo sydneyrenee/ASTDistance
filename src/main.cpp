@@ -11,6 +11,8 @@
 #include <fstream>
 #include <filesystem>
 #include <iomanip>
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -194,6 +196,73 @@ const char* language_name(Language lang) {
     return "Unknown";
 }
 
+static std::string lowercase_ascii(std::string s) {
+    for (char& c : s) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+static std::string title_ascii_segment(std::string s) {
+    s = lowercase_ascii(std::move(s));
+    if (!s.empty() && std::isalpha(static_cast<unsigned char>(s[0]))) {
+        s[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+    }
+    return s;
+}
+
+static std::string rust_identifier_to_kotlin_lower_camel(const std::string& rust_name) {
+    std::string name = rust_name;
+    if (name.rfind("r#", 0) == 0) {
+        name = name.substr(2);
+    }
+
+    // Generated Rust parsers use private names like `___action42` and
+    // `___pop_Variant9`. Kotlin ports must keep legal identifiers, so parity
+    // means `action42` and `popVariant9`, not underscore-prefixed spellings.
+    while (!name.empty() && name[0] == '_') {
+        name.erase(name.begin());
+    }
+
+    std::vector<std::string> parts;
+    std::string current;
+    for (char c : name) {
+        if (c == '_') {
+            if (!current.empty()) {
+                parts.push_back(current);
+                current.clear();
+            }
+            continue;
+        }
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty()) {
+        parts.push_back(current);
+    }
+
+    if (parts.empty()) {
+        return "";
+    }
+
+    std::string result = lowercase_ascii(parts[0]);
+    for (size_t i = 1; i < parts.size(); ++i) {
+        result += title_ascii_segment(parts[i]);
+    }
+    return result;
+}
+
+static std::string expected_target_function_name(
+        const std::string& source_name,
+        Language source_lang,
+        Language target_lang) {
+    if (source_lang == Language::RUST && target_lang == Language::KOTLIN) {
+        return rust_identifier_to_kotlin_lower_camel(source_name);
+    }
+    return source_name;
+}
+
 static void warn_kotlin_suspicious_constructs(
     const std::filesystem::path& source_path,
     Language source_lang,
@@ -242,7 +311,7 @@ void print_usage(const char* program) {
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
-    std::cerr << "      Compare functions between files with similarity matrix\n\n";
+    std::cerr << "      Compare strict function-name parity and per-function cosine/line similarity\n\n";
     std::cerr << "  " << program << " --dump <file> <rust|kotlin|cpp|python|typescript>\n";
     std::cerr << "      Dump AST structure of a file\n\n";
     std::cerr << "  " << program << " --scan <directory> <rust|kotlin|cpp|python|typescript>\n";
@@ -3658,13 +3727,6 @@ int main(int argc, char* argv[]) {
             auto funcs1 = parser.extract_function_infos(buffer1.str(), lang1);
 
             std::cout << "Found " << funcs1.size() << " " << language_name(lang1) << " functions\n";
-            for (const auto& info : funcs1) {
-                std::cout << "  - " << info.name << " (" << info.body_tree->size() << " nodes)";
-                if (info.has_stub_markers) {
-                    std::cout << " [TODO]";
-                }
-                std::cout << "\n";
-            }
 
             std::cout << "\nExtracting functions from " << file2 << " (" << language_name(lang2) << ")...\n";
             std::ifstream stream2(file2);
@@ -3673,54 +3735,288 @@ int main(int argc, char* argv[]) {
             auto funcs2 = parser.extract_function_infos(buffer2.str(), lang2);
 
             std::cout << "Found " << funcs2.size() << " " << language_name(lang2) << " functions\n";
-            for (const auto& info : funcs2) {
-                std::cout << "  - " << info.name << " (" << info.body_tree->size() << " nodes)";
-                if (info.has_stub_markers) {
-                    std::cout << " [TODO]";
+
+            const bool strict_name_parity =
+                (lang1 == lang2) || (lang1 == Language::RUST && lang2 == Language::KOTLIN);
+
+            auto target_lookup_key = [&](const FunctionInfo& info) -> std::string {
+                if (strict_name_parity) {
+                    return info.name;
                 }
-                std::cout << "\n";
+                std::string key = IdentifierStats::canonicalize(info.name);
+                return key.empty() ? info.name : key;
+            };
+
+            auto expected_lookup_key = [&](const FunctionInfo& info) -> std::string {
+                if (strict_name_parity) {
+                    return expected_target_function_name(info.name, lang1, lang2);
+                }
+                std::string key = IdentifierStats::canonicalize(info.name);
+                return key.empty() ? info.name : key;
+            };
+
+            auto guarded_combined_similarity = [](const FunctionInfo& source_func,
+                                                  const FunctionInfo& target_func) -> float {
+                // Guardrail: treat stub markers as a failure only when they appear in the
+                // target function but not in the source baseline.
+                if (target_func.has_stub_markers && !source_func.has_stub_markers) {
+                    return 0.0f;
+                }
+                return ASTSimilarity::combined_similarity_with_content(
+                    source_func.body_tree.get(),
+                    target_func.body_tree.get(),
+                    source_func.identifiers,
+                    target_func.identifiers);
+            };
+
+            auto guarded_ast_cosine = [](const FunctionInfo& source_func,
+                                         const FunctionInfo& target_func) -> float {
+                if (target_func.has_stub_markers && !source_func.has_stub_markers) {
+                    return 0.0f;
+                }
+                return ASTSimilarity::histogram_cosine_similarity(
+                    source_func.body_tree.get(),
+                    target_func.body_tree.get());
+            };
+
+            auto guarded_identifier_cosine = [](const FunctionInfo& source_func,
+                                                const FunctionInfo& target_func) -> float {
+                if (target_func.has_stub_markers && !source_func.has_stub_markers) {
+                    return 0.0f;
+                }
+                return source_func.identifiers.canonical_cosine_similarity(target_func.identifiers);
+            };
+
+            struct FunctionMatchCandidate {
+                float score = 0.0f;
+                float ast_cosine = 0.0f;
+                float id_cosine = 0.0f;
+                int source_index = 0;
+                int target_index = 0;
+            };
+
+            std::unordered_map<std::string, std::vector<int>> target_by_name;
+            target_by_name.reserve(funcs2.size());
+            for (int j = 0; j < static_cast<int>(funcs2.size()); ++j) {
+                target_by_name[target_lookup_key(funcs2[j])].push_back(j);
             }
 
-            // Compare function bodies (all pairs, then aggregate with matching)
-            std::cout << "\n=== Function Similarity Matrix ===\n\n";
-            std::cout << std::setw(20) << "";
-            for (const auto& func2 : funcs2) {
-                std::cout << std::setw(12) << func2.name.substr(0, 10);
+            std::vector<FunctionMatchCandidate> candidates;
+            for (int i = 0; i < static_cast<int>(funcs1.size()); ++i) {
+                auto bucket = target_by_name.find(expected_lookup_key(funcs1[i]));
+                if (bucket == target_by_name.end()) {
+                    continue;
+                }
+                for (int j : bucket->second) {
+                    candidates.push_back({
+                        guarded_combined_similarity(funcs1[i], funcs2[j]),
+                        guarded_ast_cosine(funcs1[i], funcs2[j]),
+                        guarded_identifier_cosine(funcs1[i], funcs2[j]),
+                        i,
+                        j,
+                    });
+                }
             }
-            std::cout << "\n";
 
-            for (const auto& func1 : funcs1) {
-                std::cout << std::setw(20) << func1.name.substr(0, 18);
-                for (const auto& func2 : funcs2) {
-                    float sim = 0.0f;
-                    // Guardrail: treat stub markers as a failure only when they appear in the
-                    // *target* function but not in the source function.
-                    //
-                    // This prevents legitimate TODO/FIXME comments in the Rust source from
-                    // forcing the Kotlin port similarity to 0.
-                    if (!(func2.has_stub_markers && !func1.has_stub_markers)) {
-                        sim = ASTSimilarity::combined_similarity_with_content(
-                            func1.body_tree.get(), func2.body_tree.get(),
-                            func1.identifiers, func2.identifiers);
+            std::sort(candidates.begin(), candidates.end(),
+                [](const FunctionMatchCandidate& a, const FunctionMatchCandidate& b) {
+                    return a.score > b.score;
+                });
+
+            std::vector<bool> source_used(funcs1.size(), false);
+            std::vector<bool> target_used(funcs2.size(), false);
+
+            struct FunctionPairReport {
+                std::string source_name;
+                std::string expected_name;
+                std::string target_name;
+                int source_lines = 0;
+                int target_lines = 0;
+                int line_gap = 0;
+                float line_ratio = 0.0f;
+                int source_nodes = 0;
+                int target_nodes = 0;
+                float ast_cosine = 0.0f;
+                float id_cosine = 0.0f;
+                float combined = 0.0f;
+                bool stub_guarded = false;
+            };
+
+            std::vector<FunctionPairReport> reports;
+            reports.reserve(std::min(funcs1.size(), funcs2.size()));
+            float total_combined = 0.0f;
+            float total_ast_cosine = 0.0f;
+            float total_id_cosine = 0.0f;
+            float total_line_balance = 0.0f;
+
+            for (const auto& candidate : candidates) {
+                if (source_used[candidate.source_index] || target_used[candidate.target_index]) {
+                    continue;
+                }
+                const auto& source_func = funcs1[candidate.source_index];
+                const auto& target_func = funcs2[candidate.target_index];
+                source_used[candidate.source_index] = true;
+                target_used[candidate.target_index] = true;
+
+                FunctionPairReport report;
+                report.source_name = source_func.name;
+                report.expected_name = expected_target_function_name(source_func.name, lang1, lang2);
+                report.target_name = target_func.name;
+                report.source_lines = source_func.line_count;
+                report.target_lines = target_func.line_count;
+                report.line_gap = target_func.line_count - source_func.line_count;
+                report.line_ratio = source_func.line_count > 0
+                    ? static_cast<float>(target_func.line_count) / static_cast<float>(source_func.line_count)
+                    : 0.0f;
+                report.source_nodes = source_func.body_tree ? source_func.body_tree->size() : 0;
+                report.target_nodes = target_func.body_tree ? target_func.body_tree->size() : 0;
+                report.ast_cosine = candidate.ast_cosine;
+                report.id_cosine = candidate.id_cosine;
+                report.combined = candidate.score;
+                report.stub_guarded = target_func.has_stub_markers && !source_func.has_stub_markers;
+                reports.push_back(report);
+
+                total_combined += report.combined;
+                total_ast_cosine += report.ast_cosine;
+                total_id_cosine += report.id_cosine;
+                if (source_func.line_count > 0 && target_func.line_count > 0) {
+                    int min_lines = std::min(source_func.line_count, target_func.line_count);
+                    int max_lines = std::max(source_func.line_count, target_func.line_count);
+                    total_line_balance += static_cast<float>(min_lines) / static_cast<float>(max_lines);
+                }
+            }
+
+            int unmatched_source = 0;
+            int unmatched_target = 0;
+            for (bool used : source_used) {
+                if (!used) ++unmatched_source;
+            }
+            for (bool used : target_used) {
+                if (!used) ++unmatched_target;
+            }
+
+            const float source_total = static_cast<float>(funcs1.size());
+            const float matched_total = static_cast<float>(reports.size());
+            const float coverage = source_total > 0.0f ? matched_total / source_total : 1.0f;
+            const float overall_score = source_total > 0.0f ? total_combined / source_total : 0.0f;
+            const float matched_avg = matched_total > 0.0f ? total_combined / matched_total : 0.0f;
+            const float ast_avg = matched_total > 0.0f ? total_ast_cosine / matched_total : 0.0f;
+            const float id_avg = matched_total > 0.0f ? total_id_cosine / matched_total : 0.0f;
+            const float line_balance_avg = matched_total > 0.0f ? total_line_balance / matched_total : 0.0f;
+
+            std::cout << "\n=== Function Name Parity ===\n";
+            if (lang1 == Language::RUST && lang2 == Language::KOTLIN) {
+                std::cout << "Rule: Rust snake_case/private generated names must match legal Kotlin lowerCamelCase names.\n";
+                std::cout << "Examples: `foo_bar` -> `fooBar`, `___action42` -> `action42`, "
+                          << "`___pop_Variant9` -> `popVariant9`.\n";
+            } else if (lang1 == lang2) {
+                std::cout << "Rule: same-language function names must match exactly.\n";
+            } else {
+                std::cout << "Rule: cross-language fallback uses canonicalized identifiers.\n";
+            }
+            std::cout << "Strict matched pairs: " << reports.size() << " / " << funcs1.size()
+                      << " source functions";
+            std::cout << " | unmatched source: " << unmatched_source
+                      << " | unmatched target: " << unmatched_target << "\n";
+            std::cout << "Name coverage: " << std::fixed << std::setprecision(3) << coverage << "\n";
+            std::cout << "Function body score (missing source functions count as 0): "
+                      << std::fixed << std::setprecision(3) << overall_score << "\n";
+            std::cout << "Matched average combined: " << std::fixed << std::setprecision(3) << matched_avg
+                      << " | AST cosine avg: " << ast_avg
+                      << " | identifier cosine avg: " << id_avg
+                      << " | line-balance avg: " << line_balance_avg << "\n";
+
+            if (unmatched_source > 0) {
+                std::cout << "\nMissing expected target functions:\n";
+                for (int i = 0; i < static_cast<int>(funcs1.size()); ++i) {
+                    if (!source_used[i]) {
+                        std::cout << "  - " << funcs1[i].name
+                                  << " -> expected " << expected_target_function_name(funcs1[i].name, lang1, lang2)
+                                  << " (" << funcs1[i].line_count << " lines)\n";
                     }
-                    std::cout << std::setw(12) << std::fixed << std::setprecision(3) << sim;
                 }
-                std::cout << "\n";
             }
 
-            auto function_summary = CodebaseComparator::compare_function_sets(funcs1, funcs2);
-            if (function_summary.score >= 0.0f) {
-                std::cout << "\nCompared " << function_summary.source_total << " source functions vs "
-                          << function_summary.target_total << " target functions\n";
-                std::cout << "Matched pairs: " << function_summary.matched_pairs
-                          << " | Unmatched source: " << function_summary.unmatched_source
-                          << " | Unmatched target: " << function_summary.unmatched_target << "\n";
-                std::cout << "Function-wise overall score: "
-                          << std::fixed << std::setprecision(3)
-                          << function_summary.score << "\n";
-                if (function_summary.has_source_stub || function_summary.has_target_stub) {
-                    std::cout << "TODO/stub markers found in function bodies.\n";
-                    std::cout << "Pairs only contribute 0 when the target contains markers absent in source.\n";
+            if (unmatched_target > 0) {
+                std::cout << "\nExtra target functions not matched by strict source-name parity:\n";
+                for (int j = 0; j < static_cast<int>(funcs2.size()); ++j) {
+                    if (!target_used[j]) {
+                        std::cout << "  - " << funcs2[j].name
+                                  << " (" << funcs2[j].line_count << " lines)\n";
+                    }
+                }
+            }
+
+            auto line_reports = reports;
+            std::sort(line_reports.begin(), line_reports.end(),
+                [](const FunctionPairReport& a, const FunctionPairReport& b) {
+                    int a_gap = std::abs(a.line_gap);
+                    int b_gap = std::abs(b.line_gap);
+                    if (a_gap != b_gap) return a_gap > b_gap;
+                    return a.source_name < b.source_name;
+                });
+
+            std::cout << "\n=== Worst Line Parity (top 25 by absolute line gap) ===\n";
+            std::cout << "Source\tExpectedTarget\tActualTarget\tSrcLines\tTargetLines\tLineRatio\tLineGap\tCombined\n";
+            for (size_t i = 0; i < std::min<size_t>(25, line_reports.size()); ++i) {
+                const auto& report = line_reports[i];
+                std::cout << report.source_name << "\t"
+                          << report.expected_name << "\t"
+                          << report.target_name << "\t"
+                          << report.source_lines << "\t"
+                          << report.target_lines << "\t"
+                          << std::fixed << std::setprecision(3) << report.line_ratio << "\t"
+                          << report.line_gap << "\t"
+                          << report.combined << "\n";
+            }
+
+            std::sort(reports.begin(), reports.end(),
+                [](const FunctionPairReport& a, const FunctionPairReport& b) {
+                    if (a.combined != b.combined) return a.combined < b.combined;
+                    if (std::abs(a.line_gap) != std::abs(b.line_gap)) {
+                        return std::abs(a.line_gap) > std::abs(b.line_gap);
+                    }
+                    return a.source_name < b.source_name;
+                });
+
+            std::cout << "\n=== Per-Function Similarity (strict name parity, worst score first) ===\n";
+            std::cout << "Source\tExpectedTarget\tActualTarget\tSrcLines\tTargetLines\tLineRatio\tLineGap"
+                      << "\tSrcNodes\tTargetNodes\tASTCosine\tIdentifierCosine\tCombined\tStubGuard\n";
+            for (const auto& report : reports) {
+                std::cout << report.source_name << "\t"
+                          << report.expected_name << "\t"
+                          << report.target_name << "\t"
+                          << report.source_lines << "\t"
+                          << report.target_lines << "\t"
+                          << std::fixed << std::setprecision(3) << report.line_ratio << "\t"
+                          << report.line_gap << "\t"
+                          << report.source_nodes << "\t"
+                          << report.target_nodes << "\t"
+                          << report.ast_cosine << "\t"
+                          << report.id_cosine << "\t"
+                          << report.combined << "\t"
+                          << (report.stub_guarded ? "yes" : "no") << "\n";
+            }
+
+            size_t pair_count = funcs1.size() * funcs2.size();
+            if (pair_count > 10000) {
+                std::cout << "\nFunction similarity matrix omitted: " << pair_count
+                          << " all-pairs cells would obscure the strict per-function parity report.\n";
+            } else {
+                std::cout << "\n=== Function Similarity Matrix ===\n\n";
+                std::cout << std::setw(20) << "";
+                for (const auto& func2 : funcs2) {
+                    std::cout << std::setw(12) << func2.name.substr(0, 10);
+                }
+                std::cout << "\n";
+
+                for (const auto& func1 : funcs1) {
+                    std::cout << std::setw(20) << func1.name.substr(0, 18);
+                    for (const auto& func2 : funcs2) {
+                        std::cout << std::setw(12) << std::fixed << std::setprecision(3)
+                                  << guarded_combined_similarity(func1, func2);
+                    }
+                    std::cout << "\n";
                 }
             }
 
