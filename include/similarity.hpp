@@ -345,6 +345,21 @@ public:
         return prev[m];
     }
 
+    static std::vector<Tree*> collect_postorder_sample(Tree* tree, int stride, int reserve_hint) {
+        std::vector<Tree*> nodes;
+        nodes.reserve(static_cast<size_t>(std::max(1, reserve_hint)));
+
+        int index = 0;
+        tree->traverse_postorder([&](Tree* n) {
+            if (index % stride == 0) {
+                nodes.push_back(n);
+            }
+            index++;
+        });
+
+        return nodes;
+    }
+
     /**
      * Tree edit distance with OOM protection.
      *
@@ -353,25 +368,23 @@ public:
      * Two-row DP keeps memory at O(min(n,m)) regardless.
      */
     static int tree_edit_distance(Tree* tree1, Tree* tree2) {
-        std::vector<Tree*> nodes1, nodes2;
-        tree1->traverse_postorder([&nodes1](Tree* n) { nodes1.push_back(n); });
-        tree2->traverse_postorder([&nodes2](Tree* n) { nodes2.push_back(n); });
-
-        int full_n = static_cast<int>(nodes1.size());
-        int full_m = static_cast<int>(nodes2.size());
+        int full_n = tree1->size();
+        int full_m = tree2->size();
 
         if (full_n <= MAX_EDIT_DISTANCE_NODES && full_m <= MAX_EDIT_DISTANCE_NODES) {
+            auto nodes1 = collect_postorder_sample(tree1, 1, full_n);
+            auto nodes2 = collect_postorder_sample(tree2, 1, full_m);
             return edit_distance_dp(nodes1, nodes2);
         }
 
-        // Strided sampling
         int stride1 = (full_n + MAX_EDIT_DISTANCE_NODES - 1) / MAX_EDIT_DISTANCE_NODES;
         int stride2 = (full_m + MAX_EDIT_DISTANCE_NODES - 1) / MAX_EDIT_DISTANCE_NODES;
         int stride = std::max(stride1, stride2);
 
-        std::vector<Tree*> s1, s2;
-        for (int i = 0; i < full_n; i += stride) s1.push_back(nodes1[i]);
-        for (int i = 0; i < full_m; i += stride) s2.push_back(nodes2[i]);
+        auto s1 = collect_postorder_sample(
+            tree1, stride, (full_n + stride - 1) / stride);
+        auto s2 = collect_postorder_sample(
+            tree2, stride, (full_m + stride - 1) / stride);
 
         return edit_distance_dp(s1, s2) * stride;
     }

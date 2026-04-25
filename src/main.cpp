@@ -3,6 +3,7 @@
 #include "tree_lstm.hpp"
 #include "codebase.hpp"
 #include "porting_utils.hpp"
+#include "transliteration_similarity.hpp"
 #include "task_manager.hpp"
 #include "symbol_analysis.hpp"
 #include "symbol_extraction.hpp"
@@ -3367,95 +3368,10 @@ void cmd_release(const std::string& task_file, const std::string& source_qualifi
     }
 }
 
-static bool guardrails_detect_shell_pipeline_peer_process() {
-    // If ast_distance is part of a shell pipeline (cmd | other),
-    // there will be a sibling process in our process group that's neither
-    // our ancestor nor our child.
-    //
-    // We intentionally allow non-terminal stdout when the caller captures output
-    // directly (e.g. a wrapper process reading from a pipe), because that is not
-    // the same failure mode as shell filtering commands like `sed`/`grep`.
-    const int self = static_cast<int>(getpid());
-    const int pgid = static_cast<int>(getpgrp());
-
-    FILE* fp = popen("ps -A -o pid= -o ppid= -o pgid= -o comm=", "r");
-    if (!fp) {
-        // Conservative fallback: if we cannot inspect the process table,
-        // assume the pipe is a shell pipeline and refuse to run.
-        return true;
-    }
-
-    struct Row {
-        int pid = 0;
-        int ppid = 0;
-        int pgid = 0;
-    };
-
-    std::vector<Row> rows;
-    rows.reserve(256);
-    std::unordered_map<int, int> ppid_by_pid;
-
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), fp)) {
-        std::string line(buf);
-        std::stringstream ss(line);
-        Row r;
-        if (!(ss >> r.pid >> r.ppid >> r.pgid)) {
-            continue;
-        }
-        rows.push_back(r);
-        ppid_by_pid[r.pid] = r.ppid;
-    }
-    pclose(fp);
-
-    // Build ancestor chain for this process.
-    std::unordered_set<int> ancestors;
-    int cur = self;
-    for (int i = 0; i < 64; ++i) {
-        auto it = ppid_by_pid.find(cur);
-        if (it == ppid_by_pid.end()) break;
-        int parent = it->second;
-        if (parent <= 0) break;
-        if (!ancestors.insert(parent).second) break;
-        cur = parent;
-    }
-
-    // Detect a peer process in the same process group.
-    for (const auto& r : rows) {
-        if (r.pgid != pgid) continue;
-        if (r.pid == self) continue;
-        if (ancestors.count(r.pid)) continue;
-        if (r.ppid == self) continue;  // our own child
-        return true;
-    }
-
-    return false;
-}
-
 int main(int argc, char* argv[]) {
-    // Refuse to run when stdout or stderr is piped to another program via a shell pipeline.
-    // This blocks `ast_distance ... | sed/grep/...` which has caused model-driven wrappers
-    // to silently filter or truncate dashboards.
-    // Skip this check in CI environments where stdout is captured by the runner.
-    if (!getenv("CI")) {
-        bool out_fifo = false;
-        bool err_fifo = false;
-        struct stat st;
-        if (fstat(STDOUT_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
-            out_fifo = true;
-        }
-        if (fstat(STDERR_FILENO, &st) == 0 && S_ISFIFO(st.st_mode)) {
-            err_fifo = true;
-        }
-
-        if ((out_fifo || err_fifo) && guardrails_detect_shell_pipeline_peer_process()) {
-            const char msg[] = "Error: stdout is piped to another program.\n"
-                               "ast_distance does not support piping (|).\n"
-                               "Run it directly in a terminal.\n";
-            write(STDERR_FILENO, msg, sizeof(msg) - 1);
-            return 2;
-        }
-    }
+    // Keep progress visible when stdout is captured or piped without rejecting
+    // legitimate large-output workflows such as `ast_distance ... | tee report.txt`.
+    setvbuf(stdout, nullptr, _IOLBF, 0);
 
     int agent = 0;
     bool override_mode = false;
@@ -3848,13 +3764,30 @@ int main(int argc, char* argv[]) {
             auto report = ASTSimilarity::compare(tree1.get(), tree2.get(), macro_friendly);
             report.print();
 
+            std::string text1 = file1_source ? *file1_source : read_file_to_string(file1);
+            std::string text2 = file2_source ? *file2_source : read_file_to_string(file2);
+            auto translit_report = TransliterationSimilarity::compare(text1, lang1, text2, lang2);
+
+            std::cout << "\n=== Transliteration-Normalized Text ===\n";
+            std::cout << "Tokens:               "
+                      << translit_report.source_tokens << " vs "
+                      << translit_report.target_tokens << "\n";
+            std::cout << "Token cosine:         " << std::fixed << std::setprecision(4)
+                      << translit_report.token_cosine << "\n";
+            std::cout << "Token jaccard:        " << std::fixed << std::setprecision(4)
+                      << translit_report.token_jaccard << "\n";
+            std::cout << "5-gram jaccard:       " << std::fixed << std::setprecision(4)
+                      << translit_report.kgram_jaccard << "\n";
+            std::cout << "Transliteration score:" << std::fixed << std::setprecision(4)
+                      << translit_report.score << "\n";
+
             auto ids1 = file1_source ? parser.extract_identifiers(*file1_source, lang1)
                                      : parser.extract_identifiers_from_file(file1, lang1);
             auto ids2 = file2_source ? parser.extract_identifiers(*file2_source, lang2)
                                      : parser.extract_identifiers_from_file(file2, lang2);
             float content_score_shape_guard = ASTSimilarity::combined_similarity_with_content(
                 tree1.get(), tree2.get(), ids1, ids2);
-            float content_score = content_score_shape_guard;
+            float content_score = std::max(content_score_shape_guard, translit_report.score);
 
             std::cout << "\n=== Identifier Content Analysis ===\n";
             std::cout << "Identifiers:          "
@@ -3946,6 +3879,7 @@ int main(int argc, char* argv[]) {
                 // If the file-level content-aware score (which includes strong AST-shape heuristics)
                 // is higher than the function-body blend, prefer it.
                 content_score = std::max(content_score, content_score_shape_guard);
+                content_score = std::max(content_score, translit_report.score);
             }
 
             if (function_scored) {

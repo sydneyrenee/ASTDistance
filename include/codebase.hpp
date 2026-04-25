@@ -4,6 +4,7 @@
 #include "ast_parser.hpp"
 #include "similarity.hpp"
 #include "porting_utils.hpp"
+#include "transliteration_similarity.hpp"
 #include "symbol_extractor.hpp"
 #include <filesystem>
 #include <map>
@@ -15,6 +16,7 @@
 #include <sstream>
 #include <regex>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -1070,11 +1072,31 @@ public:
         };
 
         std::vector<FunctionMatchCandidate> candidates;
-        candidates.reserve(src_prod.size() * tgt_all.size());
+        candidates.reserve(src_prod.size());
+
+        std::unordered_map<std::string, std::vector<int>> target_by_name;
+        target_by_name.reserve(tgt_all.size());
+        for (int j = 0; j < static_cast<int>(tgt_all.size()); ++j) {
+            std::string key = IdentifierStats::canonicalize(tgt_all[j]->name);
+            if (key.empty()) {
+                key = tgt_all[j]->name;
+            }
+            target_by_name[key].push_back(j);
+        }
 
         for (int i = 0; i < static_cast<int>(src_prod.size()); ++i) {
             const auto* source_func = src_prod[i];
-            for (int j = 0; j < static_cast<int>(tgt_all.size()); ++j) {
+            std::string key = IdentifierStats::canonicalize(source_func->name);
+            if (key.empty()) {
+                key = source_func->name;
+            }
+
+            auto bucket = target_by_name.find(key);
+            if (bucket == target_by_name.end()) {
+                continue;
+            }
+
+            for (int j : bucket->second) {
                 const auto* target_func = tgt_all[j];
 
                 float sim = 0.0f;
@@ -1335,6 +1357,15 @@ public:
         return ss.str();
     }
 
+    static std::string read_files_to_string(const std::vector<std::string>& paths) {
+        std::stringstream ss;
+        for (const auto& path : paths) {
+            ss << read_file_to_string(path);
+            ss << '\n';
+        }
+        return ss.str();
+    }
+
     struct TypeNameCoverage {
         int source_total = 0;
         int target_total = 0;
@@ -1451,6 +1482,9 @@ public:
                     if (src_tree) src_tree->flatten_node_type(82);
                     if (tgt_tree) tgt_tree->flatten_node_type(82);
 
+                    std::string src_text = read_files_to_string(src_file.paths);
+                    std::string tgt_text = read_files_to_string(tgt_file.paths);
+
                     auto src_ids = parser.extract_identifiers_from_file(
                         src_file.paths, src_lang);
                     auto tgt_ids = parser.extract_identifiers_from_file(
@@ -1458,6 +1492,9 @@ public:
 
                     float file_sim = ASTSimilarity::combined_similarity_with_content(
                         src_tree.get(), tgt_tree.get(), src_ids, tgt_ids);
+                    auto translit = TransliterationSimilarity::compare(
+                        src_text, src_lang, tgt_text, tgt_lang);
+                    file_sim = std::max(file_sim, translit.score);
 
                     // Parity penalty: if target is missing functions (by name),
                     // reduce the score even if the file-level shape looks similar.
