@@ -46,12 +46,14 @@ struct IdentifierStats {
      * "foo_bar" and "fooBar" and "FooBar" all become "foobar".
      * This lets snake_case Rust match camelCase Kotlin.
      *
-     * Also normalizes cross-language equivalents:
-     *   self/this → "this", Option/nullable → "option",
-     *   Vec/List/MutableList → "list", etc.
+     * This is intentionally strict: it does not map `fmt` to `toString`,
+     * `cmp` to `compareTo`, or collection/type synonyms. Those translations
+     * are real naming choices and should stay visible in parity reports.
      */
     static std::string canonicalize(const std::string& name) {
-        // First: lowercase + strip underscores
+        // Strict snake_case <-> camelCase / PascalCase parity:
+        // collapse case and drop underscores. No type-name remapping,
+        // no ignore lists, no synonym tables.
         std::string result;
         result.reserve(name.size());
         for (char c : name) {
@@ -60,191 +62,6 @@ struct IdentifierStats {
                     std::tolower(static_cast<unsigned char>(c)));
             }
         }
-
-        // Ignore a small, explicit set of low-signal identifiers which commonly appear in
-        // faithful Rust→Kotlin transliterations but would otherwise dominate the identifier
-        // overlap metric (package/import path components, receiver tokens, and tiny temp vars).
-        static const std::set<std::string> ignore = {
-            // Receiver tokens
-            "self",
-            "this",
-            // Rust path components / Kotlin package/import noise
-            "crate",
-            "io",
-            "github",
-            "com",
-            "kotlin",
-            "kotlinmania",
-            "starlarkkotlin",
-            // Common tiny temp vars (tuple destructuring / iterator glue)
-            "xk",
-            "xv",
-            "xy",
-            "yk",
-            "yv",
-            // Iterator/local glue frequently introduced by Kotlin ports
-            "xsiter",
-            "xsbasics",
-            "rest",
-            "merged",
-            "minlen",
-            "ch",
-            "sb",
-            // Rust-only derive/plumbing identifiers which do not exist in Kotlin ports
-            // but otherwise dominate identifier overlap.
-            "allocative",
-            "dupe",
-            "clone",
-            "copy",
-            "formatter",
-            "hasher",
-
-            // Kotlin Result plumbing which has no direct Rust identifier analogue.
-            // (Rust uses `?` / `Ok` / `Err` patterns instead.)
-            "getorelse",
-
-            // Kotlin stdlib/value types used to represent Rust syntax-only constructs.
-            // Rust tuples and slices don't surface as identifiers in tree-sitter-rust, so
-            // counting Kotlin's `Pair`/`Triple`/`Array`/`TupleN` identifiers is low-signal
-            // noise for faithful transliterations.
-            "array",
-            "pair",
-            "triple",
-            "tuple",
-            "tuple1",
-            "tuple4",
-            "tuple5",
-
-        };
-        if (ignore.count(result)) {
-            return "";
-        }
-
-        // Normalize Kotlin generic type parameter conventions like `TFrozen`, `KFrozen`, `AFrozen`
-        // to Rust's associated type name `Frozen`.
-        //
-        // This is a common, faithful transliteration pattern for Rust `T::Frozen` and should not
-        // count as identifier drift.
-        if (result.size() > 6 && result != "frozen") {
-            const std::string suffix = "frozen";
-            if (result.size() >= suffix.size() &&
-                result.compare(result.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                return "frozen";
-            }
-        }
-
-        // Cross-language equivalents (applied after lowering)
-        static const std::vector<std::pair<std::string, std::string>> equivalents = {
-            // Keywords
-            {"self", "this"},
-            {"crate", ""},          // Rust path component, no Kotlin equivalent
-            {"super", "super"},
-            // Visibility: Rust `pub(crate)` most closely matches Kotlin `internal`
-            {"internal", "public"},
-            // Collections
-            {"vec", "list"},
-            {"mutablelist", "list"},
-            {"arraylist", "list"},
-            {"mutablelistof", "list"},
-            {"listof", "list"},
-            {"tomutablelist", "list"},
-            {"tolist", "list"},
-            {"hashmap", "map"},
-            {"mutablemap", "map"},
-            {"mutablemapof", "map"},
-            {"mapof", "map"},
-            {"hashset", "set"},
-            {"mutableset", "set"},
-            {"mutablesetof", "set"},
-            {"setof", "set"},
-            {"btreemap", "map"},
-            {"btreeset", "set"},
-            // Types
-            {"option", "nullable"},
-            {"some", "notnull"},
-            {"none", "null"},
-            {"box", "boxed"},
-            {"arc", "arc"},
-            {"string", "string"},
-            {"str", "string"},
-            // Atomics: Rust frequently uses `AtomicPtr<T>`; Kotlin ports use `AtomicReference<T?>`.
-            {"atomicreference", "atomicptr"},
-            {"i32", "int"},
-            {"i64", "long"},
-            {"u32", "uint"},
-            {"u64", "ulong"},
-            {"usize", "uint"},
-            {"isize", "int"},
-            {"f32", "float"},
-            {"f64", "double"},
-            {"bool", "boolean"},
-            // Kotlin port helper type repr names → underlying Rust-ish scalar/type
-            {"i32typerepr", "int"},
-            {"i32starlarktyperepr", "int"},
-            {"stringtyperepr", "string"},
-            {"eithertyperepr", "either"},
-            {"kclass", "typeid"},
-            {"pair", "tuple"},
-            {"triple", "tuple"},
-            {"unit", "void"},
-            // Error handling
-            {"result", "result"},
-            {"freezeresult", "result"},
-            {"err", "error"},
-            {"ok", "success"},
-            {"failure", "error"},
-            // Test/assertion equivalents (Rust tests → kotlin.test)
-            {"assertequals", "asserteq"},
-            // Kotlin Result helper names often appear in faithful ports.
-            {"getorthrow", "unwrap"},
-            {"exceptionornull", "error"},
-            {"issuccess", "ok"},
-            {"isfailure", "err"},
-            // Rust trait methods -> Kotlin equivalents
-            {"fmt", "tostring"},          // Display::fmt -> toString
-            {"eq", "equals"},             // PartialEq::eq -> equals
-            {"partialeq", "equals"},
-            {"cmp", "compareto"},         // Ord::cmp -> compareTo
-            {"partialcmp", "compareto"},  // PartialOrd::partial_cmp -> compareTo
-            {"hash", "hashcode"},         // Hash::hash -> hashCode
-            {"clone", "copy"},            // Clone::clone -> copy (data class)
-            {"default", "invoke"},        // Default::default -> companion invoke
-            {"fromstr", "parse"},         // FromStr -> parse
-            {"intoiter", "iterator"},     // IntoIterator::into_iter -> iterator
-            {"intoiterator", "iterator"},
-            {"hasnext", "next"},
-            {"next", "next"},             // Iterator::next (same name)
-            {"serialize", "serialize"},   // serde (same name)
-            {"deserialize", "deserialize"},
-            // Project-wide convention: Rust Ordering is represented as Kotlin Int.
-            {"ordering", "int"},
-            // Kotlin string builders are commonly used where Rust uses `String`.
-            {"stringbuilder", "string"},
-            {"buildstring", "string"},
-            {"append", "push"},
-            {"substring", "split"},
-            {"deref", "get"},             // Deref::deref -> get/value
-            {"drop", "close"},            // Drop::drop -> close/Closeable
-            {"freeze", "freeze"},         // project-specific (same name)
-            {"trace", "trace"},           // project-specific (same name)
-            // Common prefixes
-            {"fn", "fun"},
-            {"impl", "class"},
-            {"pub", "public"},
-            {"mut", "var"},
-            {"let", "val"},
-            // Common operations in ports
-            {"len", "size"},
-            {"push", "add"},
-            {"add", "push"},
-        };
-
-        for (const auto& [from, to] : equivalents) {
-            if (result == from) {
-                return to;
-            }
-        }
-
         return result;
     }
 

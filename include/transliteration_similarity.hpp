@@ -167,18 +167,13 @@ private:
                 continue;
             }
 
-            if (c == '`') {
-                if (lang == Language::KOTLIN) {
-                    size_t start = ++i;
-                    while (i < text.size() && text[i] != '`') {
-                        ++i;
-                    }
-                    push_token(tokens, normalize_identifier(text.substr(start, i - start)));
-                    if (i < text.size()) ++i;
-                } else {
-                    skip_quoted(text, i, c);
-                    push_token(tokens, "str");
+            if (lang == Language::KOTLIN && c == '`') {
+                size_t start = ++i;
+                while (i < text.size() && text[i] != '`') {
+                    ++i;
                 }
+                push_token(tokens, normalize_identifier(text.substr(start, i - start)));
+                if (i < text.size()) ++i;
                 continue;
             }
 

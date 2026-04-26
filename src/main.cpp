@@ -7,6 +7,7 @@
 #include "task_manager.hpp"
 #include "symbol_analysis.hpp"
 #include "symbol_extraction.hpp"
+#include "reexport_config.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -41,6 +42,7 @@ struct GuardrailsContext {
 };
 
 static GuardrailsContext g_guardrails;
+static ReexportConfig g_reexport_config;
 
 static std::optional<std::chrono::seconds> file_age_seconds(const std::string& path) {
     try {
@@ -308,6 +310,8 @@ void print_usage(const char* program) {
     std::cerr << "Usage:\n";
     std::cerr << "  " << program << " [--agent <number>] [--task-file <tasks.json>] [--override] <command>\n";
     std::cerr << "      Guardrails: when a task system is initialized, commands require --agent.\n\n";
+    std::cerr << "  " << program << " [--config <ast_distance.config.json>] <command>\n";
+    std::cerr << "      Load optional reexport_modules patterns for consult-only wiring modules.\n\n";
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
@@ -1310,8 +1314,40 @@ void generate_reports(const Codebase& source, const Codebase& target,
                       const std::vector<std::pair<float, const CodebaseComparator::Match*>>& doc_gaps,
                       int incomplete_count,
                       int total_src_doc_lines,
-                      int total_tgt_doc_lines) {
+                      int total_tgt_doc_lines,
+                      const std::vector<CodebaseComparator::Match>& reexport_matches,
+                      const std::vector<const SourceFile*>& reexport_missing) {
     (void)incomplete_count;
+
+    auto write_reexport_section = [&](std::ofstream& out) {
+        if (reexport_matches.empty() && reexport_missing.empty()) return;
+        out << "## Reexport / Wiring Modules\n\n";
+        out << "These files match `reexport_modules` patterns in `"
+            << g_reexport_config.config_path << "`. They are filtered out of\n"
+            << "normal priority and missing-file ladders because they are wiring\n"
+            << "modules, not direct logic ports. Consult them for call-site routing;\n"
+            << "do not treat them as the next implementation target by default.\n\n";
+        if (!reexport_matches.empty()) {
+            out << "### Matched\n\n";
+            out << "| Source | Target | Path |\n";
+            out << "|--------|--------|------|\n";
+            for (const auto& m : reexport_matches) {
+                out << "| `" << m.source_qualified << "` | `" << m.target_qualified
+                    << "` | `" << m.source_path << "` |\n";
+            }
+            out << "\n";
+        }
+        if (!reexport_missing.empty()) {
+            out << "### Missing\n\n";
+            out << "| Source | Deps | Path |\n";
+            out << "|--------|------|------|\n";
+            for (const auto* sf : reexport_missing) {
+                out << "| `" << sf->qualified_name << "` | " << sf->dependent_count
+                    << " | `" << sf->relative_path << "` |\n";
+            }
+            out << "\n";
+        }
+    };
     
     std::cout << "\n=== Generating Reports ===\n\n";
     
@@ -1366,9 +1402,13 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "| Porting progress | " << matched << " | "
                << std::fixed << std::setprecision(1)
                << completion_pct << "% (matched) |\n";
-        report << "| Missing files | " << comp.unmatched_source.size() << " | "
+        report << "| Missing files | " << missing.size() << " | "
                << std::fixed << std::setprecision(1)
-               << (static_cast<float>(comp.unmatched_source.size()) / total_source * 100.0f) << "% |\n\n";
+               << (static_cast<float>(missing.size()) / total_source * 100.0f) << "% |\n";
+        if (!reexport_missing.empty()) {
+            report << "| Reexport/wiring files | " << reexport_missing.size() << " | consult-only |\n";
+        }
+        report << "\n";
         
         report << "## Port Quality Analysis\n\n";
         report << "**Average Similarity:** " << std::fixed << std::setprecision(2) << avg_similarity << "\n\n";
@@ -1500,7 +1540,8 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	            }
 	            report << "\n";
 	        }
-	        
+	        write_reexport_section(report);
+
 	        std::cout << "✅ Generated: port_status_report.md\n";
 	    }
     
@@ -1574,7 +1615,8 @@ void generate_reports(const Codebase& source, const Codebase& target,
 	            }
 	            report << "\n";
 	        }
-	        
+	        write_reexport_section(report);
+
 	        std::cout << "✅ Generated: high_priority_ports.md\n";
 	    }
     
@@ -1679,6 +1721,8 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "# Get next high-priority task\n";
         report << "./ast_distance --assign tasks.json <agent-id>\n";
         report << "```\n";
+
+        write_reexport_section(report);
         
         std::cout << "✅ Generated: NEXT_ACTIONS.md\n";
     }
@@ -1715,7 +1759,17 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
     std::cout << "Computing AST similarities...\n";
     comp.compute_similarities();
 
-    auto ranked = comp.ranked_for_porting();
+    auto ranked_all = comp.ranked_for_porting();
+    std::vector<CodebaseComparator::Match> ranked;
+    std::vector<CodebaseComparator::Match> ranked_reexports;
+    ranked.reserve(ranked_all.size());
+    for (auto& m : ranked_all) {
+        if (g_reexport_config.matches(m.source_path)) {
+            ranked_reexports.push_back(std::move(m));
+        } else {
+            ranked.push_back(std::move(m));
+        }
+    }
 
     // Agent-scoped dashboard (guardrails): in task mode, lock the view to the assigned file
     // and its direct imports to prevent "dashboard skipping" and out-of-scope prioritization.
@@ -2149,16 +2203,23 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 
 	    // Prepare missing files vector for report generation
 	    std::vector<const SourceFile*> missing;
+	    std::vector<const SourceFile*> missing_reexports;
 	    if (!comp.unmatched_source.empty()) {
 	        std::cout << "\n=== Missing Files (by Dependents) ===\n\n";
 	        // Sort unmatched by dependents
 	        for (const auto& path : comp.unmatched_source) {
-	            missing.push_back(&source.files.at(path));
+	            const SourceFile* sf = &source.files.at(path);
+	            if (g_reexport_config.matches(sf->relative_path)) {
+	                missing_reexports.push_back(sf);
+	            } else {
+	                missing.push_back(sf);
+	            }
 	        }
-	        std::sort(missing.begin(), missing.end(),
-	            [](const SourceFile* a, const SourceFile* b) {
-	                return a->dependent_count > b->dependent_count;
-	            });
+	        auto by_dependents = [](const SourceFile* a, const SourceFile* b) {
+	            return a->dependent_count > b->dependent_count;
+	        };
+	        std::sort(missing.begin(), missing.end(), by_dependents);
+	        std::sort(missing_reexports.begin(), missing_reexports.end(), by_dependents);
 
 		        std::cout << std::setw(30) << std::left << "Source File"
 		                  << std::setw(11) << "Dependents"
@@ -2170,6 +2231,14 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 		                      << std::setw(11) << sf->dependent_count
 		                      << sf->relative_path << "\n";
 		        }
+	        if (!missing_reexports.empty()) {
+	            std::cout << "\n=== Reexport / Wiring Modules (consult, don't transliterate) ===\n\n";
+	            for (const auto* sf : missing_reexports) {
+	                std::cout << std::setw(30) << std::left << sf->qualified_name.substr(0, 28)
+	                          << std::setw(11) << sf->dependent_count
+	                          << sf->relative_path << "\n";
+	            }
+	        }
 		    }
 
 	    // Documentation gaps section
@@ -2229,8 +2298,9 @@ void cmd_deep(const std::string& src_dir, const std::string& src_lang,
 	    }
 
     // Generate markdown reports
-    generate_reports(source, target, comp, ranked, missing, doc_gaps, 
-                     incomplete, total_src_doc_lines, total_tgt_doc_lines);
+    generate_reports(source, target, comp, ranked, missing, doc_gaps,
+                     incomplete, total_src_doc_lines, total_tgt_doc_lines,
+                     ranked_reexports, missing_reexports);
 }
 
 void cmd_missing(const std::string& src_dir, const std::string& src_lang,
@@ -2255,18 +2325,37 @@ void cmd_missing(const std::string& src_dir, const std::string& src_lang,
 
     // Sort unmatched by dependents
     std::vector<const SourceFile*> missing;
+    std::vector<const SourceFile*> missing_reexports;
     for (const auto& path : comp.unmatched_source) {
-        missing.push_back(&source.files.at(path));
+        const SourceFile* sf = &source.files.at(path);
+        if (g_reexport_config.matches(sf->relative_path)) {
+            missing_reexports.push_back(sf);
+        } else {
+            missing.push_back(sf);
+        }
     }
-    std::sort(missing.begin(), missing.end(),
-        [](const SourceFile* a, const SourceFile* b) {
-            return a->dependent_count > b->dependent_count;
-        });
+    auto by_dependents = [](const SourceFile* a, const SourceFile* b) {
+        return a->dependent_count > b->dependent_count;
+    };
+    std::sort(missing.begin(), missing.end(), by_dependents);
+    std::sort(missing_reexports.begin(), missing_reexports.end(), by_dependents);
 
     for (const auto* sf : missing) {
         std::cout << std::setw(40) << std::left << sf->qualified_name.substr(0, 38)
                   << std::setw(10) << sf->dependent_count
                   << sf->relative_path << "\n";
+    }
+    if (!missing_reexports.empty()) {
+        std::cout << "\n=== Reexport / Wiring Modules (consult, don't transliterate) ===\n\n";
+        std::cout << std::setw(40) << std::left << "Source File"
+                  << std::setw(10) << "Deps"
+                  << "Path\n";
+        std::cout << std::string(80, '-') << "\n";
+        for (const auto* sf : missing_reexports) {
+            std::cout << std::setw(40) << std::left << sf->qualified_name.substr(0, 38)
+                      << std::setw(10) << sf->dependent_count
+                      << sf->relative_path << "\n";
+        }
     }
 
     // Matched-but-stub files are not missing in the structural sense but are
@@ -2718,6 +2807,9 @@ void cmd_init_tasks(const std::string& src_dir, const std::string& src_lang,
         }
         if (tm.source_lang == "rust" &&
             rust_is_module_wiring_only(std::filesystem::path(tm.source_root) / sf->relative_path)) {
+            continue;
+        }
+        if (g_reexport_config.matches(sf->relative_path)) {
             continue;
         }
 
@@ -3274,6 +3366,9 @@ void cmd_complete(const std::string& task_file, const std::string& source_qualif
             rust_is_module_wiring_only(std::filesystem::path(tm.source_root) / sf->relative_path)) {
             continue;
         }
+        if (g_reexport_config.matches(sf->relative_path)) {
+            continue;
+        }
 
         // Generate expected target path
         std::string kt_path = sf->relative_path;
@@ -3546,6 +3641,7 @@ int main(int argc, char* argv[]) {
     int agent = 0;
     bool override_mode = false;
     std::string task_file_flag;
+    std::string config_file_flag;
 
     std::vector<std::string> rest;
     rest.reserve(static_cast<size_t>(argc));
@@ -3555,10 +3651,29 @@ int main(int argc, char* argv[]) {
             agent = std::stoi(argv[++i]);
         } else if (arg == "--task-file" && i + 1 < argc) {
             task_file_flag = argv[++i];
+        } else if (arg == "--config" && i + 1 < argc) {
+            config_file_flag = argv[++i];
         } else if (arg == "--override") {
             override_mode = true;
         } else {
             rest.push_back(arg);
+        }
+    }
+
+    {
+        std::string cfg_path = !config_file_flag.empty()
+            ? config_file_flag
+            : default_reexport_config_path();
+        if (load_reexport_config(cfg_path, g_reexport_config)) {
+            if (!g_reexport_config.patterns.empty()) {
+                std::cerr << "Info: loaded " << g_reexport_config.patterns.size()
+                          << " reexport-module pattern"
+                          << (g_reexport_config.patterns.size() == 1 ? "" : "s")
+                          << " from " << cfg_path << ".\n";
+            }
+        } else if (!config_file_flag.empty()) {
+            std::cerr << "Warning: --config " << cfg_path
+                      << " could not be opened; reexport filtering disabled.\n";
         }
     }
 

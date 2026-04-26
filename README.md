@@ -51,6 +51,16 @@ missing-symbol names needed for porting work.
 See [TRANSLITERATION_DISTANCE.md](TRANSLITERATION_DISTANCE.md) for the planned
 parser-guided translated-buffer distance model.
 
+Optional `ast_distance.config.json` files can define `reexport_modules` patterns
+for declarations-only wiring files that should be reported as consult-only
+instead of prioritized as direct logic ports:
+
+```json
+{
+  "reexport_modules": ["values/layout/heap.rs", "*/mod.rs"]
+}
+```
+
 ### Show missing files
 ```bash
 ./ast_distance --missing <src_dir> <src_lang> <tgt_dir> <tgt_lang>

@@ -15,7 +15,6 @@
 #include <fstream>
 #include <sstream>
 #include <regex>
-#include <unordered_set>
 #include <unordered_map>
 
 namespace fs = std::filesystem;
@@ -238,16 +237,37 @@ public:
         fs::path rel_base = root_path;
         roots_to_scan.push_back(root_path);
         if (language == "kotlin") {
-            const std::string marker = "/src/commonMain/kotlin/";
-            const auto pos = root_path.find(marker);
+            // Accept both absolute paths containing `/src/commonMain/kotlin/`
+            // and relative roots beginning with `src/commonMain/kotlin/`.
+            const std::string leading = "src/commonMain/kotlin";
+            size_t pos = std::string::npos;
+            size_t skip = 0;
+            if (root_path == leading || root_path.rfind(leading + "/", 0) == 0) {
+                pos = 0;
+            } else {
+                const std::string marker = "/" + leading;
+                const auto found = root_path.find(marker);
+                if (found != std::string::npos &&
+                    (found + marker.size() == root_path.size() ||
+                     root_path[found + marker.size()] == '/')) {
+                    pos = found;
+                    skip = 1;
+                }
+            }
             if (pos != std::string::npos) {
                 const std::string repo_root = root_path.substr(0, pos);
-                const std::string suffix = root_path.substr(pos + marker.size());
-                const fs::path test_root = fs::path(repo_root) / "src" / "commonTest" / "kotlin" / suffix;
+                size_t suffix_start = pos + skip + leading.size();
+                if (suffix_start < root_path.size() && root_path[suffix_start] == '/') {
+                    ++suffix_start;
+                }
+                const std::string suffix = root_path.substr(suffix_start);
+                const fs::path test_root = repo_root.empty()
+                    ? fs::path("src") / "commonTest" / "kotlin" / suffix
+                    : fs::path(repo_root) / "src" / "commonTest" / "kotlin" / suffix;
                 if (fs::exists(test_root) && fs::is_directory(test_root)) {
                     roots_to_scan.push_back(test_root);
                     // Use repo root for relative paths so commonMain/commonTest remain distinct.
-                    rel_base = repo_root;
+                    rel_base = repo_root.empty() ? fs::path(".") : fs::path(repo_root);
                 }
             }
         }
@@ -612,6 +632,12 @@ public:
         bool is_stub = false;
         bool matched_by_header = false;  // True if matched via "Transliterated from:"
 
+        // Additional target files that explicitly point to this same source
+        // file via port-lint headers. Common use: Kotlin commonTest files with
+        // `// port-lint: tests ...` should count toward function/test/type
+        // parity without becoming the primary production file match.
+        std::vector<std::string> additional_target_paths;
+
         // Function parity (name-based) within a file. Used to prevent "signature-only" stubs.
         int source_function_count = 0;
         int target_function_count = 0;
@@ -794,6 +820,56 @@ public:
         return 0.0f;
     }
 
+    static bool is_test_transliteration(const std::string& header_path) {
+        return header_path.rfind("tests:", 0) == 0;
+    }
+
+    static std::string source_path_from_transliteration(const std::string& header_path) {
+        if (is_test_transliteration(header_path)) {
+            return header_path.substr(std::string("tests:").size());
+        }
+        return header_path;
+    }
+
+    static float transliteration_header_match_score(
+            const SourceFile& src_file,
+            const SourceFile& tgt_file) {
+        if (tgt_file.transliterated_from.empty()) return 0.0f;
+        const std::string from = source_path_from_transliteration(tgt_file.transliterated_from);
+
+        // Check if transliterated_from contains the FULL relative path (most precise)
+        if (from.find(src_file.relative_path) != std::string::npos) {
+            return 1.0f;
+        }
+        // Check if transliterated_from ends with the EXACT filename (not substring)
+        // Use ends_with to avoid Flow.kt matching StateFlow.kt
+        if (from.ends_with("/" + src_file.filename) || from == src_file.filename) {
+            // Also verify directory context matches
+            std::string tgt_dir = tgt_file.qualified_name;
+            std::string src_dir = src_file.qualified_name;
+            size_t tgt_dot = tgt_dir.rfind('.');
+            size_t src_dot = src_dir.rfind('.');
+            if (tgt_dot != std::string::npos) tgt_dir = tgt_dir.substr(0, tgt_dot);
+            if (src_dot != std::string::npos) src_dir = src_dir.substr(0, src_dot);
+
+            if (SourceFile::normalize_name(tgt_dir) == SourceFile::normalize_name(src_dir)) {
+                return 0.9f;
+            }
+            return 0.5f;
+        }
+        // Loose check - transliterated_from ends with stem (stricter than find)
+        if (from.ends_with("/" + src_file.stem + ".kt") ||
+            from.ends_with("/" + src_file.stem + ".rs") ||
+            from.ends_with("/" + src_file.stem + ".py") ||
+            from.ends_with("/" + src_file.stem + ".cpp") ||
+            from.ends_with("/" + src_file.stem + ".cc") ||
+            from.ends_with("/" + src_file.stem + ".hpp") ||
+            from.ends_with("/" + src_file.stem + ".h")) {
+            return 0.3f;
+        }
+        return 0.0f;
+    }
+
     /**
      * Find matching files between codebases.
      * Priority: 1) "Transliterated from:" headers, 2) Name matching
@@ -809,43 +885,11 @@ public:
 
         for (const auto& [tgt_path, tgt_file] : target.files) {
             if (tgt_file.transliterated_from.empty()) continue;
+            if (is_test_transliteration(tgt_file.transliterated_from)) continue;
 
             // Try to find the source file that matches the header
             for (const auto& [src_path, src_file] : source.files) {
-                float match_score = 0.0f;
-
-                // Check if transliterated_from contains the FULL relative path (most precise)
-                if (tgt_file.transliterated_from.find(src_file.relative_path) != std::string::npos) {
-                    match_score = 1.0f;  // Full path match
-                }
-                // Check if transliterated_from ends with the EXACT filename (not substring)
-                // Use ends_with to avoid Flow.kt matching StateFlow.kt
-                else if (tgt_file.transliterated_from.ends_with("/" + src_file.filename) ||
-                         tgt_file.transliterated_from == src_file.filename) {
-                    // Also verify directory context matches
-                    std::string tgt_dir = tgt_file.qualified_name;
-                    std::string src_dir = src_file.qualified_name;
-                    size_t tgt_dot = tgt_dir.rfind('.');
-                    size_t src_dot = src_dir.rfind('.');
-                    if (tgt_dot != std::string::npos) tgt_dir = tgt_dir.substr(0, tgt_dot);
-                    if (src_dot != std::string::npos) src_dir = src_dir.substr(0, src_dot);
-
-                    if (SourceFile::normalize_name(tgt_dir) == SourceFile::normalize_name(src_dir)) {
-                        match_score = 0.9f;  // Filename + directory context match
-                    } else {
-                        match_score = 0.5f;  // Just filename match, different directory
-                    }
-                }
-                // Loose check - transliterated_from ends with stem (stricter than find)
-                else if (tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".kt") ||
-                         tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".rs") ||
-                         tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".py") ||
-                         tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".cpp") ||
-                         tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".cc") ||
-                         tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".hpp") ||
-                         tgt_file.transliterated_from.ends_with("/" + src_file.stem + ".h")) {
-                    match_score = 0.3f;  // Stem found but not as confident
-                }
+                float match_score = transliteration_header_match_score(src_file, tgt_file);
 
                 if (match_score > 0.0f) {
                     header_candidates.emplace_back(match_score, src_path, tgt_path);
@@ -909,6 +953,41 @@ public:
             matched_targets.insert(tgt_path);
         }
 
+        // Pool additional target files that explicitly point to an already
+        // matched source. This keeps `commonTest` and split translation units
+        // from being misused as primary matches while still counting their
+        // functions/types toward parity for the source file.
+        {
+            std::map<std::string, Match*> match_by_src;
+            for (auto& m : matches) {
+                match_by_src[m.source_path] = &m;
+            }
+
+            for (const auto& [tgt_path, tgt_file] : target.files) {
+                if (matched_targets.count(tgt_path)) continue;
+                if (tgt_file.transliterated_from.empty()) continue;
+
+                Match* best = nullptr;
+                float best_score = 0.0f;
+                for (const auto& [src_path, src_file] : source.files) {
+                    auto mit = match_by_src.find(src_path);
+                    if (mit == match_by_src.end()) continue;
+
+                    float score = transliteration_header_match_score(src_file, tgt_file);
+                    if (score > best_score) {
+                        best_score = score;
+                        best = mit->second;
+                    }
+                }
+                if (best != nullptr) {
+                    for (const auto& p : tgt_file.paths) {
+                        best->additional_target_paths.push_back(p);
+                    }
+                    matched_targets.insert(tgt_path);
+                }
+            }
+        }
+
         // Second pass: Name-based matching for remaining files
         std::vector<std::tuple<float, std::string, std::string>> candidates;
 
@@ -917,6 +996,7 @@ public:
 
             for (const auto& [tgt_path, tgt_file] : target.files) {
                 if (matched_targets.count(tgt_path)) continue;
+                if (is_test_transliteration(tgt_file.transliterated_from)) continue;
 
                 float score = name_match_score(src_file, tgt_file);
                 if (score > 0.4f) {
@@ -1188,14 +1268,8 @@ public:
         for (const auto& f : source_functions) {
             if (f.name.empty() || f.name == "<anonymous>") continue;
             std::string key = IdentifierStats::canonicalize(f.name);
-            // Rust `Drop` impl methods appear as a `drop` function in function extraction.
-            // Kotlin ports have no direct equivalent, so do not require it for parity.
-            if (key == "drop") {
-                continue;
-            }
-            // Rust often has duplicate trait method names (e.g. multiple `fmt` impls).
-            // In Kotlin ports these typically collapse into a single canonical method
-            // (e.g. `toString`), so only require each canonical name once.
+            // Function extraction is name-only here, so repeated trait method names
+            // in one source file are counted once per canonical name.
             if (src_seen.count(key)) {
                 continue;
             }
@@ -1236,104 +1310,15 @@ public:
         return cov;
     }
 
-    static bool rust_kotlin_ignorable_function_name_for_coverage(const std::string& canonical_name) {
-        // Rust trait impl methods frequently appear as small, repeated function names
-        // (e.g. `fmt`, `eq`) that don't exist as explicit functions in Kotlin ports
-        // (they map to `toString`/`equals`/`hashCode`).
-        //
-        // Requiring these names for parity creates systematic false negatives on
-        // faithful Rust→Kotlin transliterations.
-        //
-        // Keep this list small and explicit to preserve the strength of function-set
-        // parity as a guardrail against logic rewrites.
-        static const std::unordered_set<std::string> k = {
-            "fmt",
-            "eq",
-            "hash",
-            "partialcmp",
-            "cmp",
-            "equivalent",
-            "default",
-            "serialize",
-            // Rust assigns via traits (`AddAssign`, `SubAssign`, `MulAssign`) which don't appear as
-            // explicit function names in Kotlin (Kotlin desugars `+=` to `a = a + b` when no
-            // `plusAssign` exists, which is the correct pattern for immutable value types).
-            "addassign",
-            "subassign",
-            "mulassign",
-            // Local helper in Rust (`fn split_at_safe` inside `display_for_type_error`).
-            // Kotlin ports may keep this helper local or inline it, and Kotlin function
-            // extraction is less reliable for nested locals, so do not require it.
-            "splitatsafe",
-        };
-        return k.find(canonical_name) != k.end();
-    }
-
-    static std::vector<FunctionInfo> rust_kotlin_augment_target_functions_for_coverage(
-            const std::vector<FunctionInfo>& target_functions) {
-        // Function-name coverage is a guardrail: it ensures ports preserve the set of meaningful
-        // behaviors within a file. However, some Rust behaviors are expressed through trait
-        // methods whose names do not exist literally in Kotlin ports:
-        //   - `Mul::mul` maps to `operator fun times(...)`
-        //   - `Ord::cmp` / `PartialOrd::partial_cmp` map to `compareTo`
-        //   - `Add::add` / `Sub::sub` may map to `plus` / `minus` operator functions
-        //
-        // To avoid false negatives on faithful transliterations, we augment the Kotlin function
-        // set with a small, explicit set of canonical equivalents for coverage matching only.
-        std::vector<FunctionInfo> out = target_functions;
-
-        std::unordered_set<std::string> present;
-        present.reserve(target_functions.size());
-        bool has_to_string_raw = false;
-        bool has_compare_to_raw = false;
-        for (const auto& f : target_functions) {
-            if (f.name.empty() || f.name == "<anonymous>") continue;
-            if (f.name == "toString") has_to_string_raw = true;
-            if (f.name == "compareTo") has_compare_to_raw = true;
-            present.insert(IdentifierStats::canonicalize(f.name));
-        }
-
-        auto add_if_missing = [&](const std::string& name) {
-            std::string key = IdentifierStats::canonicalize(name);
-            if (present.find(key) != present.end()) return;
-            FunctionInfo fi;
-            fi.name = name;
-            out.push_back(std::move(fi));
-            present.insert(std::move(key));
-        };
-
-        if (present.find("times") != present.end()) {
-            add_if_missing("mul");
-        }
-        if (present.find("compareto") != present.end() || has_compare_to_raw) {
-            add_if_missing("cmp");
-            add_if_missing("partial_cmp");
-        }
-        if (present.find("plus") != present.end()) {
-            add_if_missing("add");
-        }
-        if (present.find("minus") != present.end()) {
-            add_if_missing("sub");
-        }
-        if (present.find("hashcode") != present.end()) {
-            add_if_missing("hash");
-        }
-        if (present.find("tostring") != present.end() || has_to_string_raw) {
-            add_if_missing("fmt");
-        }
-        if (present.find("to") != present.end()) {
-            add_if_missing("bitor");
-        }
-
-        return out;
-    }
-
     static FunctionNameCoverage function_name_coverage_with_lang(
             const std::vector<FunctionInfo>& source_functions,
             const std::vector<FunctionInfo>& target_functions,
             Language src_lang,
             Language tgt_lang) {
         if (src_lang == Language::RUST && tgt_lang == Language::KOTLIN) {
+            // Strict parity: every non-anonymous Rust function name must have a
+            // declared Kotlin counterpart after snake_case -> camelCase
+            // canonicalization. No ignore lists or synthetic aliases.
             std::vector<FunctionInfo> filtered;
             filtered.reserve(source_functions.size());
             for (const auto& f : source_functions) {
@@ -1345,13 +1330,9 @@ public:
                 if (key.empty()) {
                     continue;
                 }
-                if (rust_kotlin_ignorable_function_name_for_coverage(key)) {
-                    continue;
-                }
                 filtered.push_back(f);
             }
-            auto tgt_augmented = rust_kotlin_augment_target_functions_for_coverage(target_functions);
-            return function_name_coverage(filtered, tgt_augmented);
+            return function_name_coverage(filtered, target_functions);
         }
         return function_name_coverage(source_functions, target_functions);
     }
@@ -1397,8 +1378,8 @@ public:
             return cov;
         }
 
-        std::string src_text = src_file.paths.empty() ? "" : read_file_to_string(src_file.paths.front());
-        std::string tgt_text = tgt_file.paths.empty() ? "" : read_file_to_string(tgt_file.paths.front());
+        std::string src_text = read_files_to_string(src_file.paths);
+        std::string tgt_text = read_files_to_string(tgt_file.paths);
         if (src_text.empty() || tgt_text.empty()) {
             return cov;
         }
@@ -1507,8 +1488,12 @@ public:
                     // reduce the score even if the file-level shape looks similar.
                     auto source_functions = parser.extract_function_infos_from_files(
                         src_file.paths, src_lang);
+                    std::vector<std::string> all_target_paths = tgt_file.paths;
+                    all_target_paths.insert(all_target_paths.end(),
+                                            m.additional_target_paths.begin(),
+                                            m.additional_target_paths.end());
                     auto target_functions = parser.extract_function_infos_from_files(
-                        tgt_file.paths, tgt_lang);
+                        all_target_paths, tgt_lang);
                     auto fn_cov = function_name_coverage_with_lang(
                         source_functions, target_functions, src_lang, tgt_lang);
 
@@ -1520,8 +1505,10 @@ public:
                     m.source_test_function_count = fn_cov.source_test_count;
                     m.matched_test_function_count = fn_cov.matched_test_count;
 
+                    SourceFile combined_tgt_file = tgt_file;
+                    combined_tgt_file.paths = all_target_paths;
                     auto ty_cov = type_name_coverage(
-                        symbol_src, symbol_tgt, src_lang, tgt_lang, src_file, tgt_file);
+                        symbol_src, symbol_tgt, src_lang, tgt_lang, src_file, combined_tgt_file);
                     m.source_type_count = ty_cov.source_total;
                     m.target_type_count = ty_cov.target_total;
                     m.matched_type_count = ty_cov.matched;
