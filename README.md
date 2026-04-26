@@ -51,13 +51,34 @@ missing-symbol names needed for porting work.
 See [TRANSLITERATION_DISTANCE.md](TRANSLITERATION_DISTANCE.md) for the planned
 parser-guided translated-buffer distance model.
 
-Optional `ast_distance.config.json` files can define `reexport_modules` patterns
-for declarations-only wiring files that should be reported as consult-only
-instead of prioritized as direct logic ports:
+Optional `.ast_distance_config.json` files define the local port roots and
+`reexport_modules` patterns for declarations-only wiring files that should be
+reported as consult-only instead of prioritized as direct logic ports. If the
+file is missing, the first comparison command writes a stub using the source
+and target paths from that comparison.
 
 ```json
 {
-  "reexport_modules": ["values/layout/heap.rs", "*/mod.rs"]
+  "type": "port",
+  "name": "my-port",
+  "source": {
+    "path": "tmp/upstream/src",
+    "lang": "rust"
+  },
+  "target": {
+    "path": "src/commonMain/kotlin/my/package",
+    "lang": "kotlin"
+  },
+  "checks": {
+    "deep": true,
+    "missing": true,
+    "todos": true,
+    "lint": true
+  },
+  "reexport_modules": [
+    "mod.rs",
+    "lib.rs"
+  ]
 }
 ```
 

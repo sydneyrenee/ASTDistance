@@ -198,6 +198,37 @@ const char* language_name(Language lang) {
     return "Unknown";
 }
 
+const char* language_config_name(Language lang) {
+    switch (lang) {
+        case Language::RUST: return "rust";
+        case Language::KOTLIN: return "kotlin";
+        case Language::CPP: return "cpp";
+        case Language::PYTHON: return "python";
+        case Language::TYPESCRIPT: return "typescript";
+    }
+    return "unknown";
+}
+
+static std::string current_project_name() {
+    try {
+        return std::filesystem::current_path().filename().string();
+    } catch (...) {
+        return "ast-distance-port";
+    }
+}
+
+static void write_missing_config_after_comparison(const ConfigEndpoint& source,
+                                                  const ConfigEndpoint& target) {
+    const std::string path = default_reexport_config_path();
+    if (g_reexport_config.loaded || std::filesystem::exists(path)) return;
+    if (write_ast_distance_config_stub(path, current_project_name(), source, target)) {
+        std::cerr << "Info: wrote " << path
+                  << " from this comparison; add reexport_modules entries there as needed.\n";
+    } else {
+        std::cerr << "Warning: could not write " << path << ".\n";
+    }
+}
+
 static std::string lowercase_ascii(std::string s) {
     for (char& c : s) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -310,8 +341,7 @@ void print_usage(const char* program) {
     std::cerr << "Usage:\n";
     std::cerr << "  " << program << " [--agent <number>] [--task-file <tasks.json>] [--override] <command>\n";
     std::cerr << "      Guardrails: when a task system is initialized, commands require --agent.\n\n";
-    std::cerr << "  " << program << " [--config <ast_distance.config.json>] <command>\n";
-    std::cerr << "      Load optional reexport_modules patterns for consult-only wiring modules.\n\n";
+    std::cerr << "      Loads .ast_distance_config.json when present; comparison commands create a stub when absent.\n\n";
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
@@ -3641,7 +3671,6 @@ int main(int argc, char* argv[]) {
     int agent = 0;
     bool override_mode = false;
     std::string task_file_flag;
-    std::string config_file_flag;
 
     std::vector<std::string> rest;
     rest.reserve(static_cast<size_t>(argc));
@@ -3651,8 +3680,6 @@ int main(int argc, char* argv[]) {
             agent = std::stoi(argv[++i]);
         } else if (arg == "--task-file" && i + 1 < argc) {
             task_file_flag = argv[++i];
-        } else if (arg == "--config" && i + 1 < argc) {
-            config_file_flag = argv[++i];
         } else if (arg == "--override") {
             override_mode = true;
         } else {
@@ -3661,9 +3688,7 @@ int main(int argc, char* argv[]) {
     }
 
     {
-        std::string cfg_path = !config_file_flag.empty()
-            ? config_file_flag
-            : default_reexport_config_path();
+        std::string cfg_path = default_reexport_config_path();
         if (load_reexport_config(cfg_path, g_reexport_config)) {
             if (!g_reexport_config.patterns.empty()) {
                 std::cerr << "Info: loaded " << g_reexport_config.patterns.size()
@@ -3671,9 +3696,6 @@ int main(int argc, char* argv[]) {
                           << (g_reexport_config.patterns.size() == 1 ? "" : "s")
                           << " from " << cfg_path << ".\n";
             }
-        } else if (!config_file_flag.empty()) {
-            std::cerr << "Warning: --config " << cfg_path
-                      << " could not be opened; reexport filtering disabled.\n";
         }
     }
 
@@ -3756,9 +3778,11 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "--rank" && argc >= 6) {
             cmd_rank(argv[2], argv[3], argv[4], argv[5]);
+            write_missing_config_after_comparison({argv[2], argv[3]}, {argv[4], argv[5]});
 
         } else if (mode == "--deep" && argc >= 6) {
             cmd_deep(argv[2], argv[3], argv[4], argv[5]);
+            write_missing_config_after_comparison({argv[2], argv[3]}, {argv[4], argv[5]});
 
         } else if (mode == "--numpy-mlx" && argc >= 4) {
             cmd_numpy_mlx(argv[2], argv[3]);
@@ -3768,6 +3792,7 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "--missing" && argc >= 6) {
             cmd_missing(argv[2], argv[3], argv[4], argv[5]);
+            write_missing_config_after_comparison({argv[2], argv[3]}, {argv[4], argv[5]});
 
         } else if (mode == "--todos" && argc >= 3) {
             bool verbose = true;
@@ -3839,6 +3864,9 @@ int main(int argc, char* argv[]) {
                 }
             }
             cmd_symbol_parity(src_root, tgt_root, options);
+            write_missing_config_after_comparison(
+                {src_root, language_config_name(options.source_lang)},
+                {tgt_root, language_config_name(options.target_lang)});
 
         } else if (mode == "--import-map" && argc >= 3) {
             ImportMapOptions options;
@@ -4235,6 +4263,9 @@ int main(int argc, char* argv[]) {
                     std::cout << "\n";
                 }
             }
+            write_missing_config_after_comparison(
+                {file1, language_config_name(lang1)},
+                {file2, language_config_name(lang2)});
 
         } else if (mode[0] != '-' && argc >= 5) {
             // Default: compare two files with explicit languages
@@ -4500,6 +4531,9 @@ int main(int argc, char* argv[]) {
                       << (doc_weighted * 100.0f) << "%\n";
             std::cout << "Unique doc words:     " << comments1.word_freq.size()
                       << " vs " << comments2.word_freq.size() << "\n";
+            write_missing_config_after_comparison(
+                {file1, language_config_name(lang1)},
+                {file2, language_config_name(lang2)});
 
         } else {
             print_usage(argv[0]);
