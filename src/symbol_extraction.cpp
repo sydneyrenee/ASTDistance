@@ -17,19 +17,60 @@ namespace ast_distance {
 // ============================================================================
 
 std::string snake_to_camel(const std::string& snake) {
-    std::string result;
-    bool next_upper = false;
-    for (char c : snake) {
+    std::string name = snake;
+    if (name.rfind("r#", 0) == 0) {
+        name = name.substr(2);
+    }
+    while (!name.empty() && name[0] == '_') {
+        name.erase(name.begin());
+    }
+    if (name.empty()) {
+        return "";
+    }
+
+    std::vector<std::string> parts;
+    std::string current;
+    for (char c : name) {
         if (c == '_') {
-            next_upper = true;
-        } else {
-            if (next_upper) {
-                result += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                next_upper = false;
-            } else {
-                result += c;
+            if (!current.empty()) {
+                parts.push_back(current);
+                current.clear();
             }
+            continue;
         }
+        if (std::isalnum(static_cast<unsigned char>(c))) {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty()) {
+        parts.push_back(current);
+    }
+    if (parts.empty()) {
+        return "";
+    }
+
+    auto lowercase_part = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return out;
+    };
+    auto title_part = [](const std::string& s) {
+        if (s.empty()) return s;
+        std::string out;
+        out.reserve(s.size());
+        out += static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        for (size_t i = 1; i < s.size(); ++i) {
+            out += static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+        }
+        return out;
+    };
+
+    std::string result = lowercase_part(parts[0]);
+    for (size_t i = 1; i < parts.size(); ++i) {
+        result += title_part(parts[i]);
     }
     return result;
 }
@@ -52,12 +93,18 @@ namespace {
 // ============================================================================
 
 bool should_skip_path(const std::string& path) {
-    return path.find("/test") != std::string::npos ||
-           path.find("/build/") != std::string::npos ||
-           path.find("/CMakeFiles/") != std::string::npos ||
+    return path.find("/CMakeFiles/") != std::string::npos ||
            path.find("/cmake-build") != std::string::npos ||
-           path.find("/target/") != std::string::npos ||
-           path.find("/_deps/") != std::string::npos;
+           path.find("/_deps/") != std::string::npos ||
+           path.find("/.gradle/") != std::string::npos ||
+           path.find("/node_modules/") != std::string::npos ||
+           path.find("/build/reports/") != std::string::npos ||
+           path.find("/build/classes/") != std::string::npos ||
+           path.find("/build/generated/") != std::string::npos ||
+           path.find("/build/kotlin/") != std::string::npos ||
+           path.find("/build/tmp/") != std::string::npos ||
+           path.find("/target/debug/") != std::string::npos ||
+           path.find("/target/release/") != std::string::npos;
 }
 
 std::string read_file_content(const fs::path& path) {
@@ -456,21 +503,42 @@ bool kotlin_is_stub_body(TSNode body_node, const std::string& source) {
     std::string body = get_node_text(body_node, source);
     if (body.empty()) return true;
 
-    // Check for TODO/stub markers
+    std::string code;
+    code.reserve(body.size());
+    size_t i = 0;
+    while (i < body.size()) {
+        if (i + 1 < body.size() && body[i] == '/' && body[i + 1] == '/') {
+            i += 2;
+            while (i < body.size() && body[i] != '\n') ++i;
+        } else if (i + 1 < body.size() && body[i] == '/' && body[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < body.size() && !(body[i] == '*' && body[i + 1] == '/')) ++i;
+            if (i + 1 < body.size()) i += 2;
+        } else {
+            code += body[i++];
+        }
+    }
+
+    // Check executable tokens only; comments can faithfully preserve upstream notes.
     static const std::vector<std::string> stub_markers = {
-        "TODO", "FIXME", "STUB", "placeholder", "not implemented",
-        "= TODO()", "= error(", "throw NotImplementedError",
-        "// Placeholder types"
+        "TODO()",
+        "TODO(\"",
+        "= TODO()",
+        "throw NotImplementedError",
+        "throw kotlin.NotImplementedError",
+        "error(\"not implemented",
+        "error(\"unimplemented",
+        "error(\"stub",
+        "error(\"placeholder",
     };
     for (const auto& marker : stub_markers) {
-        if (body.find(marker) != std::string::npos) return true;
+        if (code.find(marker) != std::string::npos) return true;
     }
 
     // Empty class body: just braces with optional whitespace
-    if (body.length() < 10) {
-        // Trim whitespace and check if just {}
+    if (code.length() < 10) {
         std::string trimmed;
-        for (char c : body) {
+        for (char c : code) {
             if (!std::isspace(static_cast<unsigned char>(c))) trimmed += c;
         }
         if (trimmed == "{}" || trimmed == "{};" || trimmed.empty()) return true;
@@ -525,12 +593,29 @@ Visibility kotlin_extract_visibility(TSNode node, const std::string& source) {
 }
 
 std::string kotlin_extract_name(TSNode node, const std::string& source) {
+    auto strip_backticks = [](std::string s) {
+        if (s.size() >= 2 && s.front() == '`' && s.back() == '`') {
+            return s.substr(1, s.size() - 2);
+        }
+        return s;
+    };
+
     uint32_t count = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < count; ++i) {
         TSNode child = ts_node_named_child(node, i);
         std::string type(ts_node_type(child));
         if (type == "simple_identifier" || type == "type_identifier") {
-            return get_node_text(child, source);
+            return strip_backticks(get_node_text(child, source));
+        }
+        if (type == "variable_declaration") {
+            uint32_t vcount = ts_node_named_child_count(child);
+            for (uint32_t j = 0; j < vcount; ++j) {
+                TSNode v = ts_node_named_child(child, j);
+                std::string vtype(ts_node_type(v));
+                if (vtype == "simple_identifier" || vtype == "type_identifier") {
+                    return strip_backticks(get_node_text(v, source));
+                }
+            }
         }
     }
     return {};
@@ -758,20 +843,18 @@ void kotlin_extract_symbols_recursive(
         }
     }
     else if (type == "property_declaration") {
-        // Top-level vals/vars (consts)
-        if (parent_type.empty()) {
-            std::string name = kotlin_extract_name(node, source);
-            if (!name.empty()) {
-                Visibility vis = kotlin_extract_visibility(node, source);
-                Symbol sym;
-                sym.name = name;
-                sym.qualified_name = name;
-                sym.kind = SymbolKind::CONST;
-                sym.visibility = vis;
-                sym.file = file;
-                sym.line = get_node_line(node);
-                table.add(std::move(sym));
-            }
+        std::string name = kotlin_extract_name(node, source);
+        if (!name.empty()) {
+            Visibility vis = kotlin_extract_visibility(node, source);
+            Symbol sym;
+            sym.name = name;
+            sym.qualified_name = parent_type.empty() ? name : parent_type + "." + name;
+            sym.kind = SymbolKind::CONST;
+            sym.visibility = vis;
+            sym.file = file;
+            sym.line = get_node_line(node);
+            sym.parent = parent_type;
+            table.add(std::move(sym));
         }
     }
     else if (type == "type_alias") {
@@ -816,6 +899,15 @@ std::vector<MatchResult> generate_match_candidates(const Symbol& rust_sym) {
 
     // 1. Exact match (types are PascalCase in both languages)
     candidates.push_back({rust_sym.name, 1.0f, "exact"});
+
+    // 1b. Generated Rust symbols often use leading underscores for namespacing.
+    if (!rust_sym.name.empty() && rust_sym.name[0] == '_') {
+        std::string stripped = rust_sym.name;
+        while (!stripped.empty() && stripped[0] == '_') stripped.erase(stripped.begin());
+        if (!stripped.empty() && stripped != rust_sym.name) {
+            candidates.push_back({stripped, 0.97f, "strip_leading_underscore"});
+        }
+    }
 
     // 2. snake_case → camelCase for functions
     if (rust_sym.kind == SymbolKind::FUNCTION || rust_sym.kind == SymbolKind::IMPL_METHOD) {

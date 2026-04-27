@@ -161,7 +161,7 @@ public:
      *
      * WARNING: This metric cannot distinguish real code from placeholder stubs.
      * A file of `fun x() = null` scores the same as `fun computeHash() = ...`.
-     * Use combined_similarity_with_content() for real porting assessment.
+     * Use function_parameter_body_cosine_similarity() for Rust -> Kotlin port reports.
      */
     static float combined_similarity(Tree* tree1, Tree* tree2,
                                      float hist_weight = 0.5f,
@@ -310,6 +310,31 @@ public:
         }
 
         return base;
+    }
+
+    /**
+     * Strict function comparison used for transliteration reports.
+     *
+     * The caller supplies a synthetic tree containing only the function
+     * parameters and body, plus identifiers extracted from those same regions.
+     * This deliberately avoids whole-file shape rescue: if the implementation
+     * and parameters do not line up, the file score must fall.
+     */
+    static float function_parameter_body_cosine_similarity(
+            Tree* tree1, Tree* tree2,
+            const IdentifierStats& ids1, const IdentifierStats& ids2) {
+        auto finite_or_zero = [](float v) -> float {
+            return std::isfinite(v) ? v : 0.0f;
+        };
+
+        float ast_cosine = finite_or_zero(histogram_cosine_similarity(tree1, tree2));
+
+        if (ids1.canonical_freq.empty() && ids2.canonical_freq.empty()) {
+            return ast_cosine;
+        }
+
+        float identifier_cosine = finite_or_zero(ids1.canonical_cosine_similarity(ids2));
+        return 0.70f * identifier_cosine + 0.30f * ast_cosine;
     }
 
     /**

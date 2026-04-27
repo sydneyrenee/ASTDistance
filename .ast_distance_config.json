@@ -1,0 +1,22 @@
+{
+  "type": "port",
+  "name": "ASTDistance",
+  "source": {
+    "path": "/Volumes/stuff/Projects/ASTDistance/include",
+    "lang": "cpp"
+  },
+  "target": {
+    "path": "/Volumes/stuff/Projects/ASTDistance/python/ast_distance_py",
+    "lang": "python"
+  },
+  "checks": {
+    "deep": true,
+    "missing": true,
+    "todos": true,
+    "lint": true
+  },
+  "reexport_modules": [
+    "mod.rs",
+    "lib.rs"
+  ]
+}

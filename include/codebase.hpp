@@ -407,6 +407,13 @@ public:
      */
     void extract_porting_data() {
         for (auto& [path, sf] : files) {
+            sf.transliterated_from.clear();
+            sf.line_count = 0;
+            sf.code_lines = 0;
+            sf.is_stub = false;
+            sf.todos.clear();
+            sf.lint_errors.clear();
+
             bool all_parts_stub = !sf.paths.empty();
             for (const auto& p : sf.paths) {
                 if (sf.transliterated_from.empty()) {
@@ -617,6 +624,14 @@ public:
         int stub_mismatch_count = 0;
     };
 
+    struct ProvenanceProposal {
+        std::string source_path;
+        std::string target_path;
+        std::string current_header;
+        std::string proposed_header;
+        std::string reason;
+    };
+
     struct Match {
         std::string source_path;
         std::string target_path;
@@ -631,6 +646,10 @@ public:
         int lint_count = 0;
         bool is_stub = false;
         bool matched_by_header = false;  // True if matched via "Transliterated from:"
+        bool matched_by_normalized_provenance = false;
+        std::vector<std::string> provenance_warnings;
+        std::vector<ProvenanceProposal> provenance_proposals;
+        std::vector<std::string> zero_reasons;  // Hard-fail reasons that force similarity to 0
 
         // Additional target files that explicitly point to this same source
         // file via port-lint headers. Common use: Kotlin commonTest files with
@@ -686,37 +705,34 @@ public:
         int symbol_deficit() const {
             return function_deficit() + type_deficit();
         }
+        int source_symbol_surface() const {
+            return std::max(0, source_function_count) + std::max(0, source_type_count);
+        }
 
         /**
          * Porting priority score.
          *
          * Design rationale:
-         *   - The old formula was `dependents * (1 - similarity)`, which zeroes
-         *     out any file with no dependents (every test file, every leaf
-         *     module). That hid hundreds of real gaps.
-         *   - The new formula makes *symbol deficit* (missing functions +
-         *     missing types) the primary driver — a file with 10 missing
-         *     functions ranks above a file that merely has low AST similarity.
-         *   - Import depth (number of files depending on this one) is kept as
-         *     a multiplicative boost, but log-scaled so that high-fanout files
-         *     don't drown out standalone files with real deficits.
-         *   - Similarity gap is a tiebreaker for files with no explicit
-         *     symbol-level gap.
+         *   - Primary: source dependents/import fanout. A hot file should be
+         *     worked before a leaf module even when the leaf has more missing
+         *     declarations, because the hot file clears more downstream
+         *     compilation failures.
+         *   - Secondary: missing functions and types/classes in that file.
+         *     Deficits describe how much concrete porting work remains, but
+         *     they no longer outrank fanout on their own.
+         *   - Tertiary: total source symbol surface, then function similarity
+         *     gap as the final tiebreaker.
          */
         float priority_score() const {
+            float dependents = static_cast<float>(source_dependents);
             float deficit = static_cast<float>(symbol_deficit());
-            float import_depth = std::log1p(static_cast<float>(source_dependents));
+            float symbol_surface = static_cast<float>(source_symbol_surface());
             float sim_gap = std::max(0.0f, 1.0f - similarity);
 
-            // 10 points per missing symbol; each missing symbol is amplified
-            // by how many downstream files will benefit once it's restored.
-            float deficit_score = deficit * (10.0f + import_depth * 2.0f);
-
-            // For files with no explicit symbol-level gap, fall back to the
-            // old AST-similarity × dependents signal.
-            float shape_score = import_depth * sim_gap * 5.0f;
-
-            return deficit_score + shape_score;
+            return dependents * 1000000.0f
+                 + deficit * 10000.0f
+                 + symbol_surface * 100.0f
+                 + sim_gap * 10.0f;
         }
     };
 
@@ -726,6 +742,400 @@ public:
 
     CodebaseComparator(Codebase& src, Codebase& tgt)
         : source(src), target(tgt) {}
+
+    static std::string normalize_source_annotation_path(std::string path) {
+        std::replace(path.begin(), path.end(), '\\', '/');
+        while (path.rfind("./", 0) == 0) {
+            path = path.substr(2);
+        }
+        return path;
+    }
+
+    static std::string normalized_source_annotation_component(const std::string& component,
+                                                              bool is_filename) {
+        if (!is_filename) {
+            return SourceFile::normalize_name(component);
+        }
+
+        fs::path p(component);
+        std::string stem = SourceFile::normalize_name(p.stem().string());
+        std::string ext = p.extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return stem + ext;
+    }
+
+    static std::string normalized_source_annotation_match_key(std::string path) {
+        path = normalize_source_annotation_path(std::move(path));
+        std::vector<std::string> parts;
+        fs::path p(path);
+        for (const auto& part : p) {
+            std::string segment = part.string();
+            if (segment.empty() || segment == ".") {
+                continue;
+            }
+            parts.push_back(segment);
+        }
+
+        if (parts.empty()) {
+            return "";
+        }
+
+        std::ostringstream out;
+        for (size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0) out << "/";
+            out << normalized_source_annotation_component(parts[i], i + 1 == parts.size());
+        }
+        return out.str();
+    }
+
+    static std::set<std::string> source_annotation_match_keys(std::string path) {
+        path = normalize_source_annotation_path(std::move(path));
+        std::set<std::string> variants;
+
+        auto add_variant = [&](const std::string& variant) {
+            std::string key = normalized_source_annotation_match_key(variant);
+            if (!key.empty()) {
+                variants.insert(std::move(key));
+            }
+        };
+
+        add_variant(path);
+
+        if (path.rfind("src/", 0) == 0) {
+            add_variant(path.substr(4));
+        }
+
+        size_t crate_src = path.find("/src/");
+        if (crate_src != std::string::npos) {
+            add_variant(path.substr(crate_src + 5));
+        }
+
+        return variants;
+    }
+
+    static std::string canonical_source_annotation_path(std::string path) {
+        path = normalize_source_annotation_path(std::move(path));
+
+        if (path.rfind("src/", 0) == 0) {
+            path = path.substr(4);
+        }
+
+        size_t crate_src = path.find("/src/");
+        if (crate_src != std::string::npos) {
+            path = path.substr(crate_src + 5);
+        }
+
+        return normalize_source_annotation_path(std::move(path));
+    }
+
+    static std::string port_lint_source_header_line(const std::string& source_path) {
+        return "// port-lint: source " + canonical_source_annotation_path(source_path);
+    }
+
+    static std::string port_lint_header_line(const std::string& kind,
+                                             const std::string& source_path) {
+        return "// port-lint: " + kind + " " + canonical_source_annotation_path(source_path);
+    }
+
+    static std::string join_reasons(const std::vector<std::string>& reasons) {
+        std::ostringstream out;
+        for (size_t i = 0; i < reasons.size(); ++i) {
+            if (i > 0) out << "; ";
+            out << reasons[i];
+        }
+        return out.str();
+    }
+
+    static std::string strip_kotlin_comments_and_strings(const std::string& source) {
+        std::string out(source.size(), ' ');
+        enum class State { Normal, LineComment, BlockComment, String, RawString, CharLiteral };
+        State state = State::Normal;
+        int block_depth = 0;
+
+        for (size_t i = 0; i < source.size(); ++i) {
+            char c = source[i];
+            char next = (i + 1 < source.size()) ? source[i + 1] : '\0';
+            char next2 = (i + 2 < source.size()) ? source[i + 2] : '\0';
+
+            if (c == '\n') {
+                out[i] = '\n';
+            }
+
+            switch (state) {
+                case State::Normal:
+                    if (c == '/' && next == '/') {
+                        state = State::LineComment;
+                        ++i;
+                        if (i < source.size() && source[i] == '\n') out[i] = '\n';
+                    } else if (c == '/' && next == '*') {
+                        state = State::BlockComment;
+                        block_depth = 1;
+                        ++i;
+                    } else if (c == '"' && next == '"' && next2 == '"') {
+                        state = State::RawString;
+                        i += 2;
+                    } else if (c == '"') {
+                        state = State::String;
+                    } else if (c == '\'') {
+                        state = State::CharLiteral;
+                    } else {
+                        out[i] = c;
+                    }
+                    break;
+
+                case State::LineComment:
+                    if (c == '\n') {
+                        state = State::Normal;
+                        out[i] = '\n';
+                    }
+                    break;
+
+                case State::BlockComment:
+                    if (c == '/' && next == '*') {
+                        block_depth++;
+                        ++i;
+                    } else if (c == '*' && next == '/') {
+                        block_depth--;
+                        ++i;
+                        if (block_depth <= 0) state = State::Normal;
+                    }
+                    break;
+
+                case State::String:
+                    if (c == '\\') {
+                        ++i;
+                    } else if (c == '"') {
+                        state = State::Normal;
+                    }
+                    break;
+
+                case State::RawString:
+                    if (c == '"' && next == '"' && next2 == '"') {
+                        state = State::Normal;
+                        i += 2;
+                    }
+                    break;
+
+                case State::CharLiteral:
+                    if (c == '\\') {
+                        ++i;
+                    } else if (c == '\'') {
+                        state = State::Normal;
+                    }
+                    break;
+            }
+        }
+
+        return out;
+    }
+
+    static std::string extract_kotlin_comments(const std::string& source) {
+        std::string out;
+        enum class State { Normal, LineComment, BlockComment, String, RawString, CharLiteral };
+        State state = State::Normal;
+        int block_depth = 0;
+
+        for (size_t i = 0; i < source.size(); ++i) {
+            char c = source[i];
+            char next = (i + 1 < source.size()) ? source[i + 1] : '\0';
+            char next2 = (i + 2 < source.size()) ? source[i + 2] : '\0';
+
+            switch (state) {
+                case State::Normal:
+                    if (c == '/' && next == '/') {
+                        state = State::LineComment;
+                        ++i;
+                    } else if (c == '/' && next == '*') {
+                        state = State::BlockComment;
+                        block_depth = 1;
+                        ++i;
+                    } else if (c == '"' && next == '"' && next2 == '"') {
+                        state = State::RawString;
+                        i += 2;
+                    } else if (c == '"') {
+                        state = State::String;
+                    } else if (c == '\'') {
+                        state = State::CharLiteral;
+                    }
+                    break;
+
+                case State::LineComment:
+                    if (c == '\n') {
+                        state = State::Normal;
+                        out += '\n';
+                    } else {
+                        out += c;
+                    }
+                    break;
+
+                case State::BlockComment:
+                    if (c == '/' && next == '*') {
+                        block_depth++;
+                        out += ' ';
+                        ++i;
+                    } else if (c == '*' && next == '/') {
+                        block_depth--;
+                        out += ' ';
+                        ++i;
+                        if (block_depth <= 0) {
+                            state = State::Normal;
+                            out += '\n';
+                        }
+                    } else {
+                        out += c;
+                    }
+                    break;
+
+                case State::String:
+                    if (c == '\\') {
+                        ++i;
+                    } else if (c == '"') {
+                        state = State::Normal;
+                    }
+                    break;
+
+                case State::RawString:
+                    if (c == '"' && next == '"' && next2 == '"') {
+                        state = State::Normal;
+                        i += 2;
+                    }
+                    break;
+
+                case State::CharLiteral:
+                    if (c == '\\') {
+                        ++i;
+                    } else if (c == '\'') {
+                        state = State::Normal;
+                    }
+                    break;
+            }
+        }
+
+        return out;
+    }
+
+    static bool looks_like_lower_snake_identifier(const std::string& token) {
+        if (token.empty() || token == "_") return false;
+        if (token.find('_') == std::string::npos) return false;
+        if (token.front() == '_' || token.back() == '_') return false;
+
+        bool has_lower = false;
+        bool has_letter = false;
+        for (char c : token) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            if (std::isalpha(uc)) {
+                has_letter = true;
+                if (std::islower(uc)) has_lower = true;
+            }
+        }
+        return has_letter && has_lower;
+    }
+
+    static std::vector<std::string> kotlin_contamination_reasons_for_text(const std::string& source) {
+        std::vector<std::string> reasons;
+        std::string code = strip_kotlin_comments_and_strings(source);
+        std::string comments = extract_kotlin_comments(source);
+
+        auto add_reason = [&](const std::string& reason) {
+            if (std::find(reasons.begin(), reasons.end(), reason) == reasons.end()) {
+                reasons.push_back(reason);
+            }
+        };
+
+        auto scan_text = [&](const std::string& text, const std::string& where) {
+            static const std::regex snake_re(R"(\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]*\b)");
+            for (std::sregex_iterator it(text.begin(), text.end(), snake_re), end; it != end; ++it) {
+                std::string token = it->str();
+                if (looks_like_lower_snake_identifier(token)) {
+                    add_reason("snake_case identifier `" + token + "` in Kotlin " + where);
+                    break;
+                }
+            }
+
+            struct RustPattern {
+                std::regex pattern;
+                std::string reason;
+            };
+            static const std::vector<RustPattern> rust_patterns = {
+                {std::regex(R"(\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*\()"), "Rust `fn` declaration"},
+                {std::regex(R"(\blet\s+(mut\s+)?[A-Za-z_][A-Za-z0-9_]*)"), "Rust `let` binding"},
+                {std::regex(R"(\bpub(\([^)]*\))?\s+(fn|struct|enum|trait|mod|use)\b)"), "Rust `pub` item"},
+                {std::regex(R"(\bimpl(\s*<[^>{;]*>)?\s+[A-Za-z_][A-Za-z0-9_:<>,\s]*(\s+for\s+[A-Za-z_][A-Za-z0-9_:<>,\s]*)?\s*\{)"), "Rust `impl` block"},
+                {std::regex(R"(\bmacro_rules\s*!)"), "Rust `macro_rules!`"},
+                {std::regex(R"(#\s*\[[^\]]+\])"), "Rust attribute syntax"},
+                {std::regex(R"(\b(assert_eq|assert_ne|debug_assert|format|println|vec|todo|unimplemented)!\s*[\(\{\[])"), "Rust macro invocation"},
+                {std::regex(R"(\bmatch\s+[^{;]+\{)"), "Rust `match` expression"},
+                {std::regex(R"(\buse\s+[A-Za-z_][A-Za-z0-9_:]*(::|\{))"), "Rust `use` path"},
+            };
+
+            for (const auto& rp : rust_patterns) {
+                if (std::regex_search(text, rp.pattern)) {
+                    add_reason(rp.reason + " in Kotlin " + where);
+                    if (reasons.size() >= 4) break;
+                }
+            }
+        };
+
+        scan_text(code, "code");
+        scan_text(comments, "comments");
+
+        static const std::regex suppress_padding_re(
+            R"(@(?:file:)?Suppress\s*\([^)]*(UNUSED_VARIABLE|unused|FunctionName)[^)]*\))",
+            std::regex_constants::icase);
+        if (std::regex_search(source, suppress_padding_re)) {
+            add_reason("score-padding suppression annotation `@Suppress` in Kotlin code");
+        }
+
+        if (source.find("UNCHECKED_CAST") != std::string::npos &&
+            (source.find(" as Self") != std::string::npos ||
+             source.find(" as ParametersSpec") != std::string::npos)) {
+            add_reason("unchecked cast suppression hiding transliteration work in Kotlin code");
+        }
+
+        struct CommentCheatPattern {
+            std::regex pattern;
+            std::string reason;
+        };
+        static const std::vector<CommentCheatPattern> comment_cheat_patterns = {
+            {std::regex(R"((^|\n)\s*(//+|\*)?\s*Kotlin\s*:)", std::regex_constants::icase),
+             "translator-note comment (`Kotlin:`) in Kotlin comments"},
+            {std::regex(R"(\(\s*from\s+impl\b[^)]*\))", std::regex_constants::icase),
+             "Rust impl provenance note in Kotlin comments"},
+            {std::regex(R"(\b(lifetime|lifetimes|'[A-Za-z_][A-Za-z0-9_]*)\b)", std::regex_constants::icase),
+             "Rust lifetime explanation in Kotlin comments"},
+            {std::regex(R"(\b(dyn|usize|Box|transmute|unsafe)\b)"),
+             "Rust-only type/unsafe terminology in Kotlin comments"},
+            {std::regex(R"(Send\s*\+\s*Sync)"),
+             "Rust auto-trait terminology in Kotlin comments"},
+        };
+        for (const auto& cp : comment_cheat_patterns) {
+            if (std::regex_search(comments, cp.pattern)) {
+                add_reason(cp.reason);
+            }
+        }
+
+        return reasons;
+    }
+
+    static std::vector<std::string> kotlin_contamination_reasons_for_files(
+            const std::vector<std::string>& paths) {
+        std::vector<std::string> reasons;
+        for (const auto& path : paths) {
+            std::ifstream in(path);
+            if (!in.is_open()) continue;
+            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            auto file_reasons = kotlin_contamination_reasons_for_text(text);
+            for (const auto& reason : file_reasons) {
+                std::string qualified = fs::path(path).filename().string() + ": " + reason;
+                if (std::find(reasons.begin(), reasons.end(), qualified) == reasons.end()) {
+                    reasons.push_back(qualified);
+                }
+                if (reasons.size() >= 6) return reasons;
+            }
+        }
+        return reasons;
+    }
 
     /**
      * Check if a file is a header file based on extension.
@@ -831,6 +1241,71 @@ public:
         return header_path;
     }
 
+    struct HeaderMatchResult {
+        float score = 0.0f;
+        bool normalized_fallback = false;
+        std::string warning;
+        ProvenanceProposal proposal;
+    };
+
+    static ProvenanceProposal provenance_proposal_for_header(
+            const SourceFile& src_file,
+            const SourceFile& tgt_file,
+            const std::string& reason) {
+        ProvenanceProposal proposal;
+        const bool is_tests = is_test_transliteration(tgt_file.transliterated_from);
+        const std::string kind = is_tests ? "tests" : "source";
+        proposal.source_path = canonical_source_annotation_path(src_file.relative_path);
+        proposal.target_path = tgt_file.relative_path.empty()
+            ? tgt_file.filename
+            : tgt_file.relative_path;
+        proposal.current_header =
+            "// port-lint: " + kind + " " +
+            normalize_source_annotation_path(
+                source_path_from_transliteration(tgt_file.transliterated_from));
+        proposal.proposed_header = port_lint_header_line(kind, src_file.relative_path);
+        proposal.reason = reason;
+        return proposal;
+    }
+
+    static HeaderMatchResult exact_transliteration_header_match_result(
+            const SourceFile& src_file,
+            const SourceFile& tgt_file) {
+        HeaderMatchResult result;
+        if (tgt_file.transliterated_from.empty()) return result;
+
+        const std::string header_path = normalize_source_annotation_path(
+            source_path_from_transliteration(tgt_file.transliterated_from));
+        const std::string source_rel = normalize_source_annotation_path(src_file.relative_path);
+        if (header_path == source_rel) {
+            result.score = 1.0f;
+            return result;
+        }
+
+        const auto from_keys = source_annotation_match_keys(header_path);
+        const auto source_keys = source_annotation_match_keys(source_rel);
+
+        for (const auto& from : from_keys) {
+            if (source_keys.count(from)) {
+                result.score = 0.99f;
+                result.normalized_fallback = true;
+                result.warning =
+                    "port-lint provenance header matched only after fallback normalization: `" +
+                    tgt_file.transliterated_from + "` vs expected `" +
+                    canonical_source_annotation_path(src_file.relative_path) + "`";
+                result.proposal = provenance_proposal_for_header(src_file, tgt_file, result.warning);
+                return result;
+            }
+        }
+        return result;
+    }
+
+    static float exact_transliteration_header_match_score(
+            const SourceFile& src_file,
+            const SourceFile& tgt_file) {
+        return exact_transliteration_header_match_result(src_file, tgt_file).score;
+    }
+
     static float transliteration_header_match_score(
             const SourceFile& src_file,
             const SourceFile& tgt_file) {
@@ -875,13 +1350,25 @@ public:
      * Priority: 1) "Transliterated from:" headers, 2) Name matching
      */
     void find_matches() {
+        target.extract_porting_data();
+
         std::set<std::string> matched_sources;
         std::set<std::string> matched_targets;
+        const bool strict_provenance_matching =
+            (source.language == "rust" && target.language == "kotlin");
 
         // First pass: Match by "Transliterated from:" header
         // Target files reference source files, so look in target for headers
         // Store candidates with scores for best matching
-        std::vector<std::tuple<float, std::string, std::string>> header_candidates;
+        struct HeaderCandidate {
+            float score = 0.0f;
+            std::string src_path;
+            std::string tgt_path;
+            bool normalized_fallback = false;
+            std::string warning;
+            ProvenanceProposal proposal;
+        };
+        std::vector<HeaderCandidate> header_candidates;
 
         for (const auto& [tgt_path, tgt_file] : target.files) {
             if (tgt_file.transliterated_from.empty()) continue;
@@ -889,10 +1376,22 @@ public:
 
             // Try to find the source file that matches the header
             for (const auto& [src_path, src_file] : source.files) {
-                float match_score = transliteration_header_match_score(src_file, tgt_file);
+                HeaderMatchResult match;
+                if (strict_provenance_matching) {
+                    match = exact_transliteration_header_match_result(src_file, tgt_file);
+                } else {
+                    match.score = transliteration_header_match_score(src_file, tgt_file);
+                }
 
-                if (match_score > 0.0f) {
-                    header_candidates.emplace_back(match_score, src_path, tgt_path);
+                if (match.score > 0.0f) {
+                    header_candidates.push_back({
+                        match.score,
+                        src_path,
+                        tgt_path,
+                        match.normalized_fallback,
+                        match.warning,
+                        match.proposal,
+                    });
                 }
             }
         }
@@ -900,22 +1399,24 @@ public:
         // Sort by score descending, with header preference for ties
         std::sort(header_candidates.begin(), header_candidates.end(),
             [this](const auto& a, const auto& b) {
-                float score_a = std::get<0>(a);
-                float score_b = std::get<0>(b);
+                float score_a = a.score;
+                float score_b = b.score;
                 if (std::abs(score_a - score_b) > 0.001f) {
                     return score_a > score_b;  // Higher score first
                 }
                 // Same score - prefer header files
-                const auto& tgt_a = target.files.at(std::get<2>(a));
-                const auto& tgt_b = target.files.at(std::get<2>(b));
+                const auto& tgt_a = target.files.at(a.tgt_path);
+                const auto& tgt_b = target.files.at(b.tgt_path);
                 bool a_header = is_header_file(tgt_a);
                 bool b_header = is_header_file(tgt_b);
                 if (a_header != b_header) return a_header;  // Headers first
                 // Same type - prefer shorter path (less nesting)
-                return std::get<2>(a).size() < std::get<2>(b).size();
+                return a.tgt_path.size() < b.tgt_path.size();
             });
 
-        for (const auto& [score, src_path, tgt_path] : header_candidates) {
+        for (const auto& candidate : header_candidates) {
+            const auto& src_path = candidate.src_path;
+            const auto& tgt_path = candidate.tgt_path;
             if (matched_sources.count(src_path) || matched_targets.count(tgt_path)) {
                 continue;  // Already matched
             }
@@ -947,6 +1448,14 @@ public:
                 }
             }
             m.matched_by_header = true;
+            if (candidate.normalized_fallback) {
+                m.matched_by_normalized_provenance = true;
+                m.lint_count += 1;
+                if (!candidate.warning.empty()) {
+                    m.provenance_warnings.push_back(candidate.warning);
+                }
+                m.provenance_proposals.push_back(candidate.proposal);
+            }
 
             matches.push_back(m);
             matched_sources.insert(src_path);
@@ -969,13 +1478,20 @@ public:
 
                 Match* best = nullptr;
                 float best_score = 0.0f;
+                HeaderMatchResult best_match;
                 for (const auto& [src_path, src_file] : source.files) {
                     auto mit = match_by_src.find(src_path);
                     if (mit == match_by_src.end()) continue;
 
-                    float score = transliteration_header_match_score(src_file, tgt_file);
-                    if (score > best_score) {
-                        best_score = score;
+                    HeaderMatchResult match;
+                    if (strict_provenance_matching) {
+                        match = exact_transliteration_header_match_result(src_file, tgt_file);
+                    } else {
+                        match.score = transliteration_header_match_score(src_file, tgt_file);
+                    }
+                    if (match.score > best_score) {
+                        best_score = match.score;
+                        best_match = match;
                         best = mit->second;
                     }
                 }
@@ -983,24 +1499,36 @@ public:
                     for (const auto& p : tgt_file.paths) {
                         best->additional_target_paths.push_back(p);
                     }
+                    if (best_match.normalized_fallback) {
+                        best->matched_by_normalized_provenance = true;
+                        best->lint_count += 1;
+                        if (!best_match.warning.empty()) {
+                            best->provenance_warnings.push_back(best_match.warning);
+                        }
+                        best->provenance_proposals.push_back(best_match.proposal);
+                    }
                     matched_targets.insert(tgt_path);
                 }
             }
         }
 
-        // Second pass: Name-based matching for remaining files
+        // Second pass: Name-based matching for remaining files.
+        // Rust -> Kotlin reports require exact provenance so a plausible
+        // filename cannot get a free ride.
         std::vector<std::tuple<float, std::string, std::string>> candidates;
 
-        for (const auto& [src_path, src_file] : source.files) {
-            if (matched_sources.count(src_path)) continue;
+        if (!strict_provenance_matching) {
+            for (const auto& [src_path, src_file] : source.files) {
+                if (matched_sources.count(src_path)) continue;
 
-            for (const auto& [tgt_path, tgt_file] : target.files) {
-                if (matched_targets.count(tgt_path)) continue;
-                if (is_test_transliteration(tgt_file.transliterated_from)) continue;
+                for (const auto& [tgt_path, tgt_file] : target.files) {
+                    if (matched_targets.count(tgt_path)) continue;
+                    if (is_test_transliteration(tgt_file.transliterated_from)) continue;
 
-                float score = name_match_score(src_file, tgt_file);
-                if (score > 0.4f) {
-                    candidates.emplace_back(score, src_path, tgt_path);
+                    float score = name_match_score(src_file, tgt_file);
+                    if (score > 0.4f) {
+                        candidates.emplace_back(score, src_path, tgt_path);
+                    }
                 }
             }
         }
@@ -1187,7 +1715,7 @@ public:
                 // However, Rust source may contain TODO markers legitimately; do not penalize when
                 // the Kotlin target is *more complete* (source has markers, target does not).
                 if (!(target_func->has_stub_markers && !source_func->has_stub_markers)) {
-                    sim = ASTSimilarity::combined_similarity_with_content(
+                    sim = ASTSimilarity::function_parameter_body_cosine_similarity(
                         source_func->body_tree.get(),
                         target_func->body_tree.get(),
                         source_func->identifiers,
@@ -1449,78 +1977,69 @@ public:
 
         for (auto& m : matches) {
             try {
+                m.zero_reasons.clear();
                 const auto& src_file = source.files.at(m.source_path);
                 const auto& tgt_file = target.files.at(m.target_path);
                 auto src_lang = string_to_language(source.language);
                 auto tgt_lang = string_to_language(target.language);
 
-                bool has_stubs = parser.has_stub_bodies_in_files(
-                    tgt_file.paths, tgt_lang);
+                std::vector<std::string> all_target_paths = tgt_file.paths;
+                all_target_paths.insert(all_target_paths.end(),
+                                        m.additional_target_paths.begin(),
+                                        m.additional_target_paths.end());
 
+                bool has_stubs = parser.has_stub_bodies_in_files(all_target_paths, tgt_lang);
                 if (has_stubs) {
-                    m.similarity = 0.0f;
+                    m.zero_reasons.push_back("target contains TODO/stub/placeholder markers in function bodies");
                     m.is_stub = true;
+                }
+
+                if (tgt_lang == Language::KOTLIN) {
+                    auto contamination = kotlin_contamination_reasons_for_files(all_target_paths);
+                    m.zero_reasons.insert(
+                        m.zero_reasons.end(),
+                        contamination.begin(),
+                        contamination.end());
+                }
+
+                auto source_functions = parser.extract_function_infos_from_files(
+                    src_file.paths, src_lang);
+                auto target_functions = parser.extract_function_infos_from_files(
+                    all_target_paths, tgt_lang);
+                auto fn_cov = function_name_coverage_with_lang(
+                    source_functions, target_functions, src_lang, tgt_lang);
+
+                m.source_function_count = fn_cov.source_total;
+                m.target_function_count = fn_cov.target_total;
+                m.matched_function_count = fn_cov.matched;
+                m.function_coverage = fn_cov.ratio;
+                m.missing_functions = std::move(fn_cov.missing);
+                m.source_test_function_count = fn_cov.source_test_count;
+                m.matched_test_function_count = fn_cov.matched_test_count;
+
+                SourceFile combined_tgt_file = tgt_file;
+                combined_tgt_file.paths = all_target_paths;
+                auto ty_cov = type_name_coverage(
+                    symbol_src, symbol_tgt, src_lang, tgt_lang, src_file, combined_tgt_file);
+                m.source_type_count = ty_cov.source_total;
+                m.target_type_count = ty_cov.target_total;
+                m.matched_type_count = ty_cov.matched;
+                m.type_coverage = ty_cov.ratio;
+                m.missing_types = std::move(ty_cov.missing);
+
+                auto fn_result = compare_function_sets(source_functions, target_functions);
+                if (source_functions.empty()) {
+                    m.zero_reasons.push_back("no source functions found; report scoring is function-by-function only");
+                } else if (target_functions.empty()) {
+                    m.zero_reasons.push_back("no target functions found; report scoring is function-by-function only");
+                }
+
+                if (!m.zero_reasons.empty()) {
+                    m.similarity = 0.0f;
+                } else if (fn_result.score >= 0.0f) {
+                    m.similarity = fn_result.score;
                 } else {
-                    // Whole-document similarity is the default metric.
-                    auto src_tree = parser.parse_file(src_file.paths, src_lang);
-                    auto tgt_tree = parser.parse_file(tgt_file.paths, tgt_lang);
-
-                    // Normalize ASTs: Flatten namespaces/packages to reduce structural noise
-                    // Node type 82 is PACKAGE (includes C++ namespaces)
-                    if (src_tree) src_tree->flatten_node_type(82);
-                    if (tgt_tree) tgt_tree->flatten_node_type(82);
-
-                    std::string src_text = read_files_to_string(src_file.paths);
-                    std::string tgt_text = read_files_to_string(tgt_file.paths);
-
-                    auto src_ids = parser.extract_identifiers_from_file(
-                        src_file.paths, src_lang);
-                    auto tgt_ids = parser.extract_identifiers_from_file(
-                        tgt_file.paths, tgt_lang);
-
-                    float file_sim = ASTSimilarity::combined_similarity_with_content(
-                        src_tree.get(), tgt_tree.get(), src_ids, tgt_ids);
-                    auto translit = TransliterationSimilarity::compare(
-                        src_text, src_lang, tgt_text, tgt_lang);
-                    file_sim = std::max(file_sim, translit.score);
-
-                    // Parity penalty: if target is missing functions (by name),
-                    // reduce the score even if the file-level shape looks similar.
-                    auto source_functions = parser.extract_function_infos_from_files(
-                        src_file.paths, src_lang);
-                    std::vector<std::string> all_target_paths = tgt_file.paths;
-                    all_target_paths.insert(all_target_paths.end(),
-                                            m.additional_target_paths.begin(),
-                                            m.additional_target_paths.end());
-                    auto target_functions = parser.extract_function_infos_from_files(
-                        all_target_paths, tgt_lang);
-                    auto fn_cov = function_name_coverage_with_lang(
-                        source_functions, target_functions, src_lang, tgt_lang);
-
-                    m.source_function_count = fn_cov.source_total;
-                    m.target_function_count = fn_cov.target_total;
-                    m.matched_function_count = fn_cov.matched;
-                    m.function_coverage = fn_cov.ratio;
-                    m.missing_functions = std::move(fn_cov.missing);
-                    m.source_test_function_count = fn_cov.source_test_count;
-                    m.matched_test_function_count = fn_cov.matched_test_count;
-
-                    SourceFile combined_tgt_file = tgt_file;
-                    combined_tgt_file.paths = all_target_paths;
-                    auto ty_cov = type_name_coverage(
-                        symbol_src, symbol_tgt, src_lang, tgt_lang, src_file, combined_tgt_file);
-                    m.source_type_count = ty_cov.source_total;
-                    m.target_type_count = ty_cov.target_total;
-                    m.matched_type_count = ty_cov.matched;
-                    m.type_coverage = ty_cov.ratio;
-                    m.missing_types = std::move(ty_cov.missing);
-
-                    // Port completeness gates primarily on semantic code similarity:
-                    //   similarity = content_aware_ast_similarity * function_name_coverage
-                    // Type coverage is still reported separately (m.type_coverage) but is not
-                    // folded into the similarity score to avoid false negatives for faithful
-                    // transliterations that must introduce Kotlin-only type names.
-                    m.similarity = file_sim * fn_cov.ratio;
+                    m.similarity = 0.0f;
                 }
 
                 // Extract documentation statistics
@@ -1546,15 +2065,14 @@ public:
     /**
      * Get matches sorted by priority for porting.
      *
-     * Priority = (missing functions + missing types) × (10 + log1p(dependents) × 2)
-     *          + log1p(dependents) × (1 - similarity) × 5
+     * Priority = dependents * 1,000,000
+     *          + (missing functions + missing types/classes) * 10,000
+     *          + (source functions + source types/classes) * 100
+     *          + (1 - function similarity) * 10
      *
-     * Symbol deficits are the primary driver. Import depth is a
-     * multiplicative boost for deficits, and a secondary signal on its own
-     * when deficits are zero. See Match::priority_score() for the full
-     * rationale — this replaces the old `dependents × (1 - similarity)`
-     * formula, which gave priority 0 to any file with no dependents (every
-     * test file, every leaf module) and hid hundreds of real gaps.
+     * File fanout is the primary driver so the priority ladder favors work
+     * that clears downstream compilation failures fastest. Missing symbols are
+     * still visible, but a large leaf deficit should not outrank a hot file.
      */
     std::vector<Match> ranked_for_porting() {
         auto result = matches;
@@ -1572,6 +2090,8 @@ public:
 
         std::cout << "Source: " << source.root_path << " (" << source.files.size() << " files)\n";
         std::cout << "Target: " << target.root_path << " (" << target.files.size() << " files)\n";
+        std::cout << "Scoring invariant: FnSim is required function body/parameter similarity. "
+                  << "Class/type and symbol parity are reported beside it; whole-file shape is diagnostic only.\n";
         std::cout << "\n";
 
         std::cout << "Matched:   " << matches.size() << " files\n";
@@ -1582,7 +2102,7 @@ public:
             std::cout << "=== Matched Files (by porting priority) ===\n\n";
             std::cout << std::setw(30) << std::left << "Source"
                       << std::setw(30) << "Target"
-                      << std::setw(10) << "Similarity"
+                      << std::setw(10) << "FnSim"
                       << std::setw(11) << "Dependents"
                       << std::setw(14) << "FunctionParity"
                       << std::setw(12) << "TypeParity"
@@ -1602,9 +2122,13 @@ public:
                             std::to_string(m.source_type_count);
                 }
                 float priority = m.priority_score();
-                std::string stub_flag = m.is_stub ? " [STUB]" : "";
+                std::string match_flags = m.is_stub ? " [STUB]" : "";
+                if (!m.zero_reasons.empty() && !m.is_stub) match_flags = " [ZERO]";
+                if (m.matched_by_normalized_provenance) {
+                    match_flags += " [PROVENANCE-FALLBACK]";
+                }
                 std::cout << std::setw(30) << std::left << m.source_qualified.substr(0, 28)
-                          << std::setw(30) << (m.target_qualified.substr(0, 28) + stub_flag)
+                          << std::setw(30) << (m.target_qualified.substr(0, 28) + match_flags)
                           << std::setw(10) << std::fixed << std::setprecision(2) << m.similarity
                           << std::setw(11) << m.source_dependents
                           << std::setw(14) << funcs
@@ -1627,23 +2151,76 @@ public:
             for (const auto& m : ranked) {
                 std::cout << m.source_qualified << " -> " << m.target_qualified;
                 if (m.is_stub) std::cout << " [STUB]";
+                if (!m.zero_reasons.empty() && !m.is_stub) std::cout << " [ZERO]";
+                if (m.matched_by_normalized_provenance) std::cout << " [PROVENANCE-FALLBACK]";
                 std::cout << "\n";
                 std::cout << "  similarity: " << std::fixed << std::setprecision(2) << m.similarity
                           << ", priority: " << std::fixed << std::setprecision(1) << m.priority_score()
                           << ", dependents: " << m.source_dependents << "\n";
+                for (const auto& warning : m.provenance_warnings) {
+                    std::cout << "  provenance warning: " << warning << "\n";
+                }
                 std::cout << "  functions: " << m.matched_function_count << "/"
                           << m.source_function_count << " matched"
-                          << " (target total: " << m.target_function_count << ")\n";
+                          << " (target total: " << m.target_function_count
+                          << ", required body score: " << std::fixed << std::setprecision(2)
+                          << m.similarity << ")\n";
                 std::cout << "  missing functions: " << join_names(m.missing_functions) << "\n";
                 std::cout << "  types: " << m.matched_type_count << "/"
                           << m.source_type_count << " matched"
                           << " (target total: " << m.target_type_count << ")\n";
                 std::cout << "  missing types: " << join_names(m.missing_types) << "\n";
+                if (!m.zero_reasons.empty()) {
+                    std::cout << "  *** CHEAT DETECTION / SCORING FAILURE ***\n";
+                    std::cout << "  function-by-function score forced to 0: "
+                              << join_reasons(m.zero_reasons) << "\n";
+                }
                 if (m.source_test_function_count > 0) {
                     std::cout << "  tests: " << m.matched_test_function_count << "/"
                               << m.source_test_function_count << " matched\n";
                 }
                 std::cout << "\n";
+            }
+
+            bool any_zeroed = false;
+            for (const auto& m : ranked) {
+                if (!m.zero_reasons.empty()) {
+                    any_zeroed = true;
+                    break;
+                }
+            }
+            if (any_zeroed) {
+                std::cout << "\n=== Scores Forced To 0 ===\n\n";
+                for (const auto& m : ranked) {
+                    if (!m.zero_reasons.empty()) {
+                        std::cout << "  - " << m.source_qualified << " -> "
+                                  << m.target_qualified << ": "
+                                  << join_reasons(m.zero_reasons) << "\n";
+                    }
+                }
+            }
+
+            bool any_provenance_warning = false;
+            for (const auto& m : ranked) {
+                if (!m.provenance_warnings.empty()) {
+                    any_provenance_warning = true;
+                    break;
+                }
+            }
+            if (any_provenance_warning) {
+                std::cout << "\n=== Provenance Header Fallbacks ===\n\n";
+                std::cout << "These files were paired only after normalization; fix the port-lint source header.\n";
+                for (const auto& m : ranked) {
+                    for (size_t i = 0; i < m.provenance_warnings.size(); ++i) {
+                        const auto& warning = m.provenance_warnings[i];
+                        std::cout << "  - " << m.source_qualified << " -> "
+                                  << m.target_qualified << ": " << warning << "\n";
+                        if (i < m.provenance_proposals.size()) {
+                            std::cout << "    proposed: "
+                                      << m.provenance_proposals[i].proposed_header << "\n";
+                        }
+                    }
+                }
             }
         }
 

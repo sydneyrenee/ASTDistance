@@ -10,6 +10,7 @@
 #include <map>
 #include <set>
 #include <cctype>
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 
@@ -253,8 +254,8 @@ struct CommentStats {
 
 /**
  * Function metadata extracted from source code.
- * The AST is kept as the function body (not the whole declaration)
- * so that stub checks and identifier matching are aligned with behavior.
+ * The AST and identifiers are kept as parameters + body so transliteration
+ * reports compare callable behavior, not loose whole-file shape.
  */
 struct FunctionInfo {
     std::string name;
@@ -1729,6 +1730,112 @@ public:
         return function_node;
     }
 
+    bool is_parameter_container_node(const std::string& type_s, Language lang) const {
+        if (lang == Language::RUST) {
+            return type_s == "parameters";
+        }
+        if (lang == Language::KOTLIN) {
+            return type_s == "function_value_parameters";
+        }
+        if (lang == Language::CPP) {
+            return type_s == "parameter_list";
+        }
+        if (lang == Language::PYTHON) {
+            return type_s == "parameters";
+        }
+        if (lang == Language::TYPESCRIPT) {
+            return type_s == "formal_parameters" || type_s == "parameters";
+        }
+        return false;
+    }
+
+    bool node_contains_byte_range(TSNode node, uint32_t start, uint32_t end) const {
+        if (ts_node_is_null(node)) return false;
+        return ts_node_start_byte(node) <= start && ts_node_end_byte(node) >= end;
+    }
+
+    void collect_function_parameter_nodes(
+            TSNode node,
+            TSNode body_node,
+            Language lang,
+            std::vector<TSNode>& out) const {
+        if (ts_node_is_null(node)) return;
+
+        if (!ts_node_is_null(body_node) &&
+            node_contains_byte_range(node, ts_node_start_byte(body_node), ts_node_end_byte(body_node)) &&
+            !ts_node_eq(node, body_node)) {
+            // Keep walking until we reach the body itself, then stop before
+            // collecting nested/local function parameters from the body region.
+        } else if (!ts_node_is_null(body_node) && ts_node_eq(node, body_node)) {
+            return;
+        }
+
+        std::string type_s(ts_node_type(node));
+        if (is_parameter_container_node(type_s, lang)) {
+            out.push_back(node);
+            return;
+        }
+
+        uint32_t child_count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < child_count; ++i) {
+            TSNode child = ts_node_child(node, i);
+            collect_function_parameter_nodes(child, body_node, lang, out);
+        }
+    }
+
+    std::vector<TSNode> extract_function_parameter_nodes(
+            TSNode function_node,
+            TSNode body_node,
+            Language lang) const {
+        std::vector<TSNode> params;
+
+        TSNode by_field = ts_node_child_by_field_name(function_node, "parameters", 10);
+        if (!ts_node_is_null(by_field)) {
+            params.push_back(by_field);
+            return params;
+        }
+
+        collect_function_parameter_nodes(function_node, body_node, lang, params);
+        return params;
+    }
+
+    TreePtr make_function_comparison_tree(
+            TSNode function_node,
+            TSNode body_node,
+            const std::string& source,
+            Language lang) {
+        auto root = std::make_shared<Tree>(
+            static_cast<int>(NodeType::FUNCTION),
+            "function_parameters_and_body");
+
+        auto params = extract_function_parameter_nodes(function_node, body_node, lang);
+        for (const auto& param_node : params) {
+            root->add_child(convert_node(param_node, source, lang));
+        }
+
+        if (!ts_node_is_null(body_node)) {
+            root->add_child(convert_node(body_node, source, lang));
+        }
+
+        return root;
+    }
+
+    IdentifierStats extract_function_comparison_identifiers(
+            TSNode function_node,
+            TSNode body_node,
+            const std::string& source,
+            Language lang) {
+        IdentifierStats ids;
+        auto params = extract_function_parameter_nodes(function_node, body_node, lang);
+        for (const auto& param_node : params) {
+            extract_identifiers_recursive(param_node, source, lang, ids);
+        }
+        if (!ts_node_is_null(body_node)) {
+            extract_identifiers_recursive(body_node, source, lang, ids);
+        }
+        return ids;
+    }
+
     bool has_stub_markers_in_node(TSNode node, const std::string& source, Language lang) const {
         if (ts_node_is_null(node) || source.empty()) return false;
 
@@ -1873,13 +1980,10 @@ public:
             }
             std::string func_name = extract_function_name(node, lang, source);
 
-            IdentifierStats ids;
-            extract_identifiers_recursive(body_node, source, lang, ids);
-
             FunctionInfo info;
             info.name = func_name;
-            info.body_tree = convert_node(body_node, source, lang);
-            info.identifiers = ids;
+            info.body_tree = make_function_comparison_tree(node, body_node, source, lang);
+            info.identifiers = extract_function_comparison_identifiers(node, body_node, source, lang);
             info.has_stub_markers = has_stub_markers_in_node(body_node, source, lang);
             TSPoint start = ts_node_start_point(node);
             TSPoint end = ts_node_end_point(node);
