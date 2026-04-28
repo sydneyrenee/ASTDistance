@@ -1102,7 +1102,20 @@ public:
              "translator-note comment (`Kotlin:`) in Kotlin comments"},
             {std::regex(R"(\(\s*from\s+impl\b[^)]*\))", std::regex_constants::icase),
              "Rust impl provenance note in Kotlin comments"},
-            {std::regex(R"(\b(lifetime|lifetimes|'[A-Za-z_][A-Za-z0-9_]*)\b)", std::regex_constants::icase),
+            // Rust lifetime references in Kotlin comments:
+            //   - bare words `lifetime`/`lifetimes` (Rust concept must be
+            //     translated to Kotlin idiom -- "scope", "reference", etc.)
+            //   - apostrophe-prefixed lifetime annotations (`'a`, `'static`,
+            //     `'_`, etc.) -- pure Rust syntax with no Kotlin meaning
+            //
+            // The apostrophe pattern uses a leading non-word-char alternation
+            // (`(^|[^A-Za-z0-9_])`) instead of negative lookbehind because
+            // std::regex's ECMAScript flavor rejects lookbehind in some
+            // builds. Without that anchor, English contractions like
+            // "wasn't"/"can't"/"it's" false-match (the `'t`/`'s` look like
+            // one-letter lifetimes).
+            {std::regex(R"(\b(lifetime|lifetimes)\b|(^|[^A-Za-z0-9_])'[A-Za-z_][A-Za-z0-9_]*\b)",
+             std::regex_constants::icase),
              "Rust lifetime explanation in Kotlin comments"},
             {std::regex(R"(\b(dyn|usize|Box|transmute|unsafe)\b)"),
              "Rust-only type/unsafe terminology in Kotlin comments"},
