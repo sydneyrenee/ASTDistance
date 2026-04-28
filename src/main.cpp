@@ -7,6 +7,7 @@
 #include "task_manager.hpp"
 #include "symbol_analysis.hpp"
 #include "symbol_extraction.hpp"
+#include "symbol_extractor.hpp"
 #include "reexport_config.hpp"
 #include <iostream>
 #include <fstream>
@@ -795,39 +796,39 @@ static std::vector<RustModReexportHint> rust_mod_reexport_hints(
     return hints;
 }
 
-// Read whole file contents, returning empty string on failure.
-static std::string read_file_to_string(const std::filesystem::path& path) {
-    std::ifstream in(path);
-    if (!in.is_open()) return std::string();
-    return std::string(
-        (std::istreambuf_iterator<char>(in)),
-        std::istreambuf_iterator<char>());
-}
-
-// Extract the names of all type-alias declarations in a Rust source file.
-// Matches `pub type X = ...`, `pub(crate) type X = ...`, and `type X = ...`.
-// Used to verify that Kotlin typealiases mirror an actual Rust `pub type`,
-// so faithful 1:1 ports stop tripping the "Kotlin-only typealias" warning.
-static std::vector<std::string> extract_rust_type_alias_names(const std::string& content) {
+// Extract the names of all type-alias declarations in a single source file
+// using the existing SymbolExtractor / tree-sitter infrastructure.
+//
+// Rust `pub type X = ...` parses as `type_item` and SymbolExtractor labels
+// it `"type"`. Kotlin `typealias X = ...` parses as `type_alias` and is
+// labeled `"typealias"`. We accept either label.
+static std::vector<std::string> extract_type_alias_names(
+    const std::string& source_text,
+    const TSLanguage* ts_lang
+) {
     std::vector<std::string> names;
-    std::regex pattern(R"(\b(?:pub(?:\s*\([^)]+\))?\s+)?type\s+([A-Za-z_][A-Za-z0-9_]*))");
-    auto begin = std::sregex_iterator(content.begin(), content.end(), pattern);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        names.push_back((*it)[1].str());
-    }
-    return names;
-}
+    if (!ts_lang || source_text.empty()) return names;
 
-// Extract the names of all `typealias X = ...` declarations in a Kotlin file.
-static std::vector<std::string> extract_kotlin_typealias_names(const std::string& content) {
-    std::vector<std::string> names;
-    std::regex pattern(R"(\btypealias\s+([A-Za-z_][A-Za-z0-9_]*))");
-    auto begin = std::sregex_iterator(content.begin(), content.end(), pattern);
-    auto end = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        names.push_back((*it)[1].str());
+    TSParser* parser = ts_parser_new();
+    if (!parser) return names;
+    if (!ts_parser_set_language(parser, ts_lang)) {
+        ts_parser_delete(parser);
+        return names;
     }
+    TSTree* tree = ts_parser_parse_string(
+        parser, nullptr, source_text.c_str(), source_text.size());
+    if (tree) {
+        TSNode root = ts_tree_root_node(tree);
+        auto symbols = ast_distance::SymbolExtractor::extract_symbols(
+            root, source_text, "", "");
+        for (const auto& sym : symbols) {
+            if (sym.type == "type" || sym.type == "typealias") {
+                if (!sym.name.empty()) names.push_back(sym.name);
+            }
+        }
+        ts_tree_delete(tree);
+    }
+    ts_parser_delete(parser);
     return names;
 }
 
@@ -841,7 +842,7 @@ static void warn_kotlin_suspicious_constructs(
         return;
     }
 
-    std::string content = read_file_to_string(target_path);
+    std::string content = CodebaseComparator::read_file_to_string(target_path.string());
     if (content.empty()) {
         return;
     }
@@ -869,10 +870,13 @@ static void warn_kotlin_suspicious_constructs(
     //
     // Matching is by canonicalized name (snake_case <-> camelCase via
     // IdentifierStats::canonicalize), per the rest of the parity logic.
-    std::vector<std::string> kotlin_aliases = extract_kotlin_typealias_names(content);
+    std::vector<std::string> kotlin_aliases =
+        extract_type_alias_names(content, tree_sitter_kotlin());
     if (!kotlin_aliases.empty()) {
-        std::string source_content = read_file_to_string(source_path);
-        std::vector<std::string> rust_aliases = extract_rust_type_alias_names(source_content);
+        std::string source_content =
+            CodebaseComparator::read_file_to_string(source_path.string());
+        std::vector<std::string> rust_aliases =
+            extract_type_alias_names(source_content, tree_sitter_rust());
 
         std::set<std::string> rust_canon;
         for (const auto& n : rust_aliases) {
@@ -2578,12 +2582,26 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "# Immediate Actions - High-Value Files\n\n";
         report << "Based on AST analysis, here are the concrete next steps.\n\n";
         
+        // File presence is the only file-level metric retained. Everything
+        // else is function-level / type-level / symbol-level parity using
+        // the totals already aggregated above (total_matched_functions,
+        // total_source_functions, etc.) and the existing parity helpers.
+        // The previous "Average Similarity" line averaged file-level scores
+        // and obscured cases where a file appeared ported (matching imports,
+        // doc strings) while its actual functions/classes were missing.
         report << "## Summary\n\n";
-        report << "- **Current Progress:** " << std::fixed << std::setprecision(1) 
-               << completion_pct << "% (" << total_target_physical << "/" << total_source << " files)\n";
-        report << "- **Matched Files:** " << matched << "\n";
-        report << "- **Average Similarity:** " << std::fixed << std::setprecision(2) 
-               << avg_similarity << "\n";
+        report << "- **Files Present:** " << matched << "/" << total_source
+               << " (" << std::fixed << std::setprecision(1) << completion_pct << "%)\n";
+        report << "- **Function parity:** "
+               << parity_count_cell(total_matched_functions, total_source_functions, total_target_functions)
+               << " — " << parity_pct_cell(total_matched_functions, total_source_functions) << "\n";
+        report << "- **Class/type parity:** "
+               << parity_count_cell(total_matched_types, total_source_types, total_target_types)
+               << " — " << parity_pct_cell(total_matched_types, total_source_types) << "\n";
+        report << "- **Combined symbol parity:** "
+               << parity_count_cell(total_matched_symbols, total_source_symbols, total_target_symbols)
+               << " — " << parity_pct_cell(total_matched_symbols, total_source_symbols) << "\n";
+        report << "- **Cheat-zeroed Files:** " << zeroed_files << "\n";
         report << "- **Critical Issues:** " << critical << " files with <0.60 function similarity\n\n";
         
         report << "## Priority 1: Fix Incomplete High-Dependency Files\n\n";
