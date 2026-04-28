@@ -5035,6 +5035,47 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            // Iterator-trait equivalence (Rust impl Iterator <-> Kotlin : Iterator).
+            //
+            // Kotlin's kotlin.collections.Iterator interface forces a `hasNext():
+            // Boolean` method that has no Rust counterpart -- Rust's
+            // `Iterator::next() -> Option<T>` folds the "is there a next?"
+            // question into the return value. When a Kotlin class is the
+            // faithful port of a Rust `impl Iterator for X`, the forced
+            // `hasNext` should not count as an unmatched Kotlin-only extra.
+            //
+            // Laser-focused rule: suppress `hasNext` from unmatched-target
+            // ONLY when:
+            //   - Rust source contains at least one `impl Iterator for ...`
+            //     (or `impl<...> Iterator for ...`)
+            //   - Kotlin target declares a class implementing Iterator<...>
+            //     or MutableIterator<...>
+            //
+            // Both sides must show the iterator pattern. A unilateral Kotlin
+            // Iterator extension without a Rust counterpart is still a
+            // Kotlin-only invention and is reported as before.
+            const bool both_sides_have_iterator_pattern = [&]() -> bool {
+                if (lang1 != Language::RUST || lang2 != Language::KOTLIN) {
+                    return false;
+                }
+                static const std::regex rust_impl_iter(
+                    R"(\bimpl(?:\s*<[^{>]*>)?\s+(?:[A-Za-z0-9_:]+\s*::\s*)?Iterator\b\s+for\b)");
+                static const std::regex kotlin_extends_iter(
+                    R"(:\s*(?:[A-Za-z_][A-Za-z0-9_.]*\s*\.)?(?:Mutable)?Iterator\s*<)");
+                return std::regex_search(file1_text, rust_impl_iter)
+                    && std::regex_search(file2_text, kotlin_extends_iter);
+            }();
+
+            int suppressed_hasnext = 0;
+            if (both_sides_have_iterator_pattern) {
+                for (int j = 0; j < static_cast<int>(funcs2.size()); ++j) {
+                    if (!target_used[j] && funcs2[j].name == "hasNext") {
+                        target_used[j] = true;
+                        ++suppressed_hasnext;
+                    }
+                }
+            }
+
             int unmatched_source = 0;
             int unmatched_target = 0;
             for (bool used : source_used) {
@@ -5126,6 +5167,13 @@ int main(int argc, char* argv[]) {
                                   << " (" << funcs2[j].line_count << " lines)\n";
                     }
                 }
+            }
+            if (suppressed_hasnext > 0) {
+                std::cout << "\nIterator-trait equivalence: suppressed "
+                          << suppressed_hasnext
+                          << " forced `hasNext` method(s) (Kotlin Iterator interface "
+                             "requires it; Rust's Iterator::next folds the check into "
+                             "Option<T>).\n";
             }
 
             auto line_reports = reports;
