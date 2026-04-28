@@ -1108,13 +1108,18 @@ public:
             //   - apostrophe-prefixed lifetime annotations (`'a`, `'static`,
             //     `'_`, etc.) -- pure Rust syntax with no Kotlin meaning
             //
-            // The apostrophe pattern uses a leading non-word-char alternation
-            // (`(^|[^A-Za-z0-9_])`) instead of negative lookbehind because
-            // std::regex's ECMAScript flavor rejects lookbehind in some
-            // builds. Without that anchor, English contractions like
-            // "wasn't"/"can't"/"it's" false-match (the `'t`/`'s` look like
-            // one-letter lifetimes).
-            {std::regex(R"(\b(lifetime|lifetimes)\b|(^|[^A-Za-z0-9_])'[A-Za-z_][A-Za-z0-9_]*\b)",
+            // To distinguish real Rust lifetimes from English contractions
+            // (wasn't, it's, VacantEntry's) and from KDoc inline-code spans
+            // ending in possessive (`Foo`'s), require the apostrophe to be
+            // anchored at start-of-string OR preceded by a Rust-typeish
+            // context character (whitespace, `&`, `:`, `<`, `,`, `(`, `;`).
+            // Letters, digits, underscore, and backtick before the
+            // apostrophe all indicate prose / KDoc, not Rust syntax.
+            //
+            // Lookbehind is avoided because std::regex's ECMAScript flavor
+            // rejects it in some builds; the leading alternation captures
+            // the preceding character explicitly.
+            {std::regex(R"(\b(lifetime|lifetimes)\b|(^|[\s&:<,;(])'[A-Za-z_][A-Za-z0-9_]*\b)",
              std::regex_constants::icase),
              "Rust lifetime explanation in Kotlin comments"},
             {std::regex(R"(\b(dyn|usize|Box|transmute|unsafe)\b)"),
