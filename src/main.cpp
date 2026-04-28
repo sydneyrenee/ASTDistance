@@ -8,6 +8,7 @@
 #include "symbol_analysis.hpp"
 #include "symbol_extraction.hpp"
 #include "reexport_config.hpp"
+#include "port_lint.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -831,7 +832,16 @@ static void warn_kotlin_suspicious_constructs(
     if (content.find("typealias ") != std::string::npos ||
         content.find("typealias\t") != std::string::npos ||
         content.find("\ntypealias") != std::string::npos) {
-        warn("typealias");
+        // Suppress when the porter has annotated the file with one or more
+        // `// port-lint: typealias-of <rust-fqname>` lines, declaring that
+        // the typealias is a faithful port of a Rust `pub type X = Y`.
+        // Without this escape hatch, the cheat detector pushes porters to
+        // rewrite faithful typealiases as wrapper classes with Rust-named
+        // forwarding methods just to silence the warning -- precisely the
+        // rustification pattern this tool should discourage.
+        if (!port_lint::has_typealias_of_annotation(target_path)) {
+            warn("typealias");
+        }
     }
 }
 
