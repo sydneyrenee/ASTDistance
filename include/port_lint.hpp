@@ -21,16 +21,6 @@ namespace fs = std::filesystem;
  *   // port-lint: ignore-duplicate
  *   // port-lint: ignore
  *
- * TYPEALIAS PARITY:
- *   // port-lint: typealias-of <rust-fqname>
- *   typealias Set<K> = BTreeSet<K>
- *
- *   Marks the following Kotlin typealias as the faithful port of a Rust
- *   `pub type X = Y` declaration. Without this annotation, ast_distance
- *   warns "Kotlin-only typealias detected" because the cheat detector
- *   cannot otherwise distinguish a faithful pub-type port from an
- *   ergonomics-only Kotlin invention.
- *
  * Based on tools/port_linter.py
  */
 
@@ -135,70 +125,6 @@ inline bool has_suppression(const std::vector<std::string>& lines, int line_num)
     }
     
     return false;
-}
-
-/**
- * Check if a file contains any `// port-lint: typealias-of <rust-fqname>`
- * annotation in its first 200 lines.
- *
- * Used to suppress the "Kotlin-only typealias detected" warning for
- * files where the porter has explicitly marked typealiases as faithful
- * ports of Rust `pub type X = Y` declarations.
- *
- * Coarse-grained: presence of any typealias-of annotation suppresses
- * the warning for the whole file. A future refinement could match each
- * typealias declaration to a nearby annotation; for now, the coarse
- * gate is enough to stop incentivizing wrapper-class shims over
- * faithful typealiases.
- */
-inline bool has_typealias_of_annotation(const fs::path& file_path) {
-    std::ifstream file(file_path);
-    if (!file.is_open()) {
-        return false;
-    }
-
-    std::regex pattern(R"(//\s*port-lint:\s*typealias-of\s+\S+)", std::regex::icase);
-
-    std::string line;
-    int line_count = 0;
-    while (std::getline(file, line) && line_count++ < 200) {
-        if (std::regex_search(line, pattern)) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-/**
- * Extract all `// port-lint: typealias-of <rust-fqname>` annotations
- * from the first 200 lines of a file.
- *
- * Returns the list of Rust fully-qualified names that the porter has
- * declared their Kotlin typealiases to be ports of. Used by symbol
- * parity matching: when Rust has `pub type X = Y` and Kotlin declares
- * `// port-lint: typealias-of crate::module::X` near a `typealias`,
- * those count as parity matches rather than unmatched extras.
- */
-inline std::vector<std::string> extract_typealias_of_annotations(const fs::path& file_path) {
-    std::vector<std::string> result;
-    std::ifstream file(file_path);
-    if (!file.is_open()) {
-        return result;
-    }
-
-    std::regex pattern(R"(//\s*port-lint:\s*typealias-of\s+(\S+))", std::regex::icase);
-
-    std::string line;
-    int line_count = 0;
-    while (std::getline(file, line) && line_count++ < 200) {
-        std::smatch match;
-        if (std::regex_search(line, match, pattern)) {
-            result.push_back(match[1].str());
-        }
-    }
-
-    return result;
 }
 
 /**
