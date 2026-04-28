@@ -1310,6 +1310,34 @@ public:
                 return result;
             }
         }
+
+        // Basename fallback: when the header carries a path prefix that
+        // isn't present in the configured source root (e.g. btree-kotlin's
+        // `library/alloc/src/collections/btree/borrow.rs` against a source
+        // root `tmp/rust-stdlib-collections-btree/` containing flat
+        // `borrow.rs`), the prefix-strip variants above can't reach the
+        // source path. Fall through to a lower-scored basename match so
+        // those files still pair. Score 0.85 keeps this strictly below
+        // the prefix-strip fallback (0.99) and the exact match (1.0), so
+        // disambiguation between e.g. `lr1/mod.rs` vs `grammar/mod.rs`
+        // still picks the exact match when both are candidates.
+        const std::string header_basename =
+            normalized_source_annotation_component(
+                fs::path(header_path).filename().string(), /*is_filename=*/true);
+        const std::string source_basename =
+            normalized_source_annotation_component(
+                fs::path(source_rel).filename().string(), /*is_filename=*/true);
+        if (!header_basename.empty() && header_basename == source_basename) {
+            result.score = 0.85f;
+            result.normalized_fallback = true;
+            result.warning =
+                "port-lint provenance header matched only by basename: `" +
+                tgt_file.transliterated_from + "` vs expected `" +
+                canonical_source_annotation_path(src_file.relative_path) + "`";
+            result.proposal = provenance_proposal_for_header(src_file, tgt_file, result.warning);
+            return result;
+        }
+
         return result;
     }
 
