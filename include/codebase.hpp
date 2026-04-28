@@ -1036,6 +1036,39 @@ public:
         std::vector<std::string> reasons;
         std::string code = strip_kotlin_comments_and_strings(source);
         std::string comments = extract_kotlin_comments(source);
+        // Drop the canonical port-lint provenance header from the comment scan.
+        //
+        //     // port-lint: source <relative-path-to-rust-file>
+        //     // port-lint: tests  <relative-path-to-rust-file>
+        //
+        // The header is REQUIRED for port tracking and may legitimately contain
+        // snake_case segments from upstream Rust filenames (`parse_tree.rs`,
+        // `dedup_sorted_iter.rs`, etc.). Without this filter the header itself
+        // trips the snake_case cheat detector below.
+        //
+        // The regex is strict: the WHOLE line (after `//` stripping by
+        // extract_kotlin_comments) must be `<ws>port-lint:<ws>(source|tests)<ws><path><ws>`.
+        // Anything trailing the path -- including `fn cheat(){}` riding the
+        // same physical line -- fails the match and the line is scanned
+        // normally. This closes the obvious bypass of letting attackers
+        // smuggle Rust syntax onto a port-lint line.
+        {
+            static const std::regex port_lint_header_re(
+                R"(^\s*port-lint:\s*(?:source|tests)\s+\S+\s*$)");
+            std::istringstream in(comments);
+            std::ostringstream out;
+            std::string line;
+            bool first = true;
+            while (std::getline(in, line)) {
+                if (std::regex_match(line, port_lint_header_re)) {
+                    continue;
+                }
+                if (!first) out << "\n";
+                first = false;
+                out << line;
+            }
+            comments = out.str();
+        }
 
         auto add_reason = [&](const std::string& reason) {
             if (std::find(reasons.begin(), reasons.end(), reason) == reasons.end()) {
