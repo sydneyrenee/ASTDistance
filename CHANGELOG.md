@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-04-27
+
 ### Added
 
 - TypeScript NPM package (`@ast-distance/typescript`)
@@ -16,11 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI/CD workflows (test, build, publish-npm)
 - Automated build scripts
 - Feature parity documentation
+- Vendored tree-sitter grammars so CMake builds do not fetch parser sources.
+- CLI filter guard for direct file comparisons, with PTY-aware regression tests.
+- Rust-to-Kotlin provenance fallback reporting for `src/` prefix and camelCase header mismatches.
+- `port_lint_proposed_changes.md` generation for fallback provenance matches.
 
 ### Changed
 
 - C++ version enhanced with TypeScript language support
 - Updated node type mappings for comprehensive TypeScript coverage
+- Rust-to-Kotlin deep reports now separate exact header matches from provenance fallback matches.
+- Direct file comparisons now surface provenance fallback warnings and proposed `port-lint` header lines.
 
 ## [0.1.0] - TBD
 
