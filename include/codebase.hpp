@@ -1750,6 +1750,17 @@ public:
         }
 
         if (src_prod.empty() || tgt_all.empty()) {
+            result.matched_pairs = 0;
+            result.unmatched_source = static_cast<int>(src_prod.size());
+            result.unmatched_target = static_cast<int>(tgt_all.size());
+            if (src_prod.empty()) {
+                // No required functions to compare: treat as complete only if the Kotlin
+                // target also does not define functions (otherwise Kotlin is inventing API).
+                result.score = tgt_all.empty() ? 1.0f : 0.0f;
+            } else {
+                // Rust defines functions but Kotlin does not.
+                result.score = 0.0f;
+            }
             return result;
         }
 
@@ -2108,7 +2119,13 @@ public:
 
                 auto fn_result = compare_function_sets(source_functions, target_functions);
                 if (source_functions.empty()) {
-                    m.zero_reasons.push_back("no source functions found; report scoring is function-by-function only");
+                    if (target_functions.empty()) {
+                        // No required function bodies on either side.
+                        m.similarity = 1.0f;
+                    } else {
+                        m.zero_reasons.push_back(
+                            "no source functions found; target defines functions; report scoring is function-by-function only");
+                    }
                 } else if (target_functions.empty()) {
                     m.zero_reasons.push_back("no target functions found; report scoring is function-by-function only");
                 }

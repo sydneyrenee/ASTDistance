@@ -2180,11 +2180,13 @@ void generate_reports(const Codebase& source, const Codebase& target,
     // Count quality distribution. Stubs are always critical regardless of
     // whatever similarity score they carry, and are excluded from the average.
     int excellent = 0, good = 0, critical = 0;
-    float avg_similarity = 0.0f;
+    float avg_similarity = 0.0f;        // Average inline-code (function body) cosine
+    float avg_doc_similarity = 0.0f;    // Average documentation cosine
     int avg_count = 0;
     for (const auto& m : comp.matches) {
         if (m.is_stub) { critical++; continue; }
         avg_similarity += m.similarity;
+        avg_doc_similarity += m.doc_similarity;
         avg_count++;
         if (m.similarity >= 0.85) excellent++;
         else if (m.similarity >= 0.60) good++;
@@ -2192,6 +2194,7 @@ void generate_reports(const Codebase& source, const Codebase& target,
     }
     if (avg_count > 0) {
         avg_similarity /= avg_count;
+        avg_doc_similarity /= avg_count;
     }
     float matched_denominator = matched > 0 ? static_cast<float>(matched) : 1.0f;
 
@@ -2292,7 +2295,9 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "| Combined symbol parity | "
                << parity_count_cell(total_matched_symbols, total_source_symbols, total_target_symbols)
                << " | " << parity_pct_cell(total_matched_symbols, total_source_symbols) << " |\n";
-        report << "| Average function body similarity | " << avg_similarity_cell() << " | required score |\n";
+        report << "| Average function body similarity | " << avg_similarity_cell() << " | inline-code cosine |\n";
+        report << "| Average documentation similarity | " << std::fixed << std::setprecision(2)
+               << avg_doc_similarity << " | doc text cosine |\n";
         report << "| Missing source functions | " << missing_source_functions << " | 0% parity until ported |\n";
         report << "| Missing source classes/types | " << missing_source_types << " | 0% parity until ported |\n";
         report << "| Missing source symbol files | " << missing_source_files_with_symbols
@@ -2582,13 +2587,9 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "# Immediate Actions - High-Value Files\n\n";
         report << "Based on AST analysis, here are the concrete next steps.\n\n";
         
-        // File presence is the only file-level metric retained. Everything
-        // else is function-level / type-level / symbol-level parity using
-        // the totals already aggregated above (total_matched_functions,
-        // total_source_functions, etc.) and the existing parity helpers.
-        // The previous "Average Similarity" line averaged file-level scores
-        // and obscured cases where a file appeared ported (matching imports,
-        // doc strings) while its actual functions/classes were missing.
+        // Parity (function/symbol/class) is the end-state measurement; the
+        // average cosine lines beneath it report inline-code body similarity
+        // and documentation similarity per file as established diagnostics.
         report << "## Summary\n\n";
         report << "- **Files Present:** " << matched << "/" << total_source
                << " (" << std::fixed << std::setprecision(1) << completion_pct << "%)\n";
@@ -2601,6 +2602,12 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "- **Combined symbol parity:** "
                << parity_count_cell(total_matched_symbols, total_source_symbols, total_target_symbols)
                << " — " << parity_pct_cell(total_matched_symbols, total_source_symbols) << "\n";
+        report << "- **Average inline-code cosine:** " << std::fixed << std::setprecision(2)
+               << avg_similarity << " (function body across "
+               << avg_count << " matched files)\n";
+        report << "- **Average documentation cosine:** " << std::fixed << std::setprecision(2)
+               << avg_doc_similarity << " (doc text across "
+               << avg_count << " matched files)\n";
         report << "- **Cheat-zeroed Files:** " << zeroed_files << "\n";
         report << "- **Critical Issues:** " << critical << " files with <0.60 function similarity\n\n";
         
@@ -5105,12 +5112,26 @@ int main(int argc, char* argv[]) {
 
             const float source_total = static_cast<float>(funcs1.size());
             const float matched_total = static_cast<float>(reports.size());
-            const float coverage = source_total > 0.0f ? matched_total / source_total : 0.0f;
-            const float overall_score = source_total > 0.0f ? total_combined / source_total : 0.0f;
-            const float matched_avg = matched_total > 0.0f ? total_combined / matched_total : 0.0f;
-            const float ast_avg = matched_total > 0.0f ? total_ast_cosine / matched_total : 0.0f;
-            const float id_avg = matched_total > 0.0f ? total_id_cosine / matched_total : 0.0f;
-            const float line_balance_avg = matched_total > 0.0f ? total_line_balance / matched_total : 0.0f;
+            const float coverage = [&]() -> float {
+                if (source_total > 0.0f) {
+                    return matched_total / source_total;
+                }
+                return funcs2.empty() ? 1.0f : 0.0f;
+            }();
+            const float overall_score = [&]() -> float {
+                if (source_total > 0.0f) {
+                    return total_combined / source_total;
+                }
+                return funcs2.empty() ? 1.0f : 0.0f;
+            }();
+            const float matched_avg =
+                matched_total > 0.0f ? total_combined / matched_total : overall_score;
+            const float ast_avg =
+                matched_total > 0.0f ? total_ast_cosine / matched_total : overall_score;
+            const float id_avg =
+                matched_total > 0.0f ? total_id_cosine / matched_total : overall_score;
+            const float line_balance_avg =
+                matched_total > 0.0f ? total_line_balance / matched_total : overall_score;
 
             std::cout << "\n=== Function-by-Function Comparison (required score) ===\n";
             if (lang1 == Language::RUST && lang2 == Language::KOTLIN) {
@@ -5130,7 +5151,11 @@ int main(int argc, char* argv[]) {
             std::cout << "Function body score (missing source functions count as 0): "
                       << std::fixed << std::setprecision(3) << overall_score << "\n";
             if (funcs1.empty()) {
-                std::cout << "Function comparison failed: no source function bodies were extracted.\n";
+                if (funcs2.empty()) {
+                    std::cout << "No functions in either file; treating function similarity as 1.000.\n";
+                } else {
+                    std::cout << "No source functions; target defines functions (score forced to 0.000).\n";
+                }
             } else if (funcs2.empty()) {
                 std::cout << "Function comparison failed: no target function bodies were extracted.\n";
             } else if (unmatched_source > 0) {
@@ -5396,7 +5421,11 @@ int main(int argc, char* argv[]) {
                           << function_result.target_total << " functions, matched "
                           << function_result.matched_pairs << "\n";
                 if (function_result.source_total == 0) {
-                    std::cout << "Function comparison failed: no source function bodies were extracted.\n";
+                    if (function_result.target_total == 0) {
+                        std::cout << "No functions in either file; treating function similarity as 1.000.\n";
+                    } else {
+                        std::cout << "No source functions; target defines functions (score forced to 0.000).\n";
+                    }
                 } else if (function_result.target_total == 0) {
                     std::cout << "Function comparison failed: no target function bodies were extracted.\n";
                 } else if (function_result.unmatched_source > 0) {
