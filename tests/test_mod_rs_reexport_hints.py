@@ -56,7 +56,7 @@ fun doThing(x: Int): Int {
 
     out = proc.stdout
     expected = [
-        "Function comparison failed: no source function bodies were extracted.",
+        "No source functions; target defines functions (score forced to 0.000).",
         "Rust mod.rs reexports detected:",
         "do_thing -> expected doThing",
         "(actual: foo_bar::do_thing, likely source: foo_bar.rs)",

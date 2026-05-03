@@ -5,6 +5,7 @@
 #include <sstream>
 #include <filesystem>
 #include <algorithm>
+#include <regex>
 #include <set>
 #include <cctype>
 
@@ -1020,6 +1021,149 @@ std::vector<MatchResult> generate_match_candidates(const Symbol& rust_sym) {
 // Public API
 // ============================================================================
 
+// ============================================================================
+// Reexport graph extraction
+//
+// Walks the Rust source tree, opens every `mod.rs` and `lib.rs`, and parses
+// `pub use` declarations into a flat graph keyed by exported name.
+//
+// Why: when a symbol like `Bar` shows up as missing in the parity report,
+// the porter wants to know *where Bar actually lives* — the canonical
+// defining file — so they can put the Kotlin counterpart in the right
+// place. A `pub use foo::bar::Bar` chain points the way. Per AGENTS.md,
+// the Kotlin port wires callers to the canonical location, not the
+// reexport, so showing the chain saves the porter from chasing it
+// manually.
+//
+// This is intentionally a regex parser (not tree-sitter): `pub use` is a
+// shallow declaration, almost always one statement per line, and we want
+// to keep this layer dependency-free for downstream callers that already
+// hold a SymbolTable.
+// ============================================================================
+
+namespace {
+
+std::string trim_use(const std::string& s) {
+    size_t start = 0;
+    while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) ++start;
+    size_t end = s.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1]))) --end;
+    return s.substr(start, end - start);
+}
+
+// Last `::`-separated component of a Rust path.
+std::string last_component(const std::string& path) {
+    auto pos = path.rfind("::");
+    if (pos == std::string::npos) return path;
+    return path.substr(pos + 2);
+}
+
+// "foo::bar::Baz as Q" → ("foo::bar::Baz", "Q"); without "as", alias is empty.
+std::pair<std::string, std::string> split_alias(const std::string& spec) {
+    static const std::regex alias_re(R"(^(.+?)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)\s*$)");
+    std::smatch m;
+    if (std::regex_match(spec, m, alias_re)) {
+        return {trim_use(m[1].str()), trim_use(m[2].str())};
+    }
+    return {trim_use(spec), {}};
+}
+
+// "Foo, Bar as Q, Baz" → {"Foo", "Bar as Q", "Baz"}, respecting nested braces.
+std::vector<std::string> split_top_level_commas(const std::string& items) {
+    std::vector<std::string> out;
+    std::string current;
+    int depth = 0;
+    for (char c : items) {
+        if (c == '{') ++depth;
+        else if (c == '}') --depth;
+        if (c == ',' && depth == 0) {
+            std::string t = trim_use(current);
+            if (!t.empty()) out.push_back(t);
+            current.clear();
+        } else {
+            current.push_back(c);
+        }
+    }
+    std::string t = trim_use(current);
+    if (!t.empty()) out.push_back(t);
+    return out;
+}
+
+void collect_use_specs(const std::string& mod_file,
+                       int line_no,
+                       const std::string& spec,
+                       ReexportGraph& graph) {
+    if (spec.empty() || spec.find('*') != std::string::npos) return;
+
+    static const std::regex brace_re(R"(^(.+?)::\{(.+)\}\s*$)");
+    std::smatch m;
+    if (std::regex_match(spec, m, brace_re)) {
+        std::string prefix = trim_use(m[1].str());
+        for (const auto& item : split_top_level_commas(m[2].str())) {
+            auto [path, alias] = split_alias(item);
+            if (path == "self") {
+                std::string exported = alias.empty() ? last_component(prefix) : alias;
+                ReexportEdge edge{mod_file, line_no, prefix, exported};
+                graph.chains_by_name[exported].push_back({edge});
+                continue;
+            }
+            std::string full = prefix + "::" + path;
+            std::string exported = alias.empty() ? last_component(path) : alias;
+            ReexportEdge edge{mod_file, line_no, full, exported};
+            graph.chains_by_name[exported].push_back({edge});
+        }
+        return;
+    }
+
+    auto [path, alias] = split_alias(spec);
+    std::string exported = alias.empty() ? last_component(path) : alias;
+    if (exported.empty() || exported == "self") return;
+    ReexportEdge edge{mod_file, line_no, path, exported};
+    graph.chains_by_name[exported].push_back({edge});
+}
+
+}  // namespace
+
+ReexportGraph extract_rust_reexports(const std::string& root) {
+    ReexportGraph graph;
+
+    // `pub` or `pub(crate)`/`pub(in foo)` followed by `use … ;`. We don't
+    // try to handle multi-line `use` blocks; the stdlib btree, lalrpop, and
+    // codex sources we target keep them on one line.
+    static const std::regex use_re(
+        R"(^\s*pub(?:\([^)]*\))?\s+use\s+(.+?)\s*;\s*$)");
+
+    // `pub use` declarations live in `mod.rs` and `lib.rs` most often, but
+    // any .rs file can reexport from a sibling submodule (the stdlib's
+    // btree puts `pub use entry::{Entry, OccupiedEntry, VacantEntry}` at
+    // the top of `map.rs` and `set.rs`, for example). Walk every Rust
+    // file; the parser ignores anything that isn't a single-line
+    // `pub use … ;`.
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().extension() != ".rs") continue;
+        std::string path = entry.path().string();
+        if (should_skip_path(path)) continue;
+
+        std::string content = read_file_content(entry.path());
+        if (content.empty()) continue;
+
+        std::string rel_path = fs::relative(entry.path(), root).string();
+
+        std::istringstream stream(content);
+        std::string line;
+        int line_no = 0;
+        while (std::getline(stream, line)) {
+            ++line_no;
+            std::smatch m;
+            if (!std::regex_match(line, m, use_re)) continue;
+            collect_use_specs(rel_path, line_no, trim_use(m[1].str()), graph);
+        }
+    }
+
+    return graph;
+}
+
 SymbolTable extract_rust_symbols(const std::string& root) {
     SymbolTable table;
     TSParser* parser = ts_parser_new();
@@ -1080,7 +1224,9 @@ SymbolTable extract_kotlin_symbols(const std::string& root) {
     return table;
 }
 
-SymbolParityReport build_parity_report(const SymbolTable& rust, const SymbolTable& kotlin) {
+SymbolParityReport build_parity_report(const SymbolTable& rust,
+                                       const SymbolTable& kotlin,
+                                       const ReexportGraph* reexports) {
     SymbolParityReport report;
 
     // Count stubs
@@ -1140,6 +1286,21 @@ SymbolParityReport build_parity_report(const SymbolTable& rust, const SymbolTabl
         match.kotlin_symbol = best_match;
         match.confidence = best_confidence;
         match.match_reason = best_reason;
+        // Annotate with `pub use` chains so missing-symbol output points
+        // the porter at the canonical defining file. Only attach the
+        // chain when the chain's mod.rs is *not* the same file the
+        // symbol is defined in — otherwise we'd echo `Bar (in foo.rs)
+        // exported via foo.rs` for every locally-public item.
+        if (reexports) {
+            auto it = reexports->chains_by_name.find(rust_sym.name);
+            if (it != reexports->chains_by_name.end()) {
+                for (const auto& chain : it->second) {
+                    if (chain.empty()) continue;
+                    if (chain.front().mod_file == rust_sym.file) continue;
+                    match.reexport_chains.push_back(chain);
+                }
+            }
+        }
         report.matches.push_back(match);
 
         if (best_match) {
@@ -1199,7 +1360,18 @@ void SymbolParityReport::print(bool verbose, bool missing_only) const {
                     std::cout << "  " << m.rust_symbol->name
                               << " (" << visibility_name(m.rust_symbol->visibility)
                               << " in " << m.rust_symbol->file
-                              << ":" << m.rust_symbol->line << ")\n";
+                              << ":" << m.rust_symbol->line << ")";
+                    for (const auto& chain : m.reexport_chains) {
+                        for (const auto& edge : chain) {
+                            std::cout << "\n      via " << edge.mod_file
+                                      << ":" << edge.mod_line
+                                      << "  pub use " << edge.original_path;
+                            if (edge.exported_name != last_component(edge.original_path)) {
+                                std::cout << " as " << edge.exported_name;
+                            }
+                        }
+                    }
+                    std::cout << "\n";
                 }
             }
         } else if (verbose) {
@@ -1350,6 +1522,13 @@ void SymbolParityReport::print_json() const {
     }
     std::cout << "  ],\n";
 
+    // Build a sidecar lookup so we can attach reexport chains to the
+    // missing entries without changing the public missing_in_kotlin shape.
+    std::map<const Symbol*, const SymbolMatch*> match_by_rust;
+    for (const auto& m : matches) {
+        if (!m.kotlin_symbol) match_by_rust[m.rust_symbol] = &m;
+    }
+
     std::cout << "  \"missing\": [\n";
     for (size_t i = 0; i < missing_in_kotlin.size(); ++i) {
         const auto* s = missing_in_kotlin[i];
@@ -1358,7 +1537,29 @@ void SymbolParityReport::print_json() const {
                   << "\", \"visibility\": \"" << visibility_name(s->visibility)
                   << "\", \"is_test\": " << (s->is_test ? "true" : "false")
                   << ", \"file\": \"" << s->file
-                  << "\", \"line\": " << s->line << "}";
+                  << "\", \"line\": " << s->line;
+        auto it = match_by_rust.find(s);
+        if (it != match_by_rust.end() && !it->second->reexport_chains.empty()) {
+            std::cout << ", \"reexport_chains\": [";
+            bool first_chain = true;
+            for (const auto& chain : it->second->reexport_chains) {
+                if (!first_chain) std::cout << ",";
+                first_chain = false;
+                std::cout << "[";
+                for (size_t e = 0; e < chain.size(); ++e) {
+                    const auto& edge = chain[e];
+                    if (e) std::cout << ",";
+                    std::cout << "{\"mod_file\":\"" << edge.mod_file
+                              << "\",\"mod_line\":" << edge.mod_line
+                              << ",\"original_path\":\"" << edge.original_path
+                              << "\",\"exported_name\":\"" << edge.exported_name
+                              << "\"}";
+                }
+                std::cout << "]";
+            }
+            std::cout << "]";
+        }
+        std::cout << "}";
         if (i + 1 < missing_in_kotlin.size()) std::cout << ",";
         std::cout << "\n";
     }
@@ -1477,7 +1678,13 @@ void cmd_symbol_parity(const std::string& rust_root,
         }
     }
 
-    SymbolParityReport report = build_parity_report(*rust_ptr, *kotlin_ptr);
+    std::cerr << "Indexing Rust pub-use reexports...\n";
+    ReexportGraph reexports = extract_rust_reexports(rust_root);
+    std::cerr << "Found " << reexports.chains_by_name.size()
+              << " distinct reexported names\n";
+
+    SymbolParityReport report =
+        build_parity_report(*rust_ptr, *kotlin_ptr, &reexports);
     if (options.json) {
         report.print_json();
     } else {

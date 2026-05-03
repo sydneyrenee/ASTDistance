@@ -119,11 +119,41 @@ struct SymbolTable {
     size_t size() const { return symbols.size(); }
 };
 
+// One edge in a Rust `pub use` chain.
+//
+// When `lib.rs` says `pub use foo::Bar;`, that's an edge with
+// `mod_file = "lib.rs"`, `original_path = "foo::Bar"`, and the chain may
+// continue if `foo/mod.rs` itself reexports `Bar` from a deeper location.
+//
+// Surfacing this in the missing-symbol report tells the porter exactly
+// which Rust file to read and where the Kotlin counterpart should live
+// (per AGENTS.md, callers should wire to the canonical defining package,
+// not the reexport).
+struct ReexportEdge {
+    std::string mod_file;        // the .rs file containing the `pub use`
+    int mod_line = 0;
+    std::string original_path;   // e.g. "foo::Bar" (right-hand side of `use`)
+    std::string exported_name;   // local name after the optional `as Alias`
+};
+
+// Reexport graph for a Rust source tree, indexed by the exported name as
+// it appears in the reexporting module. The same name can appear in many
+// chains (e.g. several `mod.rs` files all re-exporting `Result`); each
+// vector entry is one such chain.
+struct ReexportGraph {
+    std::map<std::string, std::vector<std::vector<ReexportEdge>>> chains_by_name;
+};
+
+ReexportGraph extract_rust_reexports(const std::string& root);
+
 struct SymbolMatch {
     const Symbol* rust_symbol = nullptr;
     const Symbol* kotlin_symbol = nullptr;
     float confidence = 0.0f;
     std::string match_reason;  // "exact", "camelCase", "qualified"
+    // Populated only when this symbol is reachable through one or more
+    // `pub use` chains. Empty for the common case of a directly-defined symbol.
+    std::vector<std::vector<ReexportEdge>> reexport_chains;
 };
 
 struct SymbolParityReport {
@@ -157,8 +187,12 @@ std::string rust_qualified_to_kotlin(const std::string& qualified);
 SymbolTable extract_rust_symbols(const std::string& root);
 SymbolTable extract_kotlin_symbols(const std::string& root);
 
-// Build parity report
-SymbolParityReport build_parity_report(const SymbolTable& rust, const SymbolTable& kotlin);
+// Build parity report. The optional reexport graph is consulted only to
+// annotate missing symbols with their `pub use` chains; passing nullptr or
+// omitting the argument is safe and yields the same numeric coverage.
+SymbolParityReport build_parity_report(const SymbolTable& rust,
+                                       const SymbolTable& kotlin,
+                                       const ReexportGraph* reexports = nullptr);
 
 // CLI command
 void cmd_symbol_parity(const std::string& rust_root,
