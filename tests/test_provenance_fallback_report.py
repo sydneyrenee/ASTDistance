@@ -79,23 +79,23 @@ def main() -> None:
             raise AssertionError(direct.stdout)
         assert_proposal_file(tmp / "port_lint_proposed_changes.md")
 
-        deep = subprocess.run(
-            [
-                str(ast_distance),
-                "--deep",
-                str(rust_root),
-                "rust",
-                str(kotlin_root),
-                "kotlin",
-            ],
-            cwd=tmp,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-        if deep.returncode != 0:
-            raise AssertionError(deep.stdout)
+        # The redirect guard rejects subprocess.PIPE capture (correct under
+        # the universal stdout-must-be-tty rule); use the pty helper so the
+        # child sees a real terminal.
+        try:
+            deep = run_with_pty(
+                [
+                    str(ast_distance),
+                    "--deep",
+                    str(rust_root),
+                    "rust",
+                    str(kotlin_root),
+                    "kotlin",
+                ],
+                cwd=tmp,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise AssertionError(exc.output) from exc
         if "Matched by exact header:" not in deep.stdout:
             raise AssertionError(deep.stdout)
         if "Matched by provenance fallback:" not in deep.stdout:

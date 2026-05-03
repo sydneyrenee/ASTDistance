@@ -175,6 +175,13 @@ if (Python3_Interpreter_FOUND)
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_provenance_fallback_report.py"
             "$<TARGET_FILE:ast_distance>"
     )
+    add_test(
+        NAME universal_redirect_guard
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_universal_redirect_guard.py"
+            "$<TARGET_FILE:ast_distance>"
+    )
 endif()
 
 # Install

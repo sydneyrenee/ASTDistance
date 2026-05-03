@@ -445,7 +445,14 @@ static void print_cheat_detection_failure(
 }
 
 static bool comparison_mode_requires_direct_terminal(const std::string& mode, int argc) {
-    return mode == "--compare-functions" || (mode[0] != '-' && argc >= 5);
+    // The redirect/pipe guard now applies to every CLI invocation, not just
+    // comparison modes. Reading the full stdout of an ast_distance run is the
+    // contract; piping or redirecting the output truncates that view and lets
+    // a caller (a model in particular) miss content that matters. A clean,
+    // unredirected, unpiped CLI invocation is the only sanctioned shape.
+    (void)mode;
+    (void)argc;
+    return true;
 }
 
 static std::string parent_process_command() {
@@ -572,14 +579,32 @@ static int reject_redirected_comparison_output_if_needed(const std::string& mode
     }
 
     std::vector<std::string> reasons;
+
+    // Layer 1: the strict isatty gate. If stdout is not a terminal, the
+    // invocation is going somewhere automated — a pipe, a file redirect,
+    // a `bash -c "...> foo"` inner shell, a command substitution, anything
+    // that swallows the human's eyes-on-target view of the output. Reject
+    // unconditionally before any other check so even the absence of a
+    // recognisable pipeline still terminates here.
+    if (!isatty(STDOUT_FILENO)) {
+        reasons.push_back(
+            "stdout is not a terminal (pipe, file redirect, command "
+            "substitution, or `bash -c` quote-embedded redirect)");
+    }
+
+    // Layer 2: parent-process check for `script` (PTY wrapping that would
+    // otherwise satisfy isatty). The pattern `script -q -c "ast_distance …"`
+    // hands the child a slave PTY, isatty returns true, but the human's
+    // terminal is still being captured. Reject by name match.
     std::string parent = parent_process_command();
     std::string parent_lower = lowercase_for_guard(parent);
     if (parent_lower == "script" || parent_lower.find("/script") != std::string::npos) {
         reasons.push_back("parent process appears to be `script`; PTY wrapping is not allowed");
     }
-    if (reasons.empty() && isatty(STDOUT_FILENO)) {
-        return 0;
-    }
+
+    // Layer 3: visible-filter-pipeline scan. Catches `bash -c "ast_distance
+    // … | grep …"` invocations where stdout is pty-allocated by the wrapping
+    // shell and the filter is on the receiving end. Belt-and-suspenders.
     auto filter_reasons = visible_filter_pipeline_reasons();
     reasons.insert(reasons.end(), filter_reasons.begin(), filter_reasons.end());
 
@@ -588,12 +613,14 @@ static int reject_redirected_comparison_output_if_needed(const std::string& mode
     }
 
     std::cerr << "\n*** REDIRECT GUARD REJECTED ***\n";
-    std::cerr << "Comparison output must be read directly from the tool result.\n";
+    std::cerr << "ast_distance output must be read directly from a clean CLI invocation.\n";
     std::cerr << "Why:\n";
     for (const auto& reason : reasons) {
         std::cerr << "  - " << reason << "\n";
     }
-    std::cerr << "Run the comparison without pipes, redirects, grep, tee, or script wrapping.\n";
+    std::cerr << "Allowed: ast_distance <args> from an interactive terminal.\n";
+    std::cerr << "Not allowed: > file, | filter, $(...) capture, bash -c \"... > foo\",\n";
+    std::cerr << "             tee, script -c, expect, or any other output capture.\n";
     return 2;
 }
 
