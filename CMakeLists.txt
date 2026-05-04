@@ -162,10 +162,24 @@ if (Python3_Interpreter_FOUND)
             "$<TARGET_FILE:ast_distance>"
     )
     add_test(
+        NAME cli_filter_guard
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cli_filter_guard.py"
+            "$<TARGET_FILE:ast_distance>"
+    )
+    add_test(
         NAME provenance_fallback_report
         COMMAND
             "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_provenance_fallback_report.py"
+            "$<TARGET_FILE:ast_distance>"
+    )
+    add_test(
+        NAME universal_redirect_guard
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_universal_redirect_guard.py"
             "$<TARGET_FILE:ast_distance>"
     )
 endif()
