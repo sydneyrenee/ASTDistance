@@ -445,13 +445,13 @@ static void print_cheat_detection_failure(
 }
 
 static bool comparison_mode_requires_direct_terminal(const std::string& mode, int argc) {
-    // The redirect/pipe pattern check fires only for comparison modes
-    // (file-vs-file or --compare-functions). Audit modes (--symbol-parity,
-    // --deep, --scan, --import-map, --stats, --todos, --lint, --deps) are
-    // not gated — their output is aggregate enough that a harness piping
-    // them for review is a legitimate workflow, not the truncate-and-miss
-    // pattern the guard is meant to catch.
-    return mode == "--compare-functions" || (mode[0] != '-' && argc >= 5);
+    // Universal. Pipes, redirects, head/grep/awk/etc. — anything other
+    // than the binary's own legal arguments — are banned across every
+    // invocation, regardless of mode. Pattern detection in the layers
+    // below decides whether to actually reject.
+    (void)mode;
+    (void)argc;
+    return true;
 }
 
 static std::string parent_process_command() {
