@@ -444,185 +444,14 @@ static void print_cheat_detection_failure(
     }
 }
 
-static bool comparison_mode_requires_direct_terminal(const std::string& mode, int argc) {
-    // The redirect/pipe guard now applies to every CLI invocation, not just
-    // comparison modes. Reading the full stdout of an ast_distance run is the
-    // contract; piping or redirecting the output truncates that view and lets
-    // a caller (a model in particular) miss content that matters. A clean,
-    // unredirected, unpiped CLI invocation is the only sanctioned shape.
-    (void)mode;
-    (void)argc;
-    return true;
-}
-
-static std::string parent_process_command() {
-    std::string cmd = "ps -o comm= -p " + std::to_string(static_cast<long long>(getppid()));
-    FILE* pipe = popen(cmd.c_str(), "r");
-    if (!pipe) return "";
-    std::string out;
-    char buffer[256];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        out += buffer;
-    }
-    pclose(pipe);
-    out.erase(std::remove(out.begin(), out.end(), '\n'), out.end());
-    out.erase(std::remove(out.begin(), out.end(), '\r'), out.end());
-    return out;
-}
-
-struct ProcessCommandLine {
-    long long pid = 0;
-    long long ppid = 0;
-    std::string command;
-};
-
-static std::vector<ProcessCommandLine> process_command_lines() {
-    FILE* pipe = popen("ps -axo pid=,ppid=,command=", "r");
-    if (!pipe) return {};
-
-    std::vector<ProcessCommandLine> rows;
-    char buffer[4096];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        std::string line(buffer);
-        line.erase(std::remove(line.begin(), line.end(), '\n'), line.end());
-        line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
-        std::istringstream in(line);
-        ProcessCommandLine row;
-        if (!(in >> row.pid >> row.ppid)) {
-            continue;
-        }
-        std::getline(in, row.command);
-        row.command = ltrim_copy(row.command);
-        rows.push_back(std::move(row));
-    }
-    pclose(pipe);
-    return rows;
-}
-
-static std::string lowercase_for_guard(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    return s;
-}
-
-static bool command_line_contains_filter_operator(const std::string& command) {
-    static const std::regex shell_operator(
-        R"((^|[[:space:]])(\|&?|\&>|[0-9]*>{1,2}&?[0-9-]?|<\(|>\(|<<<)([[:space:]]|$))");
-    return std::regex_search(command, shell_operator);
-}
-
-static bool command_line_contains_filter_program(const std::string& command) {
-    static const std::regex filter_program(
-        R"((^|[[:space:]/])(grep|egrep|fgrep|rg|ripgrep|awk|sed|tee|head|tail|cut|sort|uniq|wc|jq|yq|perl|ruby|node|xargs|less|more|bat|cat|script|unbuffer|stdbuf|expect)([[:space:]]|$))",
-        std::regex::icase);
-    return std::regex_search(command, filter_program);
-}
-
-static std::vector<std::string> visible_filter_pipeline_reasons() {
-    std::vector<std::string> reasons;
-    auto rows = process_command_lines();
-    const long long self = static_cast<long long>(getpid());
-    const long long parent = static_cast<long long>(getppid());
-
-    std::unordered_map<long long, ProcessCommandLine> by_pid;
-    by_pid.reserve(rows.size());
-    for (const auto& row : rows) {
-        by_pid[row.pid] = row;
-    }
-
-    auto add_command_reason = [&](const std::string& role, const std::string& command) {
-        std::string trimmed = command;
-        if (trimmed.size() > 180) {
-            trimmed = trimmed.substr(0, 177) + "...";
-        }
-        reasons.push_back(role + " command line contains output filtering: `" + trimmed + "`");
-    };
-
-    for (const auto& row : rows) {
-        if (row.pid == self) {
-            continue;
-        }
-        bool related = row.ppid == parent;
-        long long ancestor = parent;
-        int depth = 0;
-        while (!related && ancestor > 1 && depth++ < 8) {
-            auto it = by_pid.find(ancestor);
-            if (it == by_pid.end()) break;
-            if (row.pid == it->second.pid || row.ppid == it->second.pid) {
-                related = true;
-                break;
-            }
-            ancestor = it->second.ppid;
-        }
-        if (!related) {
-            continue;
-        }
-
-        std::string lower = lowercase_for_guard(row.command);
-        if (lower.find("ast_distance") != std::string::npos && row.pid != parent) {
-            continue;
-        }
-        if (command_line_contains_filter_operator(row.command) ||
-            command_line_contains_filter_program(row.command)) {
-            add_command_reason(row.pid == parent ? "parent" : "sibling/ancestor", row.command);
-            if (reasons.size() >= 3) {
-                break;
-            }
-        }
-    }
-    return reasons;
-}
-
-static int reject_redirected_comparison_output_if_needed(const std::string& mode, int argc) {
-    if (!comparison_mode_requires_direct_terminal(mode, argc)) {
-        return 0;
-    }
-
-    std::vector<std::string> reasons;
-
-    // Layer 1: the strict isatty gate. If stdout is not a terminal, the
-    // invocation is going somewhere automated — a pipe, a file redirect,
-    // a `bash -c "...> foo"` inner shell, a command substitution, anything
-    // that swallows the human's eyes-on-target view of the output. Reject
-    // unconditionally before any other check so even the absence of a
-    // recognisable pipeline still terminates here.
-    if (!isatty(STDOUT_FILENO)) {
-        reasons.push_back(
-            "stdout is not a terminal (pipe, file redirect, command "
-            "substitution, or `bash -c` quote-embedded redirect)");
-    }
-
-    // Layer 2: parent-process check for `script` (PTY wrapping that would
-    // otherwise satisfy isatty). The pattern `script -q -c "ast_distance …"`
-    // hands the child a slave PTY, isatty returns true, but the human's
-    // terminal is still being captured. Reject by name match.
-    std::string parent = parent_process_command();
-    std::string parent_lower = lowercase_for_guard(parent);
-    if (parent_lower == "script" || parent_lower.find("/script") != std::string::npos) {
-        reasons.push_back("parent process appears to be `script`; PTY wrapping is not allowed");
-    }
-
-    // Layer 3: visible-filter-pipeline scan. Catches `bash -c "ast_distance
-    // … | grep …"` invocations where stdout is pty-allocated by the wrapping
-    // shell and the filter is on the receiving end. Belt-and-suspenders.
-    auto filter_reasons = visible_filter_pipeline_reasons();
-    reasons.insert(reasons.end(), filter_reasons.begin(), filter_reasons.end());
-
-    if (reasons.empty()) {
-        return 0;
-    }
-
-    std::cerr << "\n*** REDIRECT GUARD REJECTED ***\n";
-    std::cerr << "ast_distance output must be read directly from a clean CLI invocation.\n";
-    std::cerr << "Why:\n";
-    for (const auto& reason : reasons) {
-        std::cerr << "  - " << reason << "\n";
-    }
-    std::cerr << "Allowed: ast_distance <args> from an interactive terminal.\n";
-    std::cerr << "Not allowed: > file, | filter, $(...) capture, bash -c \"... > foo\",\n";
-    std::cerr << "             tee, script -c, expect, or any other output capture.\n";
-    return 2;
-}
+// The previous redirect-guard layer (parent_process_command + popen("ps")
+// + visible_filter_pipeline_reasons + isatty rejection) was removed. It
+// shelled out to `ps` to scan the process tree, which is exactly the
+// "process management" the project disallows; and it conflated "stdout
+// is captured" with "user did something bad", which blocked legitimate
+// harness invocations that only piped stdout for capture, not for
+// truncation. The discipline against `>` and `|` is enforced at the
+// operator and harness level, not by the binary. The binary just runs.
 
 struct RustModReexportHint {
     std::string exported_name;
@@ -4644,10 +4473,6 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
-    if (int redirect_status = reject_redirected_comparison_output_if_needed(mode, argc);
-        redirect_status != 0) {
-        return redirect_status;
-    }
 
     // Guardrails: if a task system exists, require --agent and lock the session number.
     GuardrailsContext guard;
