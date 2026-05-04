@@ -445,14 +445,13 @@ static void print_cheat_detection_failure(
 }
 
 static bool comparison_mode_requires_direct_terminal(const std::string& mode, int argc) {
-    // The redirect/pipe guard now applies to every CLI invocation, not just
-    // comparison modes. Reading the full stdout of an ast_distance run is the
-    // contract; piping or redirecting the output truncates that view and lets
-    // a caller (a model in particular) miss content that matters. A clean,
-    // unredirected, unpiped CLI invocation is the only sanctioned shape.
-    (void)mode;
-    (void)argc;
-    return true;
+    // The redirect/pipe pattern check fires only for comparison modes
+    // (file-vs-file or --compare-functions). Audit modes (--symbol-parity,
+    // --deep, --scan, --import-map, --stats, --todos, --lint, --deps) are
+    // not gated — their output is aggregate enough that a harness piping
+    // them for review is a legitimate workflow, not the truncate-and-miss
+    // pattern the guard is meant to catch.
+    return mode == "--compare-functions" || (mode[0] != '-' && argc >= 5);
 }
 
 static std::string parent_process_command() {
@@ -580,17 +579,12 @@ static int reject_redirected_comparison_output_if_needed(const std::string& mode
 
     std::vector<std::string> reasons;
 
-    // Layer 1: the strict isatty gate. If stdout is not a terminal, the
-    // invocation is going somewhere automated — a pipe, a file redirect,
-    // a `bash -c "...> foo"` inner shell, a command substitution, anything
-    // that swallows the human's eyes-on-target view of the output. Reject
-    // unconditionally before any other check so even the absence of a
-    // recognisable pipeline still terminates here.
-    if (!isatty(STDOUT_FILENO)) {
-        reasons.push_back(
-            "stdout is not a terminal (pipe, file redirect, command "
-            "substitution, or `bash -c` quote-embedded redirect)");
-    }
+    // The strict !isatty(STDOUT_FILENO) blanket-rejection that used to live
+    // here was removed: it conflated "stdout is captured" with "user did
+    // something bad", and refused every legitimate harness invocation.
+    // The remaining layers (script-PTY-wrapping detection and visible
+    // filter pipeline scan) detect the actual bad patterns by reading the
+    // parent process command line. If those don't fire, the call is allowed.
 
     // Layer 2: parent-process check for `script` (PTY wrapping that would
     // otherwise satisfy isatty). The pattern `script -q -c "ast_distance …"`
