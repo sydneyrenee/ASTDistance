@@ -34,14 +34,6 @@
 
 using namespace ast_distance;
 
-struct GuardrailsContext {
-    bool active = false;
-    std::string task_file;
-    int agent = 0;
-    bool override_mode = false;
-};
-
-static GuardrailsContext g_guardrails;
 static ReexportConfig g_reexport_config;
 
 static std::optional<std::chrono::seconds> file_age_seconds(const std::string& path) {
@@ -318,18 +310,6 @@ static std::string expected_target_qualified_name_for_source(const SourceFile& s
     std::string qualified = expected.generic_string();
     std::replace(qualified.begin(), qualified.end(), '/', '.');
     return qualified;
-}
-
-static void write_missing_config_after_comparison(const ConfigEndpoint& source,
-                                                  const ConfigEndpoint& target) {
-    const std::string path = default_reexport_config_path();
-    if (g_reexport_config.loaded || std::filesystem::exists(path)) return;
-    if (write_ast_distance_config_stub(path, current_project_name(), source, target)) {
-        std::cerr << "Info: wrote " << path
-                  << " from this comparison; add reexport_modules entries there as needed.\n";
-    } else {
-        std::cerr << "Warning: could not write " << path << ".\n";
-    }
 }
 
 static std::string lowercase_ascii(std::string s) {
@@ -893,13 +873,13 @@ static void warn_kotlin_suspicious_constructs(
 void print_usage(const char* program) {
     std::cerr << "AST Distance - Cross-language AST comparison and porting analysis\n\n";
     std::cerr << "Usage:\n";
-    std::cerr << "      Loads .ast_distance_config.json when present; comparison commands create a stub when absent.\n\n";
+    std::cerr << "      Loads .ast_distance_config.json when present.\n";
+    std::cerr << "      Reporting is always full-detail (file-by-file + function-by-function).\n";
+    std::cerr << "      Summary/override/dump shortcuts are disabled.\n\n";
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare strict function-name parity and per-function cosine/line similarity\n\n";
-    std::cerr << "  " << program << " --dump <file> <rust|kotlin|cpp|python|typescript>\n";
-    std::cerr << "      Dump AST structure of a file\n\n";
     std::cerr << "  " << program << " --scan <directory> <rust|kotlin|cpp|python|typescript>\n";
     std::cerr << "      Scan directory and show file list with import counts\n\n";
     std::cerr << "  " << program << " --deps <directory> <rust|kotlin|cpp|python|typescript>\n";
@@ -933,29 +913,12 @@ void print_usage(const char* program) {
     std::cerr << "      Filter to specific source file\n\n";
         std::cerr << "  " << program << " --import-map <kotlin_root>\n";
     std::cerr << "      Build type registry and show missing imports per file\n\n";
-    std::cerr << "  " << program << " --import-map <kotlin_root> --summary\n";
-    std::cerr << "      Show only per-file unresolved counts\n\n";
     std::cerr << "  " << program << " --import-map <kotlin_root> --file <path>\n";
     std::cerr << "      Show imports for a specific file\n\n";
         std::cerr << "Compiler Error Analysis:\n";
     std::cerr << "  " << program << " --compiler-fixup <kotlin_root> <error_file>\n";
     std::cerr << "      Parse compiler errors and suggest import fixes\n\n";
         }
-
-void dump_tree(Tree* node, int indent = 0) {
-    std::string pad(indent * 2, ' ');
-    const char* type_name = node_type_name(static_cast<NodeType>(node->node_type));
-
-    std::cout << pad << type_name << " (" << node->label << ")";
-    if (node->is_leaf()) {
-        std::cout << " [leaf]";
-    }
-    std::cout << "\n";
-
-    for (auto& child : node->children) {
-        dump_tree(child.get(), indent + 1);
-    }
-}
 
 void print_histogram(const std::vector<int>& hist) {
     std::cout << "Node Type Histogram:\n";
@@ -3269,7 +3232,6 @@ int main(int argc, char* argv[]) {
 
         } else if (mode == "--deep" && argc >= 6) {
             cmd_deep(argv[2], argv[3], argv[4], argv[5]);
-            write_missing_config_after_comparison({argv[2], argv[3]}, {argv[4], argv[5]});
 
         } else if (mode == "--numpy-mlx" && argc >= 4) {
             cmd_numpy_mlx(argv[2], argv[3]);
@@ -3283,11 +3245,11 @@ int main(int argc, char* argv[]) {
             return 2;
 
         } else if (mode == "--todos" && argc >= 3) {
-            bool verbose = true;
             if (argc >= 4 && std::string(argv[3]) == "--summary") {
-                verbose = false;
+                std::cerr << "Error: --summary is disabled. Use full detailed output.\n";
+                return 2;
             }
-            cmd_todos(argv[2], verbose);
+            cmd_todos(argv[2], true);
 
         } else if (mode == "--lint" && argc >= 3) {
             cmd_lint(argv[2]);
@@ -3336,9 +3298,11 @@ int main(int argc, char* argv[]) {
             for (int i = arg_start; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--missing-only" || arg == "--missing") {
-                    options.missing_only = true;
+                    std::cerr << "Error: --missing-only is disabled. Full parity output is required.\n";
+                    return 2;
                 } else if (arg == "--include-stubs") {
-                    options.include_stubs = true;
+                    std::cerr << "Error: --include-stubs is disabled. Full parity output is required.\n";
+                    return 2;
                 } else if (arg == "--kind" && i + 1 < argc) {
                     options.filter_kind = argv[++i];
                 } else if (arg == "--file" && i + 1 < argc) {
@@ -3346,16 +3310,14 @@ int main(int argc, char* argv[]) {
                 }
             }
             cmd_symbol_parity(src_root, tgt_root, options);
-            write_missing_config_after_comparison(
-                {src_root, language_config_name(options.source_lang)},
-                {tgt_root, language_config_name(options.target_lang)});
 
         } else if (mode == "--import-map" && argc >= 3) {
             ImportMapOptions options;
             for (int i = 3; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--summary") {
-                    options.summary_only = true;
+                    std::cerr << "Error: --summary is disabled. Use full detailed output.\n";
+                    return 2;
                 } else if (arg == "--file" && i + 1 < argc) {
                     options.filter_file = argv[++i];
                 } else if (arg == "--min" && i + 1 < argc) {
@@ -3376,39 +3338,9 @@ int main(int argc, char* argv[]) {
             }
             cmd_compiler_fixup(argv[2], argv[3], options);
 
-        } else if (mode == "--dump-node" && argc >= 4) {
-            ASTParser parser;
-            std::string filepath = argv[2];
-            Language lang = parse_language(argv[3]);
-            TreePtr tree = parser.parse_file(filepath, lang);
-            if (tree) {
-                dump_tree(tree.get(), 0);
-            }
-            return 0;
-
-        } else if (mode == "--dump" && argc >= 4) {
-            ASTParser parser;
-            std::string filepath = argv[2];
-            std::string lang_str = argv[3];
-            Language lang;
-            if (lang_str == "rust") lang = Language::RUST;
-            else if (lang_str == "cpp") lang = Language::CPP;
-            else if (lang_str == "python") lang = Language::PYTHON;
-            else lang = Language::KOTLIN;
-
-            std::cout << "Parsing " << filepath << " as " << lang_str << "...\n\n";
-            TreePtr tree = parser.parse_file(filepath, lang);
-
-            std::cout << "AST Structure:\n";
-            dump_tree(tree.get());
-
-            std::cout << "\n";
-            auto hist = tree->node_type_histogram(ASTSimilarity::NUM_NODE_TYPES);
-            print_histogram(hist);
-
-            std::cout << "\nTree Statistics:\n";
-            std::cout << "  Size:  " << tree->size() << " nodes\n";
-            std::cout << "  Depth: " << tree->depth() << "\n";
+        } else if (mode == "--dump-node" || mode == "--dump") {
+            std::cerr << "Error: --dump and --dump-node are disabled. Use markdown report generation only.\n";
+            return 2;
 
         } else if (mode == "--compare-functions" && argc >= 6) {
             ASTParser parser;
@@ -3821,9 +3753,6 @@ int main(int argc, char* argv[]) {
             // every Kotlin function" is not a faithfulness check and is not
             // emitted: this is a gap tester, not a cross-similarity explorer.
 
-            write_missing_config_after_comparison(
-                {file1, language_config_name(lang1)},
-                {file2, language_config_name(lang2)});
 
         } else if (mode[0] != '-' && argc >= 5) {
             // Default: compare two files with explicit languages
@@ -4092,9 +4021,6 @@ int main(int argc, char* argv[]) {
                     repo_relative_display_path(file2));
                 std::cout << "\nGenerated: port_lint_proposed_changes.md\n";
             }
-            write_missing_config_after_comparison(
-                {file1, language_config_name(lang1)},
-                {file2, language_config_name(lang2)});
 
         } else {
             print_usage(argv[0]);
