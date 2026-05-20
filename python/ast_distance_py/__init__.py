@@ -11,7 +11,6 @@ Modules:
     similarity: AST similarity metrics
     codebase: Codebase management and comparison
     porting_utils: TODO scanning, lint checks, stub detection
-    task_manager: Task management for swarm agents
 """
 
 from .node_types import (
@@ -59,12 +58,6 @@ from .porting_utils import (
     FileStats,
     PortingAnalyzer,
 )
-from .task_manager import (
-    TaskStatus,
-    FileLock,
-    PortTask,
-    TaskManager,
-)
 
 __all__ = [
     "NodeType",
@@ -100,8 +93,4 @@ __all__ = [
     "LintError",
     "FileStats",
     "PortingAnalyzer",
-    "TaskStatus",
-    "FileLock",
-    "PortTask",
-    "TaskManager",
 ]

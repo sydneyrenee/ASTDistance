@@ -93,15 +93,6 @@ def _target_path_from_source(rel_path: str, src_lang: str, tgt_lang: str) -> str
 # ── Guardrails (Swarm Mode) ────────────────────────────────────────────────
 
 @dataclass
-class _GuardrailsContext:
-    active: bool = False
-    task_file: str = ""
-    agent: int = 0
-    override_mode: bool = False
-
-
-_GUARD = _GuardrailsContext()
-
 
 def _refuse_piped_stdio() -> None:
     """Refuse to run when stdout or stderr is piped via a shell pipeline.
@@ -638,154 +629,6 @@ def cmd_deep(src_dir: str, src_lang: str, tgt_dir: str, tgt_lang: str) -> dict:
 
     print("Computing AST similarities...")
     comp.compute_similarities()
-
-    # Agent-scoped dashboard (guardrails): when a task system is initialized, lock the
-    # dashboard view to the assigned file and its direct imports.
-    if _GUARD.active and _GUARD.agent > 0 and not _GUARD.override_mode:
-        tm = TaskManager(_GUARD.task_file)
-        if tm.load():
-            _print_agent_activity_section(tm, _GUARD.task_file, _GUARD.agent)
-
-            agent_id = str(_GUARD.agent)
-            focus = next(
-                (t for t in tm.tasks if t.status == TaskStatus.ASSIGNED and t.assigned_to == agent_id),
-                None,
-            )
-
-            print("\n=== Agent Scope Dashboard ===\n")
-            print(f"Task file: {_GUARD.task_file}")
-            print(f"You are agent #{_GUARD.agent}\n")
-
-            if focus is None:
-                print(f"No task assigned to agent #{_GUARD.agent}.")
-                print(f"Run: ast_distance --assign {_GUARD.task_file} {_GUARD.agent}\n")
-                print("Note: full project dashboard is locked in agent scope.")
-                print("Use --override if you need full-project output.")
-                return {"error": "no_task_assigned", "agent": _GUARD.agent, "task_file": _GUARD.task_file}
-
-            # Build relative_path -> logical key maps for locating the focus file.
-            src_rel_to_key = {sf.relative_path: key for key, sf in source.files.items()}
-            tgt_rel_to_key = {sf.relative_path: key for key, sf in target.files.items()}
-
-            focus_src_key = src_rel_to_key.get(focus.source_path, "")
-            focus_tgt_key = tgt_rel_to_key.get(focus.target_path, "")
-
-            focus_source_path = Path(tm.source_root) / focus.source_path
-            focus_target_path = Path(tm.target_root) / focus.target_path
-
-            print(f"Assigned task: {focus.source_qualified}")
-            print(f"Source: {focus_source_path}{' (missing?)' if not focus_source_path.exists() else ''}")
-            print(f"Target: {focus_target_path} ({'exists' if focus_target_path.exists() else 'missing'})\n")
-
-            scope_source_keys: set[str] = set()
-            scope_target_keys: set[str] = set()
-            if focus_src_key:
-                scope_source_keys.add(focus_src_key)
-                scope_source_keys |= set(source.files[focus_src_key].depends_on)
-            if focus_tgt_key:
-                scope_target_keys.add(focus_tgt_key)
-                scope_target_keys |= set(target.files[focus_tgt_key].depends_on)
-
-            print(
-                f"Scope: {len(scope_source_keys)} source files (focus + imports), "
-                f"{len(scope_target_keys)} target files (focus + imports)"
-            )
-
-            assigned_to_agent: dict[str, int] = {}
-            for t in tm.tasks:
-                if t.status != TaskStatus.ASSIGNED:
-                    continue
-                try:
-                    assigned_to_agent[t.source_qualified] = int(t.assigned_to)
-                except Exception:
-                    continue
-
-            blocked_by: dict[str, int] = {}
-            for key in scope_source_keys:
-                if key == focus_src_key:
-                    continue
-                sf = source.files[key]
-                other = assigned_to_agent.get(sf.qualified_name)
-                if other is not None and other != _GUARD.agent:
-                    blocked_by[key] = other
-
-            if blocked_by:
-                print("\nBlocked imports (assigned to other agents):")
-                for key, other in sorted(blocked_by.items(), key=lambda kv: kv[1]):
-                    print(f"  - {source.files[key].qualified_name} (agent #{other})")
-
-            match_by_source = {m.source_path: m for m in comp.matches}
-            unmatched_source = set(comp.unmatched_source)
-
-            def _print_row(key: str, is_focus: bool) -> None:
-                sf = source.files[key]
-                m = match_by_source.get(key)
-                missing = key in unmatched_source
-
-                status: list[str] = []
-                if is_focus:
-                    status.append("FOCUS")
-                if missing:
-                    status.append("MISSING_FILE")
-                if m is not None and m.is_stub:
-                    status.append("STUB(FAIL)")
-                if m is not None and m.todo_count > 0:
-                    status.append("TODO(FAIL)")
-                if key in blocked_by:
-                    status.append(f"BLOCKED(agent #{blocked_by[key]})")
-
-                sim = "-" if (m is None or missing) else f"{m.similarity:.2f}"
-                todos = 0 if m is None else m.todo_count
-                lint = 0 if m is None else m.lint_count
-
-                print(
-                    f"{sf.qualified_name[:28]:<30}"
-                    f"{sf.dependent_count:<11}"
-                    f"{sim:<11}"
-                    f"{todos:<8}"
-                    f"{lint:<6}"
-                    f"{','.join(status)}"
-                )
-
-            print("\n=== Scope Work Items ===\n")
-            print(f"{'File':<30}{'Dependents':<11}{'Similarity':<11}{'TODOs':<8}{'Lint':<6}Status")
-            print("-" * 90)
-
-            if focus_src_key:
-                _print_row(focus_src_key, True)
-            else:
-                print(
-                    f"{focus.source_qualified[:28]:<30}"
-                    f"{focus.dependent_count:<11}"
-                    f"{'-':<11}"
-                    f"{0:<8}"
-                    f"{0:<6}"
-                    f"FOCUS,UNKNOWN_SOURCE_PATH"
-                )
-
-            others = [k for k in scope_source_keys if k and k != focus_src_key]
-            others.sort(key=lambda k: source.files[k].dependent_count, reverse=True)
-            for k in others:
-                _print_row(k, False)
-
-            print("\n=== Next Action (Focus) ===\n")
-            focus_match = match_by_source.get(focus_src_key) if focus_src_key else None
-            if focus_match is None or focus_src_key in unmatched_source:
-                print("Target file is missing. Create it and port the full implementation.")
-            elif focus_match.is_stub:
-                print("Replace the stub with a real implementation (stubs are a failure mode).")
-            elif focus_match.todo_count > 0:
-                print("Remove TODOs and finish the implementation (TODOs are a failure mode).")
-            elif focus_match.similarity < 0.85:
-                print("Improve similarity to >= 0.85 (whole-file + identifier-content + parity).")
-            else:
-                print("Looks complete. If you have validated behavior and tests, mark it complete.")
-
-            print("\nMark complete with:")
-            print(f"  ast_distance --agent {_GUARD.agent} --complete {_GUARD.task_file} {focus.source_qualified}")
-            print("\nNote: full project dashboard is locked in agent scope.")
-            print("Use --override to view the full project view.")
-            return {"mode": "agent_scope", "agent": _GUARD.agent, "focus": focus.source_qualified}
 
     print(comp.format_report())
 
@@ -1558,8 +1401,8 @@ Symbol Analysis:
   {prog} --symbols-stubs <kotlin_root> <cpp_root>
       Show stub files/classes
 
-  {prog} --symbols-symbol <kotlin_root> <cpp_root> <symbol> [--json]
-      Analyze a specific symbol (optionally output JSON)
+  {prog} --symbols-symbol <kotlin_root> <cpp_root> <symbol> 
+      Analyze a specific symbol 
 
   {prog} --symbol-parity <rust_root> <kotlin_root> [options]
       Rust->Kotlin symbol parity analysis
