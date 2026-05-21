@@ -581,7 +581,8 @@ public:
                lower.find("not implemented") != std::string::npos ||
                // Common stub constructs without spaces (Rust `unimplemented!`, Kotlin/Python `NotImplementedError`)
                has_word("unimplemented") ||
-               has_word("notimplemented");
+               has_word("notimplemented") ||
+               has_word("notimplementederror");
     }
 
     static bool comment_has_stub_markers(const std::string& text) {
@@ -1888,21 +1889,47 @@ public:
                         }
                     }
                 }
-            } else if (lang == Language::KOTLIN || lang == Language::TYPESCRIPT) {
+            } else if (lang == Language::KOTLIN || lang == Language::TYPESCRIPT || lang == Language::PYTHON) {
                 if (current_type == "simple_identifier" ||
                     current_type == "type_identifier" ||
-                    current_type == "identifier") {
+                    current_type == "identifier" ||
+                    current_type == "field_identifier" ||
+                    current_type == "property_identifier") {
                     uint32_t start = ts_node_start_byte(current);
                     uint32_t end = ts_node_end_byte(current);
                     if (end > start && end <= source.length()) {
                         std::string text = source.substr(start, end - start);
-                        if (text == "TODO" || text == "NotImplementedError" ||
+                        if (text_has_stub_markers(text) ||
                             (lang == Language::TYPESCRIPT && text == "undefined")) {
                             return true;
                         }
                     }
                 }
+            }
 
+            // Check string literals for Kotlin, TS, Python, and Rust
+            if (lang == Language::KOTLIN || lang == Language::TYPESCRIPT ||
+                lang == Language::PYTHON || lang == Language::RUST) {
+                if (current_type == "string_literal" ||
+                    current_type == "line_string_literal" ||
+                    current_type == "multi_line_string_literal" ||
+                    current_type == "string_content" ||
+                    current_type == "string" ||
+                    current_type == "template_string" ||
+                    current_type == "raw_string_literal" ||
+                    current_type == "string_fragment") {
+                    uint32_t start = ts_node_start_byte(current);
+                    uint32_t end = ts_node_end_byte(current);
+                    if (end > start && end <= source.length()) {
+                        std::string text = source.substr(start, end - start);
+                        if (text_has_stub_markers(text)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            if (lang == Language::KOTLIN || lang == Language::TYPESCRIPT) {
                 // TypeScript: throw new Error("unimplemented")
                 if (lang == Language::TYPESCRIPT && current_type == "throw_statement") {
                     uint32_t start = ts_node_start_byte(current);

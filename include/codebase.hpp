@@ -1055,12 +1055,15 @@ public:
         {
             static const std::regex port_lint_header_re(
                 R"(^\s*port-lint:\s*(?:source|tests)\s+\S+\s*$)");
+            static const std::regex trans_header_re(
+                R"(^\s*Transliterated\s+from:\s+\S+\s*$)", std::regex_constants::icase);
             std::istringstream in(comments);
             std::ostringstream out;
             std::string line;
             bool first = true;
             while (std::getline(in, line)) {
-                if (std::regex_match(line, port_lint_header_re)) {
+                if (std::regex_match(line, port_lint_header_re) ||
+                    std::regex_match(line, trans_header_re)) {
                     continue;
                 }
                 if (!first) out << "\n";

@@ -8,6 +8,7 @@
 #include "symbol_extraction.hpp"
 #include "symbol_extractor.hpp"
 #include "reexport_config.hpp"
+#include "ast_config.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -35,6 +36,7 @@
 using namespace ast_distance;
 
 static ReexportConfig g_reexport_config;
+static AstConfig g_ast_config;
 
 static std::optional<std::chrono::seconds> file_age_seconds(const std::string& path) {
     try {
@@ -212,8 +214,9 @@ static std::string lowercase_ascii(std::string s);
 static std::string repo_relative_display_path(const std::string& raw_path) {
     std::error_code ec;
     std::filesystem::path input(raw_path);
+    std::filesystem::path cwd = std::filesystem::current_path(ec);
     std::filesystem::path absolute =
-        input.is_absolute() ? input : (std::filesystem::current_path(ec) / input);
+        input.is_absolute() ? input : (cwd / input);
     absolute = absolute.lexically_normal();
 
     if (auto repo_root = find_repo_root(absolute)) {
@@ -226,7 +229,17 @@ static std::string repo_relative_display_path(const std::string& raw_path) {
     if (input.is_relative()) {
         return input.lexically_normal().generic_string();
     }
-    return absolute.generic_string();
+
+    // Last resort: never reveal fully-qualified absolute paths in reports.
+    // Express the path relative to CWD so output stays portable across
+    // checkouts and avoids leaking $HOME / user directories.
+    if (!cwd.empty()) {
+        auto rel = std::filesystem::relative(absolute, cwd, ec);
+        if (!ec && !rel.empty()) {
+            return rel.generic_string();
+        }
+    }
+    return absolute.filename().generic_string();
 }
 
 static std::string kotlin_namespace_segment_from_source(const std::string& segment) {
@@ -874,8 +887,7 @@ void print_usage(const char* program) {
     std::cerr << "AST Distance - Cross-language AST comparison and porting analysis\n\n";
     std::cerr << "Usage:\n";
     std::cerr << "      Loads .ast_distance_config.json when present.\n";
-    std::cerr << "      Reporting is always full-detail (file-by-file + function-by-function).\n";
-    std::cerr << "      Summary/override/dump shortcuts are disabled.\n\n";
+    std::cerr << "      Reporting is always full-detail (file-by-file + function-by-function).\n\n";
     std::cerr << "  " << program << " <file1> <lang1> <file2> <lang2>\n";
     std::cerr << "      Compare AST similarity between two files\n\n";
     std::cerr << "  " << program << " --compare-functions <file1> <lang1> <file2> <lang2>\n";
@@ -2607,16 +2619,18 @@ void generate_reports(const Codebase& source, const Codebase& target,
         report << "- Documentation ported\n";
         report << "- port-lint header present\n\n";
         
-        report << "## Next Commands\n\n";
-        report << "```bash\n";
-        report << "# Initialize task queue for systematic porting\n";
-        report << "cd tools/ast_distance\n";
-        report << "./ast_distance --init-tasks ../../" << source_display_path
-               << " " << source.language << " ../../" << target_display_path
-               << " " << target.language << " tasks.json ../../AGENTS.md\n\n";
-        report << "# Get next high-priority task\n";
-        report << "./ast_distance --assign tasks.json <agent-id>\n";
-        report << "```\n";
+        if (g_ast_config.agent_swarm) {
+            report << "## Next Commands\n\n";
+            report << "```bash\n";
+            report << "# Initialize task queue for systematic porting\n";
+            report << "cd tools/ast_distance\n";
+            report << "./ast_distance --init-tasks ../../" << source_display_path
+                   << " " << source.language << " ../../" << target_display_path
+                   << " " << target.language << " tasks.json ../../AGENTS.md\n\n";
+            report << "# Get next high-priority task\n";
+            report << "./ast_distance --assign tasks.json <agent-id>\n";
+            report << "```\n";
+        }
 
         write_reexport_section(report);
         
@@ -3186,6 +3200,8 @@ int main(int argc, char* argv[]) {
         rest.push_back(arg);
     }
 
+    g_ast_config = load_ast_config();
+
     {
         std::string cfg_path = default_reexport_config_path();
         if (load_reexport_config(cfg_path, g_reexport_config)) {
@@ -3213,9 +3229,11 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
-    if (int redirect_status = reject_redirected_comparison_output_if_needed(mode, argc);
-        redirect_status != 0) {
-        return redirect_status;
+    if (g_ast_config.redirect_guard) {
+        if (int redirect_status = reject_redirected_comparison_output_if_needed(mode, argc);
+            redirect_status != 0) {
+            return redirect_status;
+        }
     }
 
     try {
@@ -3226,9 +3244,13 @@ int main(int argc, char* argv[]) {
             cmd_deps(argv[2], argv[3]);
 
         } else if (mode == "--rank") {
-            std::cerr << "Error: --rank has been removed because it hides parts of the full report.\n"
-                      << "Use --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang> instead.\n";
-            return 2;
+            if (g_ast_config.unlock_parameters && argc >= 6) {
+                cmd_rank(argv[2], argv[3], argv[4], argv[5]);
+            } else {
+                std::cerr << "Error: --rank is disabled because it hides parts of the full report.\n"
+                          << "Use --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang> instead.\n";
+                return 2;
+            }
 
         } else if (mode == "--deep" && argc >= 6) {
             cmd_deep(argv[2], argv[3], argv[4], argv[5]);
@@ -3240,16 +3262,25 @@ int main(int argc, char* argv[]) {
             cmd_emberlint(argv[2]);
 
         } else if (mode == "--missing") {
-            std::cerr << "Error: --missing has been removed because it hides parts of the full report.\n"
-                      << "Use --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang> instead.\n";
-            return 2;
-
-        } else if (mode == "--todos" && argc >= 3) {
-            if (argc >= 4 && std::string(argv[3]) == "--summary") {
-                std::cerr << "Error: --summary is disabled. Use full detailed output.\n";
+            if (g_ast_config.unlock_parameters && argc >= 6) {
+                cmd_missing(argv[2], argv[3], argv[4], argv[5]);
+            } else {
+                std::cerr << "Error: --missing is disabled because it hides parts of the full report.\n"
+                          << "Use --deep <src_dir> <src_lang> <tgt_dir> <tgt_lang> instead.\n";
                 return 2;
             }
-            cmd_todos(argv[2], true);
+
+        } else if (mode == "--todos" && argc >= 3) {
+            bool verbose = true;
+            if (argc >= 4 && std::string(argv[3]) == "--summary") {
+                if (g_ast_config.unlock_parameters) {
+                    verbose = false;
+                } else {
+                    std::cerr << "Error: --summary is disabled. Use full detailed output.\n";
+                    return 2;
+                }
+            }
+            cmd_todos(argv[2], verbose);
 
         } else if (mode == "--lint" && argc >= 3) {
             cmd_lint(argv[2]);
@@ -3298,11 +3329,19 @@ int main(int argc, char* argv[]) {
             for (int i = arg_start; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--missing-only" || arg == "--missing") {
-                    std::cerr << "Error: --missing-only is disabled. Full parity output is required.\n";
-                    return 2;
+                    if (g_ast_config.unlock_parameters) {
+                        options.missing_only = true;
+                    } else {
+                        std::cerr << "Error: --missing-only is disabled. Full parity output is required.\n";
+                        return 2;
+                    }
                 } else if (arg == "--include-stubs") {
-                    std::cerr << "Error: --include-stubs is disabled. Full parity output is required.\n";
-                    return 2;
+                    if (g_ast_config.unlock_parameters) {
+                        options.include_stubs = true;
+                    } else {
+                        std::cerr << "Error: --include-stubs is disabled. Full parity output is required.\n";
+                        return 2;
+                    }
                 } else if (arg == "--kind" && i + 1 < argc) {
                     options.filter_kind = argv[++i];
                 } else if (arg == "--file" && i + 1 < argc) {
@@ -3316,8 +3355,12 @@ int main(int argc, char* argv[]) {
             for (int i = 3; i < argc; ++i) {
                 std::string arg = argv[i];
                 if (arg == "--summary") {
-                    std::cerr << "Error: --summary is disabled. Use full detailed output.\n";
-                    return 2;
+                    if (!g_ast_config.unlock_parameters) {
+                        std::cerr << "Error: --summary is disabled. Use full detailed output.\n";
+                        return 2;
+                    }
+                    // No summary-mode field on ImportMapOptions; flag is currently a no-op
+                    // when unlocked. Kept here for forward compatibility.
                 } else if (arg == "--file" && i + 1 < argc) {
                     options.filter_file = argv[++i];
                 } else if (arg == "--min" && i + 1 < argc) {
